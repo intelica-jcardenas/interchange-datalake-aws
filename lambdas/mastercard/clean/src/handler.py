@@ -837,6 +837,7 @@ def _clean_1644(
     file_details: dict,
     origin_sub_dir: str = "300_IPM_1644_EXT",
     target_sub_dir: str = "400_IPM_1644_CLN",
+    content_hash: str = "",
 ) -> None:
     """
     Clean MTI 1644 extracted parquet files.
@@ -864,7 +865,7 @@ def _clean_1644(
  
         df_cast = _cast_df(df=df, param=field_defs, currency_decimals_map=currency_map)
         del df
- 
+
         # Schema rebuilt per file: different FCs yield different column sets.
         schema = _build_arrow_schema(
             field_defs,
@@ -894,6 +895,7 @@ def _clean_standard(
     timestamp_format: str = "%y%m%d%H%M%S",
     field_defs_tag: str,
     with_file_cols: bool = False,
+    content_hash: str = "",
 ) -> None:
     """
     Shared clean pipeline for MTIs 1240, 1442, and 1740.
@@ -928,7 +930,7 @@ def _clean_standard(
             currency_decimals_map=currency_map,
         )
         del df
- 
+
         if schema is None:
             schema = _build_arrow_schema(
                 field_defs,
@@ -950,7 +952,7 @@ def _clean_standard(
 # To add a new MTI: write a wrapper here and add it to CLEANS.
  
  
-def _clean_1240(client_id: str, file_id: str, file_details: dict) -> None:
+def _clean_1240(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
     """Clean MTI 1240: 300_IPM_1240_EXT → 400_IPM_1240_CLN."""
     _clean_standard(
         "1240",
@@ -961,10 +963,11 @@ def _clean_1240(client_id: str, file_id: str, file_details: dict) -> None:
         "400_IPM_1240_CLN",
         field_defs_tag="with_file_cols",
         with_file_cols=True,
+        content_hash=content_hash,
     )
  
  
-def _clean_1442(client_id: str, file_id: str, file_details: dict) -> None:
+def _clean_1442(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
     """Clean MTI 1442: 300_IPM_1442_EXT → 400_IPM_1442_CLN."""
     _clean_standard(
         "1442",
@@ -975,10 +978,11 @@ def _clean_1442(client_id: str, file_id: str, file_details: dict) -> None:
         "400_IPM_1442_CLN",
         field_defs_tag="with_file_cols",
         with_file_cols=True,
+        content_hash=content_hash,
     )
  
  
-def _clean_1740(client_id: str, file_id: str, file_details: dict) -> None:
+def _clean_1740(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
     """Clean MTI 1740: 300_IPM_1740_EXT → 400_IPM_1740_CLN."""
     _clean_standard(
         "1740",
@@ -988,6 +992,7 @@ def _clean_1740(client_id: str, file_id: str, file_details: dict) -> None:
         "300_IPM_1740_EXT",
         "400_IPM_1740_CLN",
         field_defs_tag="default",
+        content_hash=content_hash,
     )
 
 
@@ -1191,7 +1196,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
  
         log.info("START clean_%s", mti)
         t = perf_counter()
-        clean_fn(client_id=client_id, file_id=file_id, file_details=file_details)
+        clean_fn(client_id=client_id, file_id=file_id, file_details=file_details, content_hash=content_hash)
         log.info("END clean_%s | time=%.2fs", mti, perf_counter() - t)
         mtis_ok.append(mti)
  

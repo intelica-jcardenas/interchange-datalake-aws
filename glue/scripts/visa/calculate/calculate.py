@@ -513,8 +513,43 @@ def calc_business_transaction_type_draft(df: DataFrame, file_type: str) -> DataF
         .when(dc.isin(cash_codes) & ~is_in & (usage == 1),                    F.lit(19))
         .otherwise(F.lit(255)).cast(IntegerType())
     )
- 
- 
+
+
+def calc_business_transaction_cycle_draft(df: DataFrame) -> DataFrame:
+    """
+    business_transaction_cycle para BASEII/draft.
+    Lógica basada en draft_code (transaction_code) y usage_code.
+    """
+    purchase_codes  = ["05", "06", "07"]
+    reversal_codes  = ["15", "16", "17", "35", "36", "37"]
+    chargeback_codes = ["25", "26", "27"]
+
+    dc    = F.col("draft_code")
+    usage = F.col("usage_code")
+
+    return df.withColumn(
+        "calc_business_transaction_cycle",
+        F.when(
+            dc.isin(purchase_codes),
+            F.when(usage == 1, F.lit(11))
+             .when(usage == 2, F.lit(23))
+             .when(usage == 9, F.lit(6))
+             .otherwise(F.lit(255))
+        ).when(
+            dc.isin(reversal_codes),
+            F.when(usage == 1, F.lit(1))
+             .when(usage == 9, F.lit(4))
+             .otherwise(F.lit(255))
+        ).when(
+            dc.isin(chargeback_codes),
+            F.when(usage == 1, F.lit(11))
+             .when(usage == 9, F.lit(6))
+             .when(usage == 2, F.lit(25))
+             .otherwise(F.lit(255))
+        ).otherwise(F.lit(255)).cast(IntegerType())
+    )
+
+
 def calc_business_transaction_type_sms(df: DataFrame) -> DataFrame:
     """business_transaction_type para SMS."""
     df = df.withColumn("_rmt", F.col("request_message_type"))
@@ -550,6 +585,15 @@ def calc_business_transaction_type_sms(df: DataFrame) -> DataFrame:
     
     df = df.drop("_rmt", "_rc", "_pc", "_pos", "_mcc")
     return df
+
+
+def calc_business_transaction_cycle_sms(df: DataFrame) -> DataFrame:
+    """
+    business_transaction_cycle para SMS.
+    No aplica para SMS (la lógica es exclusiva de transaction_code BASEII/draft) —
+    en legacy el campo se mantiene en la tabla como NULL.
+    """
+    return df.withColumn("calc_business_transaction_cycle", F.lit(None).cast(IntegerType()))
 
 
 def calc_reversal_indicator_draft(df: DataFrame) -> DataFrame:
@@ -765,6 +809,24 @@ def calc_jurisdiction_assigned_draft(df: DataFrame) -> DataFrame:
             (F.col("merchant_region_code") != F.col("ardef_region")),
             F.lit("9")
         ).otherwise(F.lit(""))
+    )
+
+
+def calc_settlement_report_currency_code_draft(df: DataFrame, client_data: dict) -> DataFrame:
+    """
+    settlement_report_currency_code para BASEII/draft.
+    Si jurisdiction in (on-us, off-us) y settlement_flag != 0 -> local_currency_code del cliente.
+    Caso contrario -> settlement_currency_code del cliente.
+    """
+    local_ccy      = str(client_data.get('local_currency_code', '')).strip()
+    settlement_ccy = str(client_data.get('settlement_currency_code', '')).strip()
+
+    return df.withColumn(
+        "calc_settlement_report_currency_code",
+        F.when(
+            F.col("calc_jurisdiction").isin(["on-us", "off-us"]) & (F.col("settlement_flag") != 0),
+            F.lit(local_ccy)
+        ).otherwise(F.lit(settlement_ccy))
     )
 
 
@@ -1040,7 +1102,7 @@ def calc_vss_aggregation_level(df: DataFrame, vss_type: str) -> DataFrame:
  
 def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
                             currency_df: DataFrame, file_type: str, client_data: dict) -> DataFrame:
-    """Calcula todos los campos adicionales para BASEII (28 campos)."""
+    """Calcula todos los campos adicionales para BASEII (30 campos)."""
     log_info("Calculating BASEII fields")
     log_info(f"Input records: {df.count():,}")
     
@@ -1076,6 +1138,7 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
     log_info("  Calculating conditional fields...")
     df = calc_business_mode_draft(df, file_type)
     df = calc_business_transaction_type_draft(df, file_type)
+    df = calc_business_transaction_cycle_draft(df)
     df = calc_reversal_indicator_draft(df)
     df = calc_jurisdiction_country_draft(df)
     
@@ -1089,7 +1152,8 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
     log_info("  Calculating jurisdiction fields...")
     df = calc_jurisdiction_draft(df, country_df, file_type, client_data)
     df = calc_jurisdiction_assigned_draft(df)
-    
+    df = calc_settlement_report_currency_code_draft(df, client_data)
+
     # 7. Timeliness
     log_info("  Calculating timeliness...")
     df = calc_timeliness_draft(df)
@@ -1106,6 +1170,7 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
         F.col("calc_business_format_code").alias("business_format_code"),
         F.col("calc_business_mode").alias("business_mode"),
         F.col("calc_business_transaction_type").alias("business_transaction_type"),
+        F.col("calc_business_transaction_cycle").alias("business_transaction_cycle"),
         F.col("calc_fast_funds").alias("fast_funds"),
         F.col("calc_funding_source").alias("funding_source"),
         F.col("calc_issuer_bin_8").alias("issuer_bin_8"),
@@ -1121,6 +1186,7 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
         F.col("calc_product_id").alias("product_id"),
         F.col("calc_product_subtype").alias("product_subtype"),
         F.col("calc_reversal_indicator").alias("reversal_indicator"),
+        F.col("calc_settlement_report_currency_code").alias("settlement_report_currency_code"),
         F.col("calc_source_currency_code_alphabetic").alias("source_currency_code_alphabetic"),
         F.col("calc_surcharge_amount").alias("surcharge_amount"),
         F.col("calc_technology_indicator").alias("technology_indicator"),
@@ -1136,7 +1202,7 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
 
 def calculate_sms_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
                          currency_df: DataFrame, client_data: dict) -> DataFrame:
-    """Calcula todos los campos adicionales para SMS (26 campos)."""
+    """Calcula todos los campos adicionales para SMS (27 campos)."""
     log_info("Calculating SMS fields")
     log_info(f"Input records: {df.count():,}")
     
@@ -1169,6 +1235,7 @@ def calculate_sms_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
     log_info("  Calculating conditional fields...")
     df = calc_business_mode_sms(df)
     df = calc_business_transaction_type_sms(df)
+    df = calc_business_transaction_cycle_sms(df)
     df = calc_reversal_indicator_sms(df)
     df = calc_jurisdiction_country_sms(df)
     
@@ -1199,6 +1266,7 @@ def calculate_sms_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
         F.col("calc_b2b_program_id").alias("b2b_program_id"),
         F.col("calc_business_mode").alias("business_mode"),
         F.col("calc_business_transaction_type").alias("business_transaction_type"),
+        F.col("calc_business_transaction_cycle").alias("business_transaction_cycle"),
         F.col("calc_fast_funds").alias("fast_funds"),
         F.col("calc_funding_source").alias("funding_source"),
         F.col("calc_issuer_bin_8").alias("issuer_bin_8"),

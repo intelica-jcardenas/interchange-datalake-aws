@@ -1,0 +1,30 @@
+{
+  "DefaultArguments": {
+    "--job-language":                "python",
+    "--enable-metrics":              "true",
+    "--enable-spark-ui":             "true",
+    "--enable-job-insights":         "true",
+    "--enable-continuous-cloudwatch-log": "true",
+    "--enable-glue-datacatalog":     "true",
+    "--spark-event-logs-path":       "s3://itl-0004-itx-dev-intchg-02-s3-reference/spark-logs/glue-vi-mc-reporting/",
+
+    "--operational_bucket":          "itl-0004-itx-dev-intchg-02-s3-operational",
+    "--reference_bucket":            "itl-0004-itx-dev-intchg-02-s3-reference",
+    "--analytics_bucket":            "itl-0004-itx-dev-intchg-02-s3-analytics",
+    "--dynamodb_table_client":       "itl-0004-itx-dev-dynamo-client-02",
+
+    "--client_code":                 "EBGR",
+    "--start_date":                  "2026-01-01",
+    "--end_date":                    "2026-01-31",
+    "--report_suffix":               "202601",
+    "--scheme_fee":                  "false"
+  },
+  "_notes": {
+    "workers":        "G.1X x 2 — suficiente para un rango corto por cliente; escalar a G.1X x 4 si se procesan rangos largos o varios clientes a la vez",
+    "glue_version":   "4.0",
+    "python_version": "3",
+    "trigger":        "Manual o EventBridge al finalizar lmbd-vi-store del último día del rango",
+    "exchange_rates": "brand_path=Visa para Visa; brand_path=MasterCard para MC — paths en S3 reference",
+    "report_suffix":  "identificador libre para el nombre de salida, ej: '202601', '202601_v2', '20260101_20260131'"
+  }
+}

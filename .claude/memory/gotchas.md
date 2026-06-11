@@ -4,7 +4,7 @@ Problemas encontrados durante el desarrollo, con su causa raíz y solución reco
 
 ---
 
-## glue-test-1 (glue-vi-mc-reporting): load_exchange_rates() leía tabla incompleta y con columnas incorrectas — "Column 'to_currency' does not exist" — RESUELTO (pendiente confirmar re-run)
+## glue-test-1 (glue-vi-mc-reporting): load_exchange_rates() leía tabla incompleta y con columnas incorrectas — "Column 'to_currency' does not exist" — RESUELTO Y VALIDADO
 
 **Archivo:** `glue/scripts/reports/get_transaction/get_transaction.py` (función `load_exchange_rates`, usada por `_join_exchange_rates`)
 **Detectado:** 2026-06-10
@@ -28,11 +28,21 @@ Además, esa ruta (`exchange-rates/brand=Visa/`) tiene **cobertura incompleta**:
 
 **Solución aplicada (2026-06-10):** `load_exchange_rates()` reescrita para leer `s3://{BUCKET_REF}/exchange_rate/rate_date=YYYY-MM-DD/` (cubre 2025-12-01..2026-04-30, ambas marcas en una tabla con columna `brand`='VISA'/'MasterCard'). Filtra `F.upper(F.col("brand")) == brand_path.upper()` y renombra `rate_date→exchange_date`, `currency_from→from_currency`, `currency_to→to_currency`, `exchange_value→fx_rate` — sin tocar `_join_exchange_rates()` ni las funciones `transform_*`. Validado: `VISA EUR→USD` existe en `rate_date=2026-01-05` (28,056 filas VISA, 22,650 MasterCard en ese día). Detalle de la decisión en `decisions.md` → "Por qué glue-vi-mc-reporting (glue-test-1) lee exchange_rate/rate_date=...".
 
-Subido a `s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/get_transaction.py`. Re-lanzado: JobRunId `jr_ecbf44e09aa4db4cabceb597478ffc21b18b27a9b4dc02f7f020fe039c284c3d` (`report_suffix=20260105_tst2`) — **pendiente confirmar resultado** (debe generar output en `s3-analytics`, no "No data... skipping").
+Subido a `s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/get_transaction.py`. Re-lanzado: JobRunId `jr_ecbf44e09aa4db4cabceb597478ffc21b18b27a9b4dc02f7f020fe039c284c3d` (`report_suffix=20260105_tst2`).
+
+**Validación (2026-06-11):** `jr_ecbf...284c3d` → `SUCCEEDED` (`Error=None`, `ExecutionTime=103s`). Output generado: `s3://itl-0004-itx-dev-intchg-02-s3-analytics/EBGR/reports/report_transactions_EBGR_20260105_tst2.parquet/` (16 MB, 561,711 filas, 32 columnas = `FINAL_COLS` completo). Verificado:
+- `reported_currency_code`: 100% `"EUR"`, 0 nulls
+- `interchange_fees_amount`: 0 nulls, valores no-cero (rule matching + conversión de moneda funcionando)
+- `transaction_amount`: rango -2795..23898 (valores convertidos a EUR vía `xr1_rate`, no solo el monto crudo)
+- `interchange_rule`: poblado con descriptores reales (`GR GP OCT CR`, `VE NON-SEC CR`, etc.)
+- `product_program_id`: 100% null — esperado, sigue siendo TODO (join ARDEF BIN products, no implementado aún)
+- `scheme_fees_amount`: 100% `0.0` — esperado, flujo aún no implementado (TODO documentado)
 
 **Si vuelve a aparecer (`Column 'X' does not exist` en `_join_exchange_rates` o columnas de `load_exchange_rates`):** verificar el schema real de `s3://itl-0004-itx-dev-intchg-02-s3-reference/exchange_rate/rate_date=<fecha>/*.parquet` (columnas: `brand, currency_from, currency_to, currency_from_code, currency_to_code, exchange_value, year, month`) — puede haber cambiado si el nuevo método de extracción de tipo de cambio Visa (en desarrollo) reemplaza esta tabla.
 
 **Nota:** hay un nuevo método de extracción de tipo de cambio Visa en desarrollo (mencionado por el usuario 2026-06-10) — cuando esté disponible, revisar si `load_exchange_rates()` debe apuntar a esa nueva fuente.
+
+**Pendientes restantes para `get_transaction.py`:** `product_program_id` (join ARDEF BIN products, ver `reporting_job_design.md`), `scheme_fees_amount` (flujo TODO), validación SMS/MC (skeletons con `# VERIFY`), escaneo NullType en `SBSA`/`BTRLRO`/`vss_110-140` antes de generar reportes para esos clientes/tipos.
 
 ---
 
@@ -255,7 +265,7 @@ temp = temp.mask(temp.str.len() == 0, "BLANK")
 - Con el `.strip()` extra: `' '` se convierte en `''` → `valid_values = ['', '9']`
 - Como `acceptance_terminal_indicator` está en `COLUMN_GROUP_SPACE` (su valor de transacción se conserva como `' '` literal, sin normalizar/strip), el filtro `_normalized.isin(valid_values)` excluye toda transacción con `' '` porque `' ' not in ['', '9']`
 
-**Cómo se detectó:** Comparación línea por línea de `_apply_default` (Glue) vs `_apply_condition_default` (local) — la única diferencia relevante era ese `.strip()` extra. Se confirmó vía regex sobre `tst_files/visa_rules.parquet` que **ningún criterio real contiene comas seguidas de espacio** — el `.strip()` no tenía caso de uso legítimo, era código incidental que introdujo la regresión.
+**Cómo se detectó:** Comparación línea por línea de `_apply_default` (Glue) vs `_apply_condition_default` (local) — la única diferencia relevante era ese `.strip()` extra. Se confirmó vía regex sobre `tst_files/reference_data/visa_rules.parquet` que **ningún criterio real contiene comas seguidas de espacio** — el `.strip()` no tenía caso de uso legítimo, era código incidental que introdujo la regresión.
 
 **Validación contra producción:** En el operational `D44C4427AED04C1E078AA86B275060FA.parquet` (jurisdiction_assigned=GR, 206,718 filas), 21,085 transacciones con `acceptance_terminal_indicator=' '` cayeron en la regla fallback 63. De ellas, **524 cumplían absolutamente TODAS las demás condiciones de la regla 39** (transaction_code, transaction_code_qualifier, account_funding_source, product_id, authorization_code, timeliness, pos_environment_code, pos_terminal_capability, pos_entry_mode, cardholder_id_method, authorization_response_code, reimbursement_attribute) — prueba directa de mala clasificación (`fee_descriptor='GR NON-SEC CR'` en vez de `'GR SECURE CR'`) causada únicamente por este bug.
 
@@ -365,6 +375,8 @@ El handler anterior tenía además **tres bugs que amplificaban esta única anom
 **Problema:** El código usa `DDB_MASTERCARD_FIELDS_TABLE` para consultar la tabla de campos Mastercard en DynamoDB, pero esta variable no está declarada en `config.json` ni en `env-vars.json`. Cae al valor hardcodeado `"itl-0004-itx-dev-dynamo-mastercard_fields-02"`, lo que romperá en ambientes distintos a dev.
 
 **Solución recomendada:** Agregar `DDB_MASTERCARD_FIELDS_TABLE` a `config.json` y `env-vars.json` igual que las otras variables de entorno del Lambda.
+
+**Confirmado aún pendiente (sync 2026-06-11):** El sync de Lambdas de esta sesión trajo cambios de código a `lmbd-mc-transform` (nuevo `content_hash` propagado + filtro `list_parquet_files` por `file_id`, ver `decisions.md`), pero el diff de `config.json` solo modificó `CodeSize`, `LastModified`, `CodeSha256` y `RevisionId` — el bloque `Environment.Variables` quedó sin cambios y `DDB_MASTERCARD_FIELDS_TABLE` sigue ausente. El bug latente sigue vigente.
 
 **Estado:** Pendiente — bug latente que se manifestará al desplegar en ambiente empresarial.
 

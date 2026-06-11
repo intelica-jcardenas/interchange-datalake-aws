@@ -85,13 +85,24 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ---
 
-## Por qué mc-store fusiona Parquets por columnas nuevas (axis=1) y no por join de claves
+## Por qué mc-store fusiona CLN + CAL + ITX por llave (file_id, file_idn, ref_id) y no por posición (axis=1)
 
-**Decisión:** `lmbd-mc-store` fusiona CLN + CAL + ITX usando `pd.concat(frames, axis=1)` — merge horizontal por índice posicional. Solo añade columnas que no existen en el frame anterior.
+**Decisión (actualizada 2026-06-11):** `lmbd-mc-store` (`_store_output`) ya NO usa `pd.concat(frames, axis=1)` por índice posicional. Ahora fusiona CLN + CAL + ITX con `df.merge(..., on=KEYS, how="left", validate="one_to_one")`, donde `KEYS = ["file_id", "file_idn", "ref_id"]`. Antes de cada merge:
+- `_normalize_merge_keys(df, KEYS)` castea las columnas llave a `string` nullable y aplica `.str.strip()` (evita mismatches por espacios o tipos mixtos int/str).
+- Se valida que las 3 columnas llave existan en CLN/CAL/ITX (`raise ValueError` si falta alguna).
+- Se valida que no haya duplicados por `KEYS` en ninguno de los tres frames (`raise ValueError` si `df.duplicated(subset=KEYS).sum() > 0`).
+- Solo se agregan al merge las columnas de CAL/ITX que no existen ya en `merged` (mismo principio que la versión anterior: "solo columnas nuevas").
+- CAL e ITX siguen siendo opcionales: `S3.exceptions.NoSuchKey` (o cualquier excepción de lectura/merge) se loguea como warning y el merge continúa solo con lo que ya se tiene — igual que antes.
 
-**Razón:** El pipeline garantiza que CLN, CAL e ITX para el mismo MTI y archivo tienen exactamente el mismo número de filas en el mismo orden (no hay filtros ni reordenamiento entre etapas). Un join por clave añadiría complejidad y latencia sin beneficio. Si la garantía de orden se rompe en alguna etapa futura, esto se manifestará como datos incorrectos — señal de un bug upstream que hay que corregir allí.
+**Decisión anterior (superada, documentada por completo):** `pd.concat(frames, axis=1)` — merge horizontal por índice posicional, asumiendo que CLN/CAL/ITX para el mismo MTI y archivo tienen exactamente el mismo número de filas en el mismo orden.
 
-**Alternativa descartada:** Join por columna de clave de transacción. Descartado por complejidad (requiere definir PK compuesta por MTI) y porque la garantía de orden ya existe por diseño del pipeline.
+**Razón del cambio:** La garantía de orden posicional entre etapas (CLN/CAL/ITX) resultó frágil en la práctica — `glue-mc-calculate` y `glue-mc-interchange` corren en Spark, donde el orden de las filas de salida no está garantizado entre ejecuciones aunque el contenido sea el mismo (shuffles, particionamiento). Un join por llave es la forma correcta de garantizar que cada fila de CAL/ITX se una con la fila CLN correcta, independientemente del orden físico de cada Parquet. `ref_id` se agregó como tercera columna de `glue-mc-interchange` (`run_interchange_mti`, ver más abajo) precisamente porque `file_id + file_idn` por sí solos no son suficientes para identificar de forma única cada registro dentro de un mismo archivo/MTI — `ref_id` es el identificador de fila a nivel de mensaje IPM.
+
+**Por qué falla rápido (`raise ValueError`) en vez de degradar:** Si las llaves no son únicas o no existen, un `how="left"` silencioso produciría duplicación de filas (fan-out) o nulls masivos en las columnas nuevas — un bug de este tipo es mucho más difícil de detectar en `operational` (Athena) que en el log del Lambda. Las validaciones convierten un dato incorrecto silencioso en un error explícito en CloudWatch.
+
+**Alternativa descartada:** Mantener el merge posicional y solo "arreglar" el orden en Spark con `orderBy` antes de escribir CAL/ITX. Descartado porque requeriría garantizar el mismo `orderBy` determinístico en CAL e ITX (etapas independientes, con sus propios shuffles/joins) — más frágil y más difícil de auditar que validar llaves explícitas.
+
+**Impacto en `glue-mc-interchange`:** `run_interchange_mti()` ahora incluye `F.col("ref_id")` en la selección de columnas de salida (antes no estaba) — es requisito para que mc-store pueda usarlo como llave de merge.
 
 ---
 
@@ -160,6 +171,18 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ---
 
+## Por qué se agrega content_hash en el pipeline Mastercard (interpreter → calculate)
+
+**Decisión (sync 2026-06-11):** Replicando el patrón ya validado en Visa (ver decisión anterior), el pipeline Mastercard ahora propaga `content_hash` (MD5 del archivo fuente) a través de todas sus etapas: `lmbd-mc-interpreter` → `lmbd-mc-transform` → `lmbd-mc-extract` → `lmbd-mc-clean` → `glue-mc-calculate`. Todas estas funciones ganaron un parámetro `content_hash: str = ""`.
+
+**Razón:** Misma que Visa — sin esta columna no hay forma de saber qué archivo originó cada fila al consultar `operational` vía Athena, y el valor ya viaja en el payload del Step Function (`itx-mastercard-orchestrator`) sin costo adicional.
+
+**Diferencia de implementación con Visa:** En Visa, `lmbd-vi-clean` propaga `content_hash` automáticamente porque itera todas las columnas del input (que ya lo trae desde transform). En Mastercard, `glue-mc-calculate` (`process_file`) lo agrega explícitamente al final con `df_final = df_final.withColumn("content_hash", F.lit(content_hash))` (Spark `lit`, no viene como columna del CLN) — porque calculate es el primer punto del pipeline MC donde se trabaja en Spark y es más simple inyectarlo ahí que propagarlo columna a columna desde el interpreter (pandas) hasta calculate.
+
+**Caso particular — `glue-mc-interchange` recibe `--content_hash` pero no lo usa:** El ASL de `itx-mastercard-orchestrator` pasa `"--content_hash.$": "$.interchange_input.content_hash"` al job de interchange, pero `interchange.py` no declara ni usa ese argumento (Glue's `getResolvedOptions` simplemente lo ignora si no está en la lista de opciones requeridas). No es un bug — `content_hash` ya queda materializado en CAL (vía `glue-mc-calculate`) y mc-store lo hereda en el merge sin necesidad de que interchange lo reescriba. Si en el futuro `interchange.py` necesita `content_hash` para algo (logging, trazabilidad de su propio output), el argumento ya está disponible en el job sin cambios en el ASL.
+
+---
+
 ## Por qué el reporting job ejecuta un cliente por vez (no lista de clientes)
 
 **Decisión:** `glue-vi-mc-reporting` (archivo: `glue/scripts/reports/get_transaction/get_transaction.py`) procesa un único cliente por ejecución. El parámetro es `--client_code` (singular).
@@ -194,6 +217,24 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ---
 
+## Por qué product_program_id en glue-vi-mc-reporting usa una nueva tabla `visa_bin_products` en s3-reference (join M5)
+
+**Decisión (2026-06-11):** `product_program_id` (antes `NULL` fijo, TODO documentado) se calcula ahora con un join M5: `product_id` (ya calculado en `glue-vi-calculate` via cruce ARDEF, presente en CLN/operational) → `bin_product_id` en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_bin_products/data.parquet` → `range_program_id`.
+
+**Origen de la tabla:** export CSV de la tabla maestra `m_visa_bin_products` de PostgreSQL legacy (58 filas: `bin_product_id, short_description, bin_card_type, range_program_id, app_creation_date, app_creation_user`), provisto por el usuario y convertido 1:1 a Parquet (sin transformación) en `visa_bin_products/data.parquet`.
+
+**Implementación en `get_transaction.py`:**
+- `load_visa_bin_products()` — nueva función junto a `load_country()`/`load_exchange_rates()`, selecciona solo `bin_product_id, range_program_id`.
+- `transform_visa_baseii()` y `transform_visa_sms()` ahora reciben `bin_products_df` como parámetro; join M5 análogo a M1/M2 (country): `df["product_id"] == bin_products_df["bin_product_id"]`, left join, alias `product_program_id_m5`.
+- `process_client_range()` y `main()` propagan `bin_products_df` (cargado y cacheado una vez, igual que `country_df`).
+- MC (`product_program_id` en `transform_mastercard`) queda como TODO separado — requiere `m_mastercard_bin_products`, tabla distinta no provista aún.
+
+**Validación (2026-06-11):** Re-run `glue-test-1` (`jr_f374a87d3849a2d8f4fa1c762c9ece25a4ba51b21118f4233460476253d73f65`, `report_suffix=20260105_tst3`, EBGR 2026-01-01..2026-01-05) → SUCCEEDED. `product_program_id`: 0 nulls (antes 100% null), suma=57,849,742=legacy, value_counts idénticos (103→555,220, 102→6,491), mapeo `product_code→product_program_id` idéntico (E,F,N,P→103; G→102) en ambos sistemas. **Resuelve completamente este TODO.**
+
+**Alternativa descartada:** Calcular `product_program_id` directamente en `glue-vi-calculate` (como los otros campos ARDEF). Descartado porque `product_program_id` es un atributo del *producto* (tabla pequeña, 58 filas, cambia raramente) no de la transacción — más simple resolverlo en el reporting job via join liviano que mantenerlo sincronizado en cada `calculate.parquet`.
+
+---
+
 ## Por qué glue-vi-mc-reporting (glue-test-1) lee `exchange_rate/rate_date=YYYY-MM-DD/` y no `exchange-rates/brand={brand}/exchange_date=YYYY-MM-DD/`
 
 **Decisión:** `load_exchange_rates()` en `glue/scripts/reports/get_transaction/get_transaction.py` lee `s3://itl-0004-itx-dev-intchg-02-s3-reference/exchange_rate/rate_date=YYYY-MM-DD/`, filtra por columna `brand` (`'VISA'` / `'MasterCard'`, comparación case-insensitive) y renombra columnas a `exchange_date, from_currency, to_currency, fx_rate`.
@@ -207,3 +248,76 @@ El bug original (`Column 'to_currency' does not exist`) solo se manifestó el 20
 **Pendiente:** hay un nuevo método de extracción de tipo de cambio Visa en desarrollo (mencionado por el usuario 2026-06-10). Cuando esté disponible, revisar si `load_exchange_rates()` debe apuntar a esa nueva fuente en vez de (o además de) `exchange_rate/`.
 
 **Alternativa descartada:** mantener `exchange-rates/brand={brand}/` y solo corregir los nombres de columna — descartado porque esa tabla no tiene cobertura completa de pares de moneda/fechas (`exchange-rates/brand=Visa/` no tenía EUR→USD para `exchange_date=2026-01-01`, mientras que `exchange_rate/rate_date=2026-01-05/` sí).
+
+---
+
+## Por qué se agregaron business_transaction_cycle y settlement_report_currency_code en glue-vi-calculate
+
+**Decisión (2026-06-11):** Dos nuevos campos calculados en `glue/scripts/visa/calculate/calculate.py`, BASEII pasa de 28 a 30 campos, SMS de 26 a 27.
+
+**`business_transaction_cycle`** (BASEII/draft, `calc_business_transaction_cycle_draft`):
+- Deriva de `draft_code` (transaction_code) + `usage_code`, replicando la clasificación del SP legacy:
+  - `draft_code in (05,06,07)` (purchase): `usage=1→11`, `usage=2→23`, `usage=9→6`, otro→255
+  - `draft_code in (15,16,17,35,36,37)` (reversal): `usage=1→1`, `usage=9→4`, otro→255
+  - `draft_code in (25,26,27)` (chargeback): `usage=1→11`, `usage=9→6`, `usage=2→25`, otro→255
+  - cualquier otro `draft_code` → 255
+- SMS (`calc_business_transaction_cycle_sms`): la lógica es exclusiva de transaction_code BASEII — para SMS el campo se mantiene `NULL` (igual que en legacy), por eso existe la función dedicada que solo hace `F.lit(None).cast(IntegerType())`.
+
+**`settlement_report_currency_code`** (solo BASEII/draft, `calc_settlement_report_currency_code_draft`):
+- Si `calc_jurisdiction in (on-us, off-us)` y `settlement_flag != 0` → `local_currency_code` del cliente (tabla `client-02`, ya cargado en `client_data` vía `get_client_data()` — el mismo mecanismo que ya usaba `--dynamodb_table_client`).
+- Caso contrario → `settlement_currency_code` del cliente.
+- No existe equivalente para SMS — el campo no se agrega a `calculate_sms_fields`.
+
+**Razón:** ambos campos son requeridos por el reporte (`glue-vi-mc-reporting` / `get_transaction.py`) y no estaban materializados en `calculate.parquet`; agregarlos en calculate evita que el reporting tenga que recalcularlos con su propia lógica duplicada.
+
+**Validación (2026-06-11):** contra `93BF199C85D2DF243AFDABEE5572E8C0` (EBGR, 2026-01-03, 269,725 filas BASEII): `business_transaction_cycle` int32, 0 nulls, distribución por `draft_code`/`usage_code` coincide con la tabla de mapeo (ej. `draft_code∈{05,06,07,25}` + `usage_code=1` → `11`). `settlement_report_currency_code` string, 0 nulls, 100% `"EUR"` para EBGR (`local_currency_code=settlement_currency_code=EUR`).
+
+**Reproceso masivo (2026-06-11):** ambos campos se reprocesaron para los 100 archivos EBGR/VISA/IN de enero 2026 (calculate + store) y se confirmaron en el catálogo Glue tras re-crawl (`business_transaction_cycle: int`, `settlement_report_currency_code: string` en `operational_ebgr_visa.baseii_drafts`). Detalle del reproceso masivo en `manual_execution.md` → "Sesión 2026-06-11".
+
+---
+
+## Por qué lmbd-mc-transform filtra list_parquet_files por prefijo file_id
+
+**Decisión (sync 2026-06-11):** `list_parquet_files` en `lambdas/mastercard/transform/src/handler.py` ahora filtra los Parquets RAW del interpreter (`100_IPM_{MTI}_RAW/`) por `stem.upper().startswith(file_id.upper())` antes de procesarlos.
+
+**Razón:** Mismo problema y misma solución ya documentados para `glue-mc-interchange` (ver gotcha "glue-mc-interchange: filtra por file_id para no reprocesar ejecuciones anteriores"). Sin el filtro, una re-ejecución de transform para un `file_id` listaría TODOS los Parquets RAW de la partición `file_type=X/date=YYYY-MM-DD` (incluyendo los de otros `file_id` ya procesados ese mismo día), reprocesándolos innecesariamente y potencialmente mezclando outputs de archivos distintos en el mismo `200_IPM_{MTI}_TRA/`.
+
+**Alternativa descartada:** Ninguna — es la aplicación directa del patrón ya validado, no requirió evaluar alternativas.
+
+---
+
+## Por qué se agregó WaitForENIRelease (180s) entre Calculate e Interchange en itx-mastercard-orchestrator
+
+**Decisión (sync 2026-06-11):** En `step-functions/mastercard/asl.json`, el estado `CheckCalculateResult` (Choice) ahora tiene como `Default` un nuevo estado `WaitForENIRelease` (Type=Wait, Seconds=180), que a su vez transiciona a `PrepareInterchangeInput` (el destino anterior de `Default`).
+
+**Razón:** `glue-mc-calculate` corre con conexión a VPC (para acceder a recursos de red privados). Cuando un job Glue con conexión VPC termina, AWS tarda en liberar las ENIs (Elastic Network Interfaces) asociadas — si `glue-mc-interchange` se lanza inmediatamente después, puede fallar o quedarse bloqueado esperando ENIs disponibles (límite de ENIs por subnet/cuenta). El Wait de 180s da margen para que AWS complete la liberación antes de lanzar el siguiente job.
+
+**Alternativa descartada:** Reintentos con backoff en `glue-mc-interchange` ante fallos de ENI. Descartado por ser más complejo de diagnosticar (el error de ENI no siempre es claro) y porque un Wait fijo es más simple y predecible para este caso conocido.
+
+**Cambio relacionado — MaxConcurrentRuns 20→50:** En el mismo sync, `glue-mc-calculate` y `glue-mc-interchange` pasaron de `MaxConcurrentRuns=20` a `50` (igual que `glue-vi-calculate`/`glue-vi-interchange`), habilitando el mismo patrón de reproceso masivo paralelo (`tst_files/reprocessing/reprocess_vi_*.py`) para Mastercard cuando se necesite.
+
+---
+
+## Por qué lmbd-mc-exchange-rates se reescribió con scraping vía proxies (ProxyManager + orquestador/worker encadenado)
+
+**Decisión (sync 2026-06-11):** `lambdas/mastercard/exchange-rates/src/handler.py` se reescribió casi por completo (+678 líneas) para obtener tipos de cambio Mastercard scrapeando `https://www.mastercard.com/marketingservices/public/mccom-services/currency-conversions/conversion-rates` (la API pública que alimenta el conversor de Mastercard), en vez de la fuente anterior.
+
+**Componentes nuevos:**
+- **`ProxyManager`** (clase thread-safe): pool de proxies con `pick()` round-robin, `report_failure()`/`report_success()` — banea un proxy tras `PROXY_BAN_AFTER=1` fallo consecutivo, y enmascara credenciales en los logs (`_mask_proxy_url`).
+- **`validate_proxies()`**: al arrancar, prueba cada proxy con una consulta real (USD→EUR) y descarta los que no responden 200 — evita gastar tiempo en proxies muertos durante el scraping real.
+- **Arquitectura orquestador/worker encadenada** (`mode="orchestrator"|"worker"` en el evento de invocación):
+  - `run_orchestrator()`: genera el rango de fechas (`BEGIN_DATE`..`END_DATE`), carga todos los pares de moneda desde `resources/currencies.json`, los divide en `NUM_CHUNKS=10` chunks, borra los Parquets existentes de cada fecha (`delete_existing_parquets`), e invoca el primer worker (`chunk_index=0`) por fecha vía `invoke_next_worker()` (invocación async, `InvocationType="Event"`).
+  - `run_worker()`: procesa su chunk con `ThreadPoolExecutor(MAX_WORKERS=9)` (cada thread = `process_sub_chunk`, con su propio proxy via `ProxyManager.pick()`), escribe el resultado a `s3://{S3_BUCKET}/{S3_PREFIX}/exchange_date={date}/`, e invoca el siguiente worker de la cadena (`chunk_index+1`) hasta agotar `chunks`.
+- Esta arquitectura encadenada evita el timeout de un solo Lambda (900s máx) cuando el número de pares de moneda × fechas es grande — cada worker procesa solo 1 de 10 chunks y se auto-relanza.
+
+**Razón:** Mastercard no expone una API/feed oficial de tipos de cambio históricos accesible para este proyecto; la única fuente disponible es la API pública del conversor web, que aplica rate-limiting/bloqueo por IP agresivo — de ahí la necesidad de rotar proxies y espaciar requests (`PAUSE_MIN/MAX` entre 1.0-1.3s por request).
+
+**Nuevos archivos de recursos:**
+- `lambdas/mastercard/exchange-rates/src/resources/currencies.json` (commiteado) — catálogo `{alphaCd, currNam}` usado para generar todos los pares `[src, dst]` con `src != dst`.
+- `lambdas/mastercard/exchange-rates/src/resources/proxy_settings.json` (**NO commiteado** — agregado a `.gitignore` vía `**/resources/proxy_settings.json`) — contiene URLs de proxy con credenciales reales (`usuario:password@host:puerto`). Estructura: `proxy_settings.proxy_list_mastercard` (preferido) con fallback a `proxy_settings.proxy_list`, filtrando `status=="active"`.
+
+**Cambios de configuración asociados:** `Timeout` 300s→750s (la cadena de workers necesita más margen por invocación), `MemorySize` 2048→512 MB (el trabajo es I/O-bound, no necesita memoria alta), `VpcConfig` removido (el scraping necesita salida a internet pública, no a recursos VPC privados), `env-vars.json` limpiado de la variable de prueba `testing_1`.
+
+**Seguridad:** `proxy_settings.json` contiene credenciales reales de proxy (`Soporteintelica:JCbiJuhUpX` embebido en ~118 URLs). Verificar que el archivo nunca se commitee — si `git status` lo muestra como tracked/staged, hay que hacer `git rm --cached` antes de que la regla de `.gitignore` surta efecto (gitignore no afecta archivos ya trackeados).
+
+**Alternativa descartada:** Mantener la fuente de tipos de cambio anterior (la que dejó la variable `testing_1` en `env-vars.json` como placeholder de pruebas). Descartado porque no cubría los pares de moneda/fechas necesarios para `glue-mc-calculate`/`glue-mc-interchange` — detalle de la fuente anterior no documentado, se reemplazó directamente.

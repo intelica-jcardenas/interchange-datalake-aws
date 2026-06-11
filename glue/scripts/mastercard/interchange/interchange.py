@@ -1264,6 +1264,7 @@ def run_interchange_mti(
                 F.col("file_id"),
                 #F.col("file_type"),
                 F.col("file_idn"),
+                F.col("ref_id"),
                 #F.col("file_date"),
                 F.col("rate_currency"),
                 F.col("rate_variable"),

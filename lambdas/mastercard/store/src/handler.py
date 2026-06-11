@@ -173,130 +173,316 @@ def _derive_target_key(cln_s3_key: str, mti: str) -> str:
     """
     return cln_s3_key.replace(f"400_IPM_{mti}_CLN", f"IPM_{mti}", 1)
 
+def _normalize_merge_keys(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    df = df.copy()
+
+    for k in keys:
+        if k in df.columns:
+            df[k] = df[k].astype("string").str.strip()
+
+    return df
 
 # ==============================================================================
 # Store por output entry
 # ==============================================================================
  
  
+# def _store_output(
+#     output: dict,
+#     staging_bucket: str,
+#     operational_bucket: str,
+# ) -> dict:
+#     """
+#     Procesa una entrada de output (un archivo CLN) del store_input.outputs.
+ 
+#     1. Lee el archivo CLN desde staging.
+#     2. Intenta leer CAL y fusionarlo (columnas nuevas, mismo orden de filas).
+#     3. Intenta leer ITX si el MTI lo soporta y el archivo existe.
+#     4. Escribe el Parquet consolidado en el bucket operational.
+#     5. Retorna el dict de resultado con cln/cal/itx/target s3 keys y métricas.
+ 
+#     Parameters
+#     ----------
+#     output : dict
+#         Entrada del array outputs: {"mti": "1240", "s3_key": "EBGR/MC/400_..."}
+#     staging_bucket : str
+#         Bucket S3 de staging (origen).
+#     operational_bucket : str
+#         Bucket S3 operational (destino).
+ 
+#     Returns
+#     -------
+#     dict con: mti, cln_s3_key, cal_s3_key, itx_s3_key, target_s3_key,
+#               records, columns, batches.
+#     """
+#     mti       = output["mti"]
+#     cln_s3_key = output["s3_key"]
+ 
+#     log.info("_store_output: START mti=%s | cln=%s", mti, cln_s3_key)
+#     t0 = perf_counter()
+ 
+#     cal_s3_key    = _derive_cal_key(cln_s3_key, mti)
+#     target_s3_key = _derive_target_key(cln_s3_key, mti)
+#     itx_s3_key_candidate = (
+#         _derive_itx_key(cln_s3_key, mti) if mti in MTIS_WITH_ITX else None
+#     )
+ 
+#     # ── Leer CLN ──────────────────────────────────────────────────────────────
+#     df_cln = _read_parquet_s3(staging_bucket, cln_s3_key)
+#     log.info(
+#         "_store_output: CLN read | mti=%s | rows=%d cols=%d [%.2fs]",
+#         mti, len(df_cln), len(df_cln.columns), perf_counter() - t0,
+#     )
+#     frames = [df_cln]
+ 
+#     # ── Leer CAL y fusionar (columnas nuevas únicamente) ──────────────────────
+#     try:
+#         df_cal = _read_parquet_s3(staging_bucket, cal_s3_key)
+#         existing_cols = set(df_cln.columns)
+#         new_cols = [c for c in df_cal.columns if c not in existing_cols]
+#         if new_cols:
+#             frames.append(df_cal[new_cols])
+#         del df_cal
+#         log.info("_store_output: CAL merged | mti=%s | new_cols=%d", mti, len(new_cols))
+#     except S3.exceptions.NoSuchKey:
+#         log.warning("_store_output: CAL not found (skipping) | %s", cal_s3_key)
+#     except Exception as exc:
+#         log.warning("_store_output: CAL read error (skipping) | %s | %s", cal_s3_key, exc)
+ 
+#     # ── Leer ITX si aplica y existe ───────────────────────────────────────────
+#     itx_s3_key_used: Optional[str] = None
+ 
+#     if itx_s3_key_candidate:
+#         try:
+#             df_itx = _read_parquet_s3(staging_bucket, itx_s3_key_candidate)
+#             already = set().union(*(set(f.columns) for f in frames))
+#             itx_new_cols = [c for c in df_itx.columns if c not in already]
+#             if itx_new_cols:
+#                 frames.append(df_itx[itx_new_cols])
+#             del df_itx
+#             itx_s3_key_used = itx_s3_key_candidate
+#             log.info(
+#                 "_store_output: ITX merged | mti=%s | new_cols=%d",
+#                 mti, len(itx_new_cols),
+#             )
+#         except S3.exceptions.NoSuchKey:
+#             log.info(
+#                 "_store_output: ITX not found (itx_s3_key=null) | %s",
+#                 itx_s3_key_candidate,
+#             )
+#         except Exception as exc:
+#             log.warning(
+#                 "_store_output: ITX read error (skipping) | %s | %s",
+#                 itx_s3_key_candidate, exc,
+#             )
+
+
+#     # ── Merge por índice posicional (misma cantidad de filas y mismo orden) ───
+#     merged = pd.concat(frames, axis=1) if len(frames) > 1 else frames[0]
+#     del frames
+#     gc.collect()
+ 
+#     records = len(merged)
+#     columns = len(merged.columns)
+ 
+#     # ── Escribir en operational ───────────────────────────────────────────────
+#     _write_parquet_s3(merged, operational_bucket, target_s3_key)
+#     del merged
+#     gc.collect()
+ 
+#     log.info(
+#         "_store_output: END mti=%s | records=%d cols=%d [%.2fs]",
+#         mti, records, columns, perf_counter() - t0,
+#     )
+ 
+#     return {
+#         "mti":           mti,
+#         "cln_s3_key":    cln_s3_key,
+#         "cal_s3_key":    cal_s3_key,
+#         "itx_s3_key":    itx_s3_key_used,
+#         "target_s3_key": target_s3_key,
+#         "records":       records,
+#         "columns":       columns,
+#         "batches":       1,
+#     }
+
+
 def _store_output(
     output: dict,
     staging_bucket: str,
     operational_bucket: str,
 ) -> dict:
     """
-    Procesa una entrada de output (un archivo CLN) del store_input.outputs.
- 
-    1. Lee el archivo CLN desde staging.
-    2. Intenta leer CAL y fusionarlo (columnas nuevas, mismo orden de filas).
-    3. Intenta leer ITX si el MTI lo soporta y el archivo existe.
-    4. Escribe el Parquet consolidado en el bucket operational.
-    5. Retorna el dict de resultado con cln/cal/itx/target s3 keys y métricas.
- 
-    Parameters
-    ----------
-    output : dict
-        Entrada del array outputs: {"mti": "1240", "s3_key": "EBGR/MC/400_..."}
-    staging_bucket : str
-        Bucket S3 de staging (origen).
-    operational_bucket : str
-        Bucket S3 operational (destino).
- 
-    Returns
-    -------
-    dict con: mti, cln_s3_key, cal_s3_key, itx_s3_key, target_s3_key,
-              records, columns, batches.
+    Consolida CLN + CAL + ITX por llave:
+      file_id, file_idn, ref_id
+
+    Ya no concatena por posición.
     """
-    mti       = output["mti"]
+    KEYS = ["file_id", "file_idn", "ref_id"]
+
+    mti = output["mti"]
     cln_s3_key = output["s3_key"]
- 
+
     log.info("_store_output: START mti=%s | cln=%s", mti, cln_s3_key)
     t0 = perf_counter()
- 
-    cal_s3_key    = _derive_cal_key(cln_s3_key, mti)
+
+    cal_s3_key = _derive_cal_key(cln_s3_key, mti)
     target_s3_key = _derive_target_key(cln_s3_key, mti)
     itx_s3_key_candidate = (
         _derive_itx_key(cln_s3_key, mti) if mti in MTIS_WITH_ITX else None
     )
- 
-    # ── Leer CLN ──────────────────────────────────────────────────────────────
+
+    # ── Leer CLN ─────────────────────────────────────────────
     df_cln = _read_parquet_s3(staging_bucket, cln_s3_key)
+    df_cln = _normalize_merge_keys(df_cln, KEYS)
+
+    missing_keys = [k for k in KEYS if k not in df_cln.columns]
+    if missing_keys:
+        raise ValueError(f"CLN no tiene llaves {missing_keys}: {cln_s3_key}")
+
+    duplicated_cln = df_cln.duplicated(subset=KEYS).sum()
+    if duplicated_cln > 0:
+        raise ValueError(
+            f"CLN tiene duplicados por {KEYS}: duplicated={duplicated_cln} | {cln_s3_key}"
+        )
+
+    merged = df_cln.copy()
+
     log.info(
         "_store_output: CLN read | mti=%s | rows=%d cols=%d [%.2fs]",
-        mti, len(df_cln), len(df_cln.columns), perf_counter() - t0,
+        mti,
+        len(merged),
+        len(merged.columns),
+        perf_counter() - t0,
     )
-    frames = [df_cln]
- 
-    # ── Leer CAL y fusionar (columnas nuevas únicamente) ──────────────────────
+
+    # ── Leer CAL y fusionar por llave ─────────────────────────
     try:
         df_cal = _read_parquet_s3(staging_bucket, cal_s3_key)
-        existing_cols = set(df_cln.columns)
+        df_cal = _normalize_merge_keys(df_cal, KEYS)
+        
+        missing_keys = [k for k in KEYS if k not in df_cal.columns]
+        if missing_keys:
+            raise ValueError(f"CAL no tiene llaves {missing_keys}: {cal_s3_key}")
+
+        duplicated_cal = df_cal.duplicated(subset=KEYS).sum()
+        if duplicated_cal > 0:
+            raise ValueError(
+                f"CAL tiene duplicados por {KEYS}: duplicated={duplicated_cal} | {cal_s3_key}"
+            )
+
+        existing_cols = set(merged.columns)
         new_cols = [c for c in df_cal.columns if c not in existing_cols]
+
         if new_cols:
-            frames.append(df_cal[new_cols])
+            merged = merged.merge(
+                df_cal[KEYS + new_cols],
+                on=KEYS,
+                how="left",
+                validate="one_to_one",
+            )
+
+        log.info(
+            "_store_output: CAL merged by keys | mti=%s | rows=%d new_cols=%d",
+            mti,
+            len(merged),
+            len(new_cols),
+        )
+
         del df_cal
-        log.info("_store_output: CAL merged | mti=%s | new_cols=%d", mti, len(new_cols))
+
     except S3.exceptions.NoSuchKey:
         log.warning("_store_output: CAL not found (skipping) | %s", cal_s3_key)
+
     except Exception as exc:
-        log.warning("_store_output: CAL read error (skipping) | %s | %s", cal_s3_key, exc)
- 
-    # ── Leer ITX si aplica y existe ───────────────────────────────────────────
-    itx_s3_key_used: Optional[str] = None
- 
+        log.warning(
+            "_store_output: CAL read/merge error (skipping) | %s | %s",
+            cal_s3_key,
+            exc,
+        )
+
+    # ── Leer ITX si aplica y fusionar por llave ───────────────
+    itx_s3_key_used = None
+
     if itx_s3_key_candidate:
         try:
             df_itx = _read_parquet_s3(staging_bucket, itx_s3_key_candidate)
-            already = set().union(*(set(f.columns) for f in frames))
-            itx_new_cols = [c for c in df_itx.columns if c not in already]
+            df_itx = _normalize_merge_keys(df_itx, KEYS)
+            
+            missing_keys = [k for k in KEYS if k not in df_itx.columns]
+            if missing_keys:
+                raise ValueError(
+                    f"ITX no tiene llaves {missing_keys}: {itx_s3_key_candidate}"
+                )
+
+            duplicated_itx = df_itx.duplicated(subset=KEYS).sum()
+            if duplicated_itx > 0:
+                raise ValueError(
+                    f"ITX tiene duplicados por {KEYS}: duplicated={duplicated_itx} | {itx_s3_key_candidate}"
+                )
+
+            existing_cols = set(merged.columns)
+            itx_new_cols = [c for c in df_itx.columns if c not in existing_cols]
+
             if itx_new_cols:
-                frames.append(df_itx[itx_new_cols])
-            del df_itx
+                merged = merged.merge(
+                    df_itx[KEYS + itx_new_cols],
+                    on=KEYS,
+                    how="left",
+                    validate="one_to_one",
+                )
+
             itx_s3_key_used = itx_s3_key_candidate
+
             log.info(
-                "_store_output: ITX merged | mti=%s | new_cols=%d",
-                mti, len(itx_new_cols),
+                "_store_output: ITX merged by keys | mti=%s | rows=%d new_cols=%d",
+                mti,
+                len(merged),
+                len(itx_new_cols),
             )
+
+            del df_itx
+
         except S3.exceptions.NoSuchKey:
             log.info(
                 "_store_output: ITX not found (itx_s3_key=null) | %s",
                 itx_s3_key_candidate,
             )
+
         except Exception as exc:
             log.warning(
-                "_store_output: ITX read error (skipping) | %s | %s",
-                itx_s3_key_candidate, exc,
+                "_store_output: ITX read/merge error (skipping) | %s | %s",
+                itx_s3_key_candidate,
+                exc,
             )
- 
-    # ── Merge por índice posicional (misma cantidad de filas y mismo orden) ───
-    merged = pd.concat(frames, axis=1) if len(frames) > 1 else frames[0]
-    del frames
-    gc.collect()
- 
+
     records = len(merged)
     columns = len(merged.columns)
- 
-    # ── Escribir en operational ───────────────────────────────────────────────
+
+    # ── Escribir operational ──────────────────────────────────
     _write_parquet_s3(merged, operational_bucket, target_s3_key)
+
     del merged
     gc.collect()
- 
+
     log.info(
         "_store_output: END mti=%s | records=%d cols=%d [%.2fs]",
-        mti, records, columns, perf_counter() - t0,
+        mti,
+        records,
+        columns,
+        perf_counter() - t0,
     )
- 
-    return {
-        "mti":           mti,
-        "cln_s3_key":    cln_s3_key,
-        "cal_s3_key":    cal_s3_key,
-        "itx_s3_key":    itx_s3_key_used,
-        "target_s3_key": target_s3_key,
-        "records":       records,
-        "columns":       columns,
-        "batches":       1,
-    }
 
+    return {
+        "mti": mti,
+        "cln_s3_key": cln_s3_key,
+        "cal_s3_key": cal_s3_key,
+        "itx_s3_key": itx_s3_key_used,
+        "target_s3_key": target_s3_key,
+        "records": records,
+        "columns": columns,
+        "batches": 1,
+    }
 
 # ==============================================================================
 # Lambda handler

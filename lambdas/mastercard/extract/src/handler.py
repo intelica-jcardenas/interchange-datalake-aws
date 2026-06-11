@@ -650,7 +650,8 @@ def _align_df_1644(df: pd.DataFrame, fc: str, pds_layout: dict) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = pd.NA
 
-    return df[wanted]
+    extras = [c for c in df.columns if c not in set(wanted)]
+    return df[wanted + extras]
 
 
 # ==============================================================================
@@ -664,6 +665,7 @@ def _extract_1644(
     file_details: dict,
     origin_sub_dir: str = "200_IPM_1644_TRA",
     target_sub_dir: str = "300_IPM_1644_EXT",
+    content_hash: str = "",
 ) -> None:
     """
     Extract and standardise MTI 1644 parquet files.
@@ -710,6 +712,7 @@ def _extract_standard(
     file_details: dict,
     origin_sub_dir: str,
     target_sub_dir: str,
+    content_hash: str = "",
 ) -> None:
     """
     Shared extract pipeline for MTIs 1240, 1442, and 1740.
@@ -774,24 +777,27 @@ def _extract_standard(
 # To add a new MTI: write a wrapper here and add it to EXTRACTS.
 
 
-def _extract_1240(client_id: str, file_id: str, file_details: dict) -> None:
+def _extract_1240(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
     """Extract MTI 1240: 200_IPM_1240_TRA → 300_IPM_1240_EXT."""
     _extract_standard(
-        "1240", client_id, file_id, file_details, "200_IPM_1240_TRA", "300_IPM_1240_EXT"
+        "1240", client_id, file_id, file_details, "200_IPM_1240_TRA", "300_IPM_1240_EXT",
+        content_hash=content_hash,
     )
 
 
-def _extract_1442(client_id: str, file_id: str, file_details: dict) -> None:
+def _extract_1442(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
     """Extract MTI 1442: 200_IPM_1442_TRA → 300_IPM_1442_EXT."""
     _extract_standard(
-        "1442", client_id, file_id, file_details, "200_IPM_1442_TRA", "300_IPM_1442_EXT"
+        "1442", client_id, file_id, file_details, "200_IPM_1442_TRA", "300_IPM_1442_EXT",
+        content_hash=content_hash,
     )
 
 
-def _extract_1740(client_id: str, file_id: str, file_details: dict) -> None:
+def _extract_1740(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
     """Extract MTI 1740: 200_IPM_1740_TRA → 300_IPM_1740_EXT."""
     _extract_standard(
-        "1740", client_id, file_id, file_details, "200_IPM_1740_TRA", "300_IPM_1740_EXT"
+        "1740", client_id, file_id, file_details, "200_IPM_1740_TRA", "300_IPM_1740_EXT",
+        content_hash=content_hash,
     )
 
 
@@ -995,7 +1001,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
  
         log.info("START extract_%s", mti)
         t = perf_counter()
-        extract_fn(client_id=client_id, file_id=file_id, file_details=file_details)
+        extract_fn(client_id=client_id, file_id=file_id, file_details=file_details, content_hash=content_hash)
         log.info("END extract_%s | time=%.2fs", mti, perf_counter() - t)
         mtis_ok.append(mti)
  

@@ -479,7 +479,8 @@
                                                                           "--S3_REFERENCE.$":  "$.calculate_input.S3_REFERENCE",
                                                                           "--dynamodb_table_client.$":  "$.calculate_input.dynamodb_table_client",
                                                                           "--dynamodb_table_fields.$":  "$.calculate_input.dynamodb_table_fields",
-                                                                          "--s3_key_1644_cln.$":  "$.calculate_input.s3_key_1644_cln"
+                                                                          "--s3_key_1644_cln.$":  "$.calculate_input.s3_key_1644_cln",
+                                                                          "--content_hash.$":  "$.calculate_input.content_hash"
                                                                       }
                                                     },
                                      "Next":  "CheckCalculateResult",
@@ -527,8 +528,14 @@
                                                                     "Next":  "CalculateFailed"
                                                                 }
                                                             ],
-                                                "Default":  "PrepareInterchangeInput"
+                                                "Default":  "WaitForENIRelease"
                                             },
+                   "WaitForENIRelease":  {
+                                             "Type":  "Wait",
+                                             "Seconds":  180,
+                                             "Next":  "PrepareInterchangeInput",
+                                             "Comment":  "Espera 3 minutos para que AWS libere las ENIs del job Calculate antes de lanzar Interchange"
+                                         },
                    "CalculateFailed":  {
                                            "Type":  "Pass",
                                            "Parameters":  {
@@ -578,7 +585,8 @@
                                                                             "--file_date.$":  "$.interchange_input.file_date",
                                                                             "--S3_STAGING.$":  "$.interchange_input.S3_STAGING",
                                                                             "--S3_REFERENCE.$":  "$.interchange_input.S3_REFERENCE",
-                                                                            "--dynamodb_table_fields.$":  "$.interchange_input.dynamodb_table_fields"
+                                                                            "--dynamodb_table_fields.$":  "$.interchange_input.dynamodb_table_fields",
+                                                                            "--content_hash.$":  "$.interchange_input.content_hash"
                                                                         }
                                                       },
                                        "ResultPath":  "$.interchange_job_result",

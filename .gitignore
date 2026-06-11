@@ -23,3 +23,6 @@ Thumbs.db
 *inventory-to-rename.txt
 tst_file*
 sql*
+
+# Credenciales de proxies para scraping de tasas (mc-exchange-rates)
+**/resources/proxy_settings.json

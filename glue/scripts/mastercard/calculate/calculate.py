@@ -1421,6 +1421,7 @@ def process_file(
     df_ex: DataFrame,
     df_lookup_691: DataFrame,
     cln_schema=None,
+    content_hash: str = "",
 ) -> dict:
     """
     Procesa un único archivo parquet CLN y produce su correspondiente CAL.
@@ -1504,8 +1505,11 @@ def process_file(
         # 6. Exclude Flag
         df_exclude_keys = build_exclude_keys(df_cln, df_lookup_691)
         df_final = apply_exclude_flag(df_final_raw, df_exclude_keys).cache()
- 
-        # 7. Escribir con el mismo nombre de archivo que el input
+
+        # 7. Columna de trazabilidad (igual que VI)
+        df_final = df_final.withColumn("content_hash", F.lit(content_hash))
+
+        # 8. Escribir con el mismo nombre de archivo que el input
         record_count = df_final.count()
         save_parquet(df_final, output_file_path)
  
@@ -1545,6 +1549,7 @@ def main():
         "outputs",
         "dynamodb_table_client",
         "dynamodb_table_fields",
+        "content_hash",
     ])
  
     job = Job(glueContext)
@@ -1558,6 +1563,7 @@ def main():
     s3_staging_url      = args["S3_STAGING"]
     dynamo_table_client = args["dynamodb_table_client"]
     dynamo_table_fields = args["dynamodb_table_fields"]
+    content_hash        = args["content_hash"]
     outputs             = json.loads(args["outputs"])
  
     log_info("=" * 70)
@@ -1568,6 +1574,7 @@ def main():
     log_info(f"  file_id:           {file_id}")
     log_info(f"  file_type:         {file_type}")
     log_info(f"  file_date:         {file_date}")
+    log_info(f"  content_hash:      {content_hash}")
     log_info(f"  S3_REFERENCE:      {s3_reference_url}")
     log_info(f"  S3_STAGING:        {s3_staging_url}")
     log_info(f"  DynamoDB client:   {dynamo_table_client}")
@@ -1665,6 +1672,7 @@ def main():
             df_ex=df_ex,
             df_lookup_691=df_lookup_691,
             cln_schema=cln_schemas.get(mti),
+            content_hash=content_hash,
         )
  
         results.append(result)
@@ -1693,6 +1701,7 @@ def main():
         "total_outputs": len(results),
         "total_records": total_records,
         "outputs":       results,
+        "content_hash":  content_hash,
     }
     log_info(f"Output summary: {json.dumps(output_data)}")
  

@@ -1697,6 +1697,8 @@ def _canonical_schema_from_de_spec(de_spec: dict) -> pa.Schema:
     fields = [
         pa.field("file_idn",      pa.string()),
         pa.field("file_dt",       pa.string()),
+        pa.field("file_id",       pa.string()),
+        pa.field("content_hash",  pa.string()),
         pa.field("msg_no",        pa.int64()),
         pa.field("block",         pa.int64()),
         pa.field("mti",           pa.string()),
@@ -1926,8 +1928,8 @@ def _process_block(
         df_block["file_idn"] = file_idn
         df_block["file_dt"]  = file_dt
  
-    # Trazabilidad: columna content_hash en cada fila del parquet (igual que VI)
     df_block["content_hash"] = content_hash
+    df_block["file_id"]      = file_id
  
     write_parquet_by_mti_block_streaming(
         df_chunk=df_block,
@@ -2028,7 +2030,7 @@ def interpretate_msg(
  
     for row in rows:
         row["function_code"] = _extract_function_code_inline(row=row, de_spec=DE_SPEC)
-        log.logger.info(f"row: {row}")
+        #log.logger.info(f"row: {row}")
  
         mti      = row.get("mti")
         fc       = row.get("function_code")
