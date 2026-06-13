@@ -74,7 +74,11 @@ DYNAMO_TABLE_FILE_CONTROL: str = os.environ.get(
 )
  
 DYNAMO_TABLE_FIELDS: str = "itl-0004-itx-dev-dynamo-mastercard_fields-02"
- 
+
+# Rows read per batch when iterating parquet files with iter_batches.
+# Avoids materialising the full decompressed DataFrame in RAM.
+CLEAN_BATCH_SIZE = int(os.environ.get("ITX_CLEAN_BATCH_SIZE", "100000"))
+
 # ==============================================================================
 # Business constants
 # ==============================================================================
@@ -725,70 +729,50 @@ def _read_parquet(key: str) -> pd.DataFrame:
     return pd.read_parquet(io.BytesIO(body))
 
 
+def _align_df_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
+    """
+    Select schema columns from df, coerce pandas dtypes to match Arrow types,
+    and return a pa.Table ready for ParquetWriter.write_table().
+
+    Called once per batch in the iter_batches loop — stateless and row-independent.
+    """
+    schema_cols = [f.name for f in schema]
+    df_aligned = df[[c for c in schema_cols if c in df.columns]].copy()
+
+    for field in schema:
+        col = field.name
+        if col not in df_aligned.columns:
+            # Column absent in this chunk (e.g. PDS parent was null for all rows
+            # in this parquet but present in an earlier one that built the schema).
+            # Fill with nulls so the schema stays consistent across all output files.
+            df_aligned[col] = None
+            continue
+        if pa.types.is_string(field.type):
+            df_aligned[col] = df_aligned[col].astype("string")
+        elif pa.types.is_int64(field.type):
+            df_aligned[col] = pd.to_numeric(df_aligned[col], errors="coerce").astype("Int64")
+        elif pa.types.is_int32(field.type):
+            df_aligned[col] = pd.to_numeric(df_aligned[col], errors="coerce").astype("Int32")
+        elif pa.types.is_date(field.type):
+            # Native Python date objects — the only representation PyArrow reliably
+            # writes as date32 across Lambda's older pyarrow release.
+            dt_series = pd.to_datetime(df_aligned[col], errors="coerce")
+            df_aligned[col] = [None if pd.isna(v) else v.date() for v in dt_series]
+
+    return pa.Table.from_pandas(df_aligned, schema=schema, preserve_index=False)
+
+
 def _write_parquet_with_schema(df: pd.DataFrame, key: str, schema: pa.Schema) -> None:
     """
     Serialise a DataFrame as parquet using a PyArrow schema and upload it to S3.
- 
+
     Only columns present in both df and schema are written, guaranteeing a
     schema-conformant output file.
     """
-    schema_cols = [f.name for f in schema]
- 
-    df_aligned = df[[c for c in schema_cols if c in df.columns]].copy()
- 
-    # Align pandas dtypes with Arrow schema types before conversion.
-    # This prevents ArrowTypeError caused by pandas dtype inference mismatches.
-    for field in schema:
-        col = field.name
- 
-        if col not in df_aligned.columns:
-            continue
- 
-        if pa.types.is_string(field.type):
-            df_aligned[col] = df_aligned[col].astype("string")
- 
-        elif pa.types.is_int64(field.type):
-            df_aligned[col] = pd.to_numeric(
-                df_aligned[col],
-                errors="coerce",
-            ).astype("Int64")
- 
-        elif pa.types.is_int32(field.type):
-            df_aligned[col] = pd.to_numeric(
-                df_aligned[col],
-                errors="coerce",
-            ).astype("Int32")
-
-        elif pa.types.is_date(field.type):
-            # Convert to Python datetime.date objects (or None for nulls).
-            # Using native Python date objects is the only representation that
-            # PyArrow reliably writes as date32 across all supported versions.
-            # Relying on datetime64 → date32 auto-cast fails on older pyarrow
-            # releases (e.g. Lambda environments) when the column is all-null,
-            # producing timestamp[ms] or raising ArrowTypeError instead.
-            dt_series = pd.to_datetime(df_aligned[col], errors="coerce")
-            df_aligned[col] = [
-                None if pd.isna(v) else v.date()
-                for v in dt_series
-            ]
-
     buf = io.BytesIO()
- 
-    pq.write_table(
-        pa.Table.from_pandas(
-            df_aligned,
-            schema=schema,
-            preserve_index=False,
-        ),
-        buf,
-        compression="snappy",
-    )
- 
-    S3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=buf.getvalue(),
-    )
+    pq.write_table(_align_df_to_schema(df, schema), buf, compression="snappy")
+    buf.seek(0)
+    S3.put_object(Bucket=S3_BUCKET, Key=key, Body=buf)
 
 
 def _target_key(
@@ -860,27 +844,56 @@ def _clean_1644(
         fc = Path(key).stem.rsplit("_", 1)[-1]
         if fc not in VALID_FC_1644:
             continue
- 
-        df = _read_parquet(key)
- 
-        df_cast = _cast_df(df=df, param=field_defs, currency_decimals_map=currency_map)
-        del df
 
-        # Schema rebuilt per file: different FCs yield different column sets.
-        schema = _build_arrow_schema(
-            field_defs,
-            ordered_cols=list(df_cast.columns),
-            default_decimal_precision=18,
-            default_decimal_scale=2,
-            timestamp_unit="ns",
-        )
- 
-        out_key = _target_key(key, target_prefix, mti="1644", fc=fc)
-        _write_parquet_with_schema(df_cast, out_key, schema)
-        log.info("MTI 1644 clean | written → s3://%s/%s", S3_BUCKET, out_key)
- 
-        del df_cast
+        # ── Lectura en streaming: nunca se materializa el DataFrame completo ──
+        # 1) Descargar bytes comprimidos y crear un buffer seekable.
+        body = S3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        in_buf = io.BytesIO(body)
+        del body
         gc.collect()
+
+        pf = pq.ParquetFile(in_buf)
+        out_key = _target_key(key, target_prefix, mti="1644", fc=fc)
+        out_buf = io.BytesIO()
+        writer = None
+        schema = None  # reconstruido por archivo (cada FC produce columnas distintas)
+
+        try:
+            # 2) Iterar de a CLEAN_BATCH_SIZE filas — nunca el DataFrame entero.
+            for batch in pf.iter_batches(batch_size=CLEAN_BATCH_SIZE):
+                df = batch.to_pandas()
+                df_cast = _cast_df(df=df, param=field_defs, currency_decimals_map=currency_map)
+                del df
+
+                # 3) Construir el schema Arrow en el primer batch y reutilizarlo.
+                if schema is None:
+                    schema = _build_arrow_schema(
+                        field_defs,
+                        ordered_cols=list(df_cast.columns),
+                        default_decimal_precision=18,
+                        default_decimal_scale=2,
+                        timestamp_unit="ns",
+                    )
+
+                table = _align_df_to_schema(df_cast, schema)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_buf, schema, compression="snappy")
+                writer.write_table(table)
+
+                del df_cast, table
+                gc.collect()
+        finally:
+            if writer is not None:
+                writer.close()
+
+        # 4) Subir el parquet acumulado directamente a S3.
+        del in_buf
+        out_buf.seek(0)
+        S3.put_object(Bucket=S3_BUCKET, Key=out_key, Body=out_buf)
+        del out_buf
+        gc.collect()
+
+        log.info("MTI 1644 clean | written → s3://%s/%s", S3_BUCKET, out_key)
 
 
 def _clean_standard(
@@ -915,37 +928,66 @@ def _clean_standard(
     field_defs = _load_field_defs(field_defs_tag, with_file_cols=with_file_cols)
     currency_map = _get_currency_map()
  
-    # Schema is built once from the first file and reused — all files in a
-    # single MTI batch share the same column structure.
+    # Schema is built once from the first batch of the first file and reused —
+    # all files within the same MTI share the same column structure.
     schema: Optional[pa.Schema] = None
- 
-    for key in list_keys:
-        df = _read_parquet(key)
- 
-        df_cast = _cast_df(
-            df=df,
-            param=field_defs,
-            date_format=date_format,
-            timestamp_format=timestamp_format,
-            currency_decimals_map=currency_map,
-        )
-        del df
 
-        if schema is None:
-            schema = _build_arrow_schema(
-                field_defs,
-                ordered_cols=list(df_cast.columns),
-                default_decimal_precision=18,
-                default_decimal_scale=2,
-                timestamp_unit="ns",
-            )
- 
-        out_key = _target_key(key, target_prefix, mti=mti)
-        _write_parquet_with_schema(df_cast, out_key, schema)
-        log.info("MTI %s clean | written → s3://%s/%s", mti, S3_BUCKET, out_key)
- 
-        del df_cast
+    for key in list_keys:
+        # ── Lectura en streaming: nunca se materializa el DataFrame completo ──
+        # 1) Descargar bytes comprimidos y crear un buffer seekable.
+        body = S3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        in_buf = io.BytesIO(body)
+        del body
         gc.collect()
+
+        pf = pq.ParquetFile(in_buf)
+        out_key = _target_key(key, target_prefix, mti=mti)
+        out_buf = io.BytesIO()
+        writer = None
+
+        try:
+            # 2) Iterar de a CLEAN_BATCH_SIZE filas — nunca el DataFrame entero.
+            for batch in pf.iter_batches(batch_size=CLEAN_BATCH_SIZE):
+                df = batch.to_pandas()
+                df_cast = _cast_df(
+                    df=df,
+                    param=field_defs,
+                    date_format=date_format,
+                    timestamp_format=timestamp_format,
+                    currency_decimals_map=currency_map,
+                )
+                del df
+
+                # 3) Construir el schema Arrow en el primer batch y reutilizarlo
+                #    en todos los archivos del MTI (misma estructura de columnas).
+                if schema is None:
+                    schema = _build_arrow_schema(
+                        field_defs,
+                        ordered_cols=list(df_cast.columns),
+                        default_decimal_precision=18,
+                        default_decimal_scale=2,
+                        timestamp_unit="ns",
+                    )
+
+                table = _align_df_to_schema(df_cast, schema)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_buf, schema, compression="snappy")
+                writer.write_table(table)
+
+                del df_cast, table
+                gc.collect()
+        finally:
+            if writer is not None:
+                writer.close()
+
+        # 4) Subir el parquet acumulado directamente a S3.
+        del in_buf
+        out_buf.seek(0)
+        S3.put_object(Bucket=S3_BUCKET, Key=out_key, Body=out_buf)
+        del out_buf
+        gc.collect()
+
+        log.info("MTI %s clean | written → s3://%s/%s", mti, S3_BUCKET, out_key)
 
 
 # Thin wrappers that bind each MTI to its subdirectories and field-def variant.

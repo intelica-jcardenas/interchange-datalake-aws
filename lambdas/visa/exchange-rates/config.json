@@ -6,8 +6,8 @@
     "Description": "Final Settings",
     "Timeout": 900,
     "MemorySize": 2048,
-    "LastModified": "2026-06-11T20:33:48.000+0000",
-    "CodeSha256": "e26e8fd1e39ccd0719b47969429ac36674c3cd38c9927f478c020e1cd32630f8",
+    "LastModified": "2026-06-11T21:16:35.000+0000",
+    "CodeSha256": "c0b941381d791715dc7c4d5040b9a61daf0d75770f07682a5fb6a432fc3f80ea",
     "Version": "$LATEST",
     "VpcConfig": {
         "SubnetIds": [
@@ -23,7 +23,7 @@
     "TracingConfig": {
         "Mode": "PassThrough"
     },
-    "RevisionId": "d54a3125-7a19-4227-be68-0a27855c0f90",
+    "RevisionId": "293b5f34-eb6e-448d-af1f-b0d329ab0e22",
     "State": "Active",
     "LastUpdateStatus": "Successful",
     "PackageType": "Image",

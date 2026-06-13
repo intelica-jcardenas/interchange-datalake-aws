@@ -1611,8 +1611,8 @@ def read_len_prefixed_messages_variable(
         body_bytes           = bytearray()
         parse_ok             = True
 
-        log.logger.info(f"mti_bytes: {mti_bytes} | bitmap_16: {bitmap_16} | mti: {mti} | enc: {enc}")
-        log.logger.info(f"field_present: {fields_present} | body_bytes: {body_bytes} | parse_ok: {parse_ok}")
+        # log.logger.info(f"mti_bytes: {mti_bytes} | bitmap_16: {bitmap_16} | mti: {mti} | enc: {enc}")
+        # log.logger.info(f"field_present: {fields_present} | body_bytes: {body_bytes} | parse_ok: {parse_ok}")
 
         for i in range(2, 129):
             if i not in fields_present:
@@ -1897,51 +1897,85 @@ def _process_block(
     Convierte el buffer de un bloque a DataFrame wide, aplica el contexto
     file_idn/file_dt del trailer 695, y escribe el parquet correspondiente.
     Se llama una vez por bloque, justo cuando se detecta el 695.
+
+    El buffer se procesa en sub-chunks para no materializar toda la lista de
+    wide_rows de golpe (un bloque grande puede tener 400K+ mensajes con 80+
+    columnas cada uno, lo que presiona varios GB de RAM de una sola vez).
+
+    Seguridad de file_idn/file_dt: ambos valores vienen del trailer 695 que
+    ya fue leido ANTES de llamar a esta funcion, por lo que estan disponibles
+    desde el primer sub-chunk. No hay riesgo de procesar un chunk sin contexto.
+
+    Cada elemento de block_buffer es un dict Python completamente parseado
+    (mensaje ISO-8583 completo). El chunking opera sobre esa lista de objetos,
+    nunca sobre bytes crudos, por lo que no existe el problema de "cortar un
+    mensaje a la mitad".
     """
     if not block_buffer:
         log.logger.info(f"No hay block_buffer/vacio")
         return
- 
-    wide_rows = [
-        build_wide_row(
-            msg_no=cast(int, row["msg_no"]),
-            block=block_no,
-            mti=cast(Optional[str], row.get("mti")),
-            enc=cast(Optional[str], row.get("enc")),
-            function_code=cast(Optional[str], row.get("function_code")),
-            function_role=row.get("function_role"),
-            parse_ok=cast(bool, row.get("parse_ok", False)),
-            bitmap_hex=row.get("bitmap"),
-            body_hex=row.get("body"),
-            de_spec=DE_SPEC,
-            fields=cast(Optional[list[int]], row.get("fields")),
-        )
-        for row in block_buffer
-    ]
- 
-    df_block = pd.DataFrame(wide_rows)
-    del wide_rows
- 
-    df_block = df_block.reindex(columns=schema.names)
- 
-    if file_idn is not None:
-        df_block["file_idn"] = file_idn
-        df_block["file_dt"]  = file_dt
- 
-    df_block["content_hash"] = content_hash
-    df_block["file_id"]      = file_id
- 
-    write_parquet_by_mti_block_streaming(
-        df_chunk=df_block,
-        fs=fs,
-        target_layer=target_layer,
-        client_id=client_id,
-        file_id=file_id,
-        schema=schema,
-        writers=writers,
+
+    chunk_size = int(os.environ.get("ITX_INTERPRETER_BLOCK_CHUNK_SIZE", "10000"))
+    total      = len(block_buffer)
+    n_chunks   = (total + chunk_size - 1) // chunk_size
+
+    log.logger.info(
+        f"[_process_block] bloque={block_no} | mensajes={total} | "
+        f"chunk_size={chunk_size} | chunks={n_chunks} | file_idn={file_idn!r}"
     )
- 
-    del df_block
+
+    for chunk_idx, start in enumerate(range(0, total, chunk_size)):
+        sub = block_buffer[start : start + chunk_size]
+
+        wide_rows = [
+            build_wide_row(
+                msg_no=cast(int, row["msg_no"]),
+                block=block_no,
+                mti=cast(Optional[str], row.get("mti")),
+                enc=cast(Optional[str], row.get("enc")),
+                function_code=cast(Optional[str], row.get("function_code")),
+                function_role=row.get("function_role"),
+                parse_ok=cast(bool, row.get("parse_ok", False)),
+                bitmap_hex=row.get("bitmap"),
+                body_hex=row.get("body"),
+                de_spec=DE_SPEC,
+                fields=cast(Optional[list[int]], row.get("fields")),
+            )
+            for row in sub
+        ]
+
+        df_chunk = pd.DataFrame(wide_rows)
+        del wide_rows
+
+        df_chunk = df_chunk.reindex(columns=schema.names)
+
+        # file_idn y file_dt ya son conocidos (vienen del trailer 695 leido
+        # antes de llamar a esta funcion) — se aplican igual a cada sub-chunk.
+        if file_idn is not None:
+            df_chunk["file_idn"] = file_idn
+            df_chunk["file_dt"]  = file_dt
+
+        df_chunk["content_hash"] = content_hash
+        df_chunk["file_id"]      = file_id
+
+        write_parquet_by_mti_block_streaming(
+            df_chunk=df_chunk,
+            fs=fs,
+            target_layer=target_layer,
+            client_id=client_id,
+            file_id=file_id,
+            schema=schema,
+            writers=writers,
+        )
+
+        del df_chunk
+        gc.collect()
+        pa.default_memory_pool().release_unused()
+
+        log.logger.info(
+            f"[_process_block] bloque={block_no} | chunk {chunk_idx + 1}/{n_chunks} "
+            f"({start}–{min(start + chunk_size, total) - 1}) escrito"
+        )
 
 
 

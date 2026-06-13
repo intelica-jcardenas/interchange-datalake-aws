@@ -39,6 +39,8 @@ from typing import Any, Iterable
 
 import boto3
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -56,6 +58,10 @@ DYNAMO_TABLE_FILE_CONTROL = os.environ.get("DYNAMO_TABLE_FILE_CONTROL")
  
 # Stores DE/PDS field metadata and the extract column names.
 DYNAMO_TABLE_FIELDS = os.environ.get("DYNAMO_TABLE_FIELDS")
+
+# Rows read per batch when iterating parquet files with iter_batches.
+# Avoids materialising the full decompressed DataFrame in RAM.
+EXTRACT_BATCH_SIZE = int(os.environ.get("ITX_EXTRACT_BATCH_SIZE", "100000"))
 
 # ==============================================================================
 # Static business config — MTIs 1240 / 1442 / 1644 / 1740
@@ -688,21 +694,48 @@ def _extract_1644(
         if fc not in VALID_FC_1644:
             continue
 
-        df = _read_parquet(key)
-        df["FUNCTION_CODE"] = fc
-        df = _align_df_1644(df, fc, pds_layout)
-        # Merge both rename dicts into a single pass — avoids an intermediate copy.
-        df = df.rename(columns={**rename_map, **RENAME_COLS_1644})
-        df.columns = [_normalize_col(c) for c in df.columns]
-
-        out_key = _target_key(key, target_prefix, mti="1644", fc=fc)
-        _write_parquet(df, out_key)
-        log.info("MTI 1644 | written → s3://%s/%s", S3_BUCKET, out_key)
-
-        # Explicitly release the DataFrame and trigger GC so the next file
-        # starts with a clean heap instead of accumulating allocations.
-        del df
+        # ── Lectura en streaming: nunca se materializa el DataFrame completo ──
+        # 1) Descargar bytes comprimidos y crear un buffer seekable.
+        body = S3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        in_buf = io.BytesIO(body)
+        del body   # libera la copia original comprimida
         gc.collect()
+
+        pf = pq.ParquetFile(in_buf)    # abre el archivo (solo lee el footer)
+        out_key = _target_key(key, target_prefix, mti="1644", fc=fc)
+        out_buf = io.BytesIO()
+        writer = None
+
+        try:
+            # 2) Iterar de a EXTRACT_BATCH_SIZE filas — nunca el DataFrame entero.
+            for batch in pf.iter_batches(batch_size=EXTRACT_BATCH_SIZE):
+                df = batch.to_pandas()
+
+                df["FUNCTION_CODE"] = fc
+                df = _align_df_1644(df, fc, pds_layout)
+                df = df.rename(columns={**rename_map, **RENAME_COLS_1644})
+                df.columns = [_normalize_col(c) for c in df.columns]
+
+                # 3) Escribir el batch al ParquetWriter en memoria.
+                table = pa.Table.from_pandas(df, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_buf, table.schema, compression="snappy")
+                writer.write_table(table)
+
+                del df, table
+                gc.collect()
+        finally:
+            if writer is not None:
+                writer.close()
+
+        # 4) Subir el parquet acumulado en out_buf directamente a S3.
+        del in_buf
+        out_buf.seek(0)
+        S3.put_object(Bucket=S3_BUCKET, Key=out_key, Body=out_buf)
+        del out_buf
+        gc.collect()
+
+        log.info("MTI 1644 | written → s3://%s/%s", S3_BUCKET, out_key)
 
 
 def _extract_standard(
@@ -731,46 +764,78 @@ def _extract_standard(
     expected_keys = list(dict_de.keys()) + list(dict_pds.keys())
 
     for key in list_keys:
-        df = _read_parquet(key)
-
-        # rename() produces a lightweight copy (only column labels, not data).
-        df = df.rename(columns=rename_map)
-        df.columns = [_normalize_col(c) for c in df.columns]
-
-        # Agregar esto:
-        cols_to_drop = []
-        for layout_key, spec in {
-            **dict_de,
-            **dict_pds,
-        }.items():  # ← renombrado a layout_key
-            if isinstance(spec, dict):
-                parent = _normalize_col(layout_key)
-                children = [_normalize_col(k) for k in spec.keys()]
-                if parent in df.columns and any(c in df.columns for c in children):
-                    cols_to_drop.append(parent)
-
-        if cols_to_drop:
-            df = df.drop(columns=cols_to_drop)
-
-        missing = _missing_layout_keys(df, expected_keys)
-        if missing:
-            log.warning(
-                "MTI %s | missing layout fields: %s%s",
-                mti,
-                missing[:20],
-                " ..." if len(missing) > 20 else "",
-            )
-            # _fill_missing_cols operates in-place — no extra copy.
-            df = _fill_missing_cols(df, missing)
-
-        df = _reorder_cols(df, ordered_layout_cols, _FIRST_COLS)
-
-        out_key = _target_key(key, target_prefix, mti=mti)
-        _write_parquet(df, out_key)
-        log.info("MTI %s | written → s3://%s/%s", mti, S3_BUCKET, out_key)
-
-        del df
+        # ── Lectura en streaming: nunca se materializa el DataFrame completo ──
+        # 1) Descargar bytes comprimidos y crear un buffer seekable.
+        body = S3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        in_buf = io.BytesIO(body)
+        del body   # libera la copia original comprimida
         gc.collect()
+
+        pf = pq.ParquetFile(in_buf)    # abre el archivo (solo lee el footer)
+        out_key = _target_key(key, target_prefix, mti=mti)
+        out_buf = io.BytesIO()
+        writer = None
+
+        # Estas listas se calculan una sola vez desde el primer batch:
+        # los nombres de columna son iguales en todos los batches del mismo archivo.
+        cols_to_drop: list[str] | None = None
+        missing: list[str] | None = None
+
+        try:
+            # 2) Iterar de a EXTRACT_BATCH_SIZE filas — nunca el DataFrame entero.
+            for batch in pf.iter_batches(batch_size=EXTRACT_BATCH_SIZE):
+                df = batch.to_pandas()
+
+                df = df.rename(columns=rename_map)
+                df.columns = [_normalize_col(c) for c in df.columns]
+
+                # 3) Calcular cols_to_drop y missing en el primer batch
+                #    (los nombres de columna no cambian entre batches del mismo archivo).
+                if cols_to_drop is None:
+                    cols_to_drop = []
+                    for layout_key, spec in {**dict_de, **dict_pds}.items():
+                        if isinstance(spec, dict):
+                            parent = _normalize_col(layout_key)
+                            children = [_normalize_col(k) for k in spec.keys()]
+                            if parent in df.columns and any(c in df.columns for c in children):
+                                cols_to_drop.append(parent)
+
+                    missing = _missing_layout_keys(df, expected_keys)
+                    if missing:
+                        log.warning(
+                            "MTI %s | missing layout fields: %s%s",
+                            mti,
+                            missing[:20],
+                            " ..." if len(missing) > 20 else "",
+                        )
+
+                if cols_to_drop:
+                    df = df.drop(columns=cols_to_drop)
+                if missing:
+                    df = _fill_missing_cols(df, missing)
+
+                df = _reorder_cols(df, ordered_layout_cols, _FIRST_COLS)
+
+                # 4) Escribir el batch al ParquetWriter en memoria.
+                table = pa.Table.from_pandas(df, preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_buf, table.schema, compression="snappy")
+                writer.write_table(table)
+
+                del df, table
+                gc.collect()
+        finally:
+            if writer is not None:
+                writer.close()
+
+        # 5) Subir el parquet acumulado en out_buf directamente a S3.
+        del in_buf
+        out_buf.seek(0)
+        S3.put_object(Bucket=S3_BUCKET, Key=out_key, Body=out_buf)
+        del out_buf
+        gc.collect()
+
+        log.info("MTI %s | written → s3://%s/%s", mti, S3_BUCKET, out_key)
 
 
 # Thin wrappers that bind each MTI to its fixed subdirectory names.

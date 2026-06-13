@@ -20,7 +20,7 @@ itl-0004-itx-{env}-intchg-02-lmbd-unzip          (si es ZIP)
 itl-0004-itx-{env}-intchg-02-lmbd-router
     |  [clasifica via DynamoDB, inicia Step Function]
     |
-    +--[Visa]----> itx-visa-orchestrator
+    +--[Visa]----> itl-0004-itx-dev-intchg-02-sfn-vi
     |                   |
     |              lmbd-vi-transform      Texto plano latin-1 -> Parquet (BASE II, SMS, VSS)
     |              lmbd-vi-extract        Extraccion de campos por posicion fija
@@ -30,7 +30,7 @@ itl-0004-itx-{env}-intchg-02-lmbd-router
     |              glue-vi-interchange    Asignacion de tarifas de interchange + DQ vs VSS
     |              lmbd-vi-store          Consolida CLN+CAL+ITX -> S3 Operational
     |
-    +--[MC]------> itx-mastercard-orchestrator
+    +--[MC]------> itl-0004-itx-dev-intchg-02-sfn-mc
                         |
                    lmbd-mc-interpreter    IPM/ISO-8583 -> Parquets por MTI (paso exclusivo MC)
                    lmbd-mc-transform      Estructuracion de DEs y PDS por MTI
@@ -89,8 +89,8 @@ Athena (*)                                        Consultas SQL sobre datos fina
 
 | Nombre | Marca | Estado |
 |--------|-------|--------|
-| `itx-visa-orchestrator` | Visa | Funcional |
-| `itx-mastercard-orchestrator` | Mastercard | Pendiente de deploy |
+| `itl-0004-itx-dev-intchg-02-sfn-vi` | Visa | Funcional |
+| `itl-0004-itx-dev-intchg-02-sfn-mc` | Mastercard | En validación end-to-end |
 
 ### S3 Buckets
 
@@ -184,7 +184,7 @@ terraform init && terraform plan && terraform apply
 | Componente | Estado |
 |------------|--------|
 | Pipeline Visa completo | Implementado y validado |
-| Pipeline Mastercard completo | Implementado — en validacion end-to-end con itx-mastercard-orchestrator |
+| Pipeline Mastercard completo | Implementado — en validacion end-to-end con itl-0004-itx-dev-intchg-02-sfn-mc |
 | Athena (crawlers, workgroups, tablas) | Pendiente de configuracion y validacion |
 
 Ver `CLAUDE.md` para documentacion tecnica detallada.

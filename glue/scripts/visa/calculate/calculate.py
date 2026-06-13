@@ -1023,76 +1023,60 @@ def calc_vss_report_type(df: DataFrame, vss_type: str) -> DataFrame:
  
 def calc_vss_aggregation_level(df: DataFrame, vss_type: str) -> DataFrame:
     """
-    vss_aggregation_level con lógica recursiva completa.
-    - Level 10: Top level (rollup_to == reporting_for)
-    - Level 1-3: Intermediate levels
-    - Level 0: Base level (default)
+    vss_aggregation_level — réplica exacta de la lógica de Standard 1.0.
+
+    Valores posibles: 0 (hoja), 1 (nodo intermedio/padre), 10 (raíz).
+
+    Lógica:
+      - 10 : rollup_to == reporting_for  (nodo raíz, se reporta a sí mismo)
+      -  1 : rollup_to != reporting_for  Y  reporting_for ∈ rollup_group
+             (este nodo es él mismo un destino de rollup → nodo intermedio/padre)
+      -  0 : rollup_to != reporting_for  Y  reporting_for ∉ rollup_group
+             (nodo hoja, nadie le hace rollup)
+
+    rollup_group = conjunto de todos los valores rollup_to donde rollup_to != reporting_for,
+    es decir, el conjunto de identificadores que son destino de rollup de alguna otra fila.
+
+    Nota: la implementación anterior navegaba la jerarquía hacia arriba en 3 iteraciones,
+    lo que producía que todas las hojas recibieran nivel 2 en lugar de 0, porque el
+    rollup_to de una hoja siempre pertenece a rollup_group por definición.
     """
-    rollup_col = f"rollup_to_sre_identifier_{vss_type}"
+    rollup_col    = f"rollup_to_sre_identifier_{vss_type}"
     reporting_col = f"reporting_for_sre_identifier_{vss_type}"
-    
+
     if rollup_col not in df.columns or reporting_col not in df.columns:
         log_info(f"  Warning: Missing rollup columns for VSS {vss_type}. Setting aggregation_level to 0.")
         return df.withColumn("calc_vss_aggregation_level", F.lit(0).cast(LongType()))
-    
-    # Añadir row_id único
-    df = df.withColumn("_row_id", F.monotonically_increasing_id())
-    
-    # Condición top level
-    top_level_condition = F.col(rollup_col) == F.col(reporting_col)
-    
-    # Identificar rollup groups (nodos intermedios)
-    rollup_groups_df = df.filter(
+
+    # Conjunto de todos los rollup_to donde rollup_to != reporting_for.
+    # Estos son los identificadores de nodos padre/intermedios (alguien les hace rollup).
+    rollup_group_df = df.filter(
         F.col(rollup_col) != F.col(reporting_col)
     ).select(
         F.col(rollup_col).alias("_rollup_group_id")
     ).distinct()
-    
-    rollup_groups_df = F.broadcast(rollup_groups_df)
-    
-    # Lookup para subir en jerarquía
-    hierarchy_lookup = df.select(
-        F.col(reporting_col).alias("_lookup_reporting"),
-        F.col(rollup_col).alias("_lookup_rollup")
-    ).distinct()
-    
-    # Inicializar
+
+    # LEFT JOIN: ¿es el reporting_for de esta fila un nodo padre?
+    # Si el join encuentra match → _rollup_group_id no es null → nivel 1.
+    df = df.join(
+        F.broadcast(rollup_group_df),
+        F.col(reporting_col) == F.col("_rollup_group_id"),
+        how="left"
+    )
+
     df = df.withColumn(
         "calc_vss_aggregation_level",
-        F.when(top_level_condition, F.lit(10)).otherwise(F.lit(0))
-    )
-    df = df.withColumn("_current_reporting", F.col(reporting_col))
-    
-    # Calcular niveles 1, 2, 3
-    for level in [1, 2, 3]:
-        df = df.join(
-            rollup_groups_df.withColumn("_in_rollup_group", F.lit(True)),
-            F.col("_current_reporting") == F.col("_rollup_group_id"),
-            how="left"
-        ).drop("_rollup_group_id")
-        
-        df = df.withColumn(
-            "calc_vss_aggregation_level",
-            F.when(
-                (F.col("calc_vss_aggregation_level") == 0) &
-                (~top_level_condition) &
-                (F.col("_in_rollup_group") == True),
-                F.lit(level)
-            ).otherwise(F.col("calc_vss_aggregation_level"))
-        )
-        
-        df = df.join(
-            F.broadcast(hierarchy_lookup),
-            F.col("_current_reporting") == F.col("_lookup_reporting"),
-            how="left"
-        ).withColumn(
-            "_current_reporting",
-            F.coalesce(F.col("_lookup_rollup"), F.lit(""))
-        ).drop("_lookup_reporting", "_lookup_rollup", "_in_rollup_group")
-    
-    df = df.drop("_row_id", "_current_reporting")
-    df = df.withColumn("calc_vss_aggregation_level", F.col("calc_vss_aggregation_level").cast(LongType()))
-    
+        F.when(
+            F.col(rollup_col) == F.col(reporting_col),
+            F.lit(10)                                           # raíz
+        ).when(
+            F.col("_rollup_group_id").isNotNull(),
+            F.lit(1)                                            # nodo intermedio/padre
+        ).otherwise(
+            F.lit(0)                                            # hoja
+        ).cast(LongType())
+    ).drop("_rollup_group_id")
+
     return df
 
 

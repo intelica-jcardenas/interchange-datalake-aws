@@ -17,7 +17,7 @@ Este repositorio es la **migración a AWS** de un sistema de procesamiento de ar
 **Desarrollador:** Julio Cesar Cardenas Suca
 **Runtime:** Python 3.11
 **Región AWS:** eu-south-2 (cuenta de prueba)
-**Estado:** Pipeline Visa implementado y validado. Mastercard: todos los componentes implementados (2026-06-02) — en validacion end-to-end con itx-mastercard-orchestrator.
+**Estado:** Pipeline Visa implementado y validado. Mastercard: todos los componentes implementados (2026-06-02) — en validacion end-to-end con itl-0004-itx-dev-intchg-02-sfn-mc.
 
 ---
 
@@ -41,8 +41,8 @@ lmbd-router
     ↓
     ├── direction=ARDEF ──→ lmbd-vi-ardef     [async directo, sin Step Function]
     ├── direction=IAR   ──→ lmbd-mc-iar       [async directo, sin Step Function]
-    ├── brand=VISA      ──→ itx-visa-orchestrator (Step Function)
-    └── brand=MASTERCARD──→ itx-mastercard-orchestrator (Step Function)
+    ├── brand=VISA      ──→ itl-0004-itx-dev-intchg-02-sfn-vi (Step Function)
+    └── brand=MASTERCARD──→ itl-0004-itx-dev-intchg-02-sfn-mc (Step Function)
 
 Step Functions (flujo normal IN/OUT)
     ↓
@@ -69,8 +69,8 @@ Athena                      → consultas SQL sobre datos finales
 
 | direction | brand | Destino | Razon |
 |-----------|-------|---------|-------|
-| IN / OUT | VISA | `itx-visa-orchestrator` | Flujo normal de transacciones |
-| IN / OUT | MASTERCARD | `itx-mastercard-orchestrator` | Flujo normal de transacciones |
+| IN / OUT | VISA | `itl-0004-itx-dev-intchg-02-sfn-vi` | Flujo normal de transacciones |
+| IN / OUT | MASTERCARD | `itl-0004-itx-dev-intchg-02-sfn-mc` | Flujo normal de transacciones |
 | ARDEF | VISA | `lmbd-vi-ardef` (directo) | Archivo de reglas/BINes, no requiere orquestacion |
 | IAR | MASTERCARD | `lmbd-mc-iar` (directo) | Archivo de reglas/BINes, no requiere orquestacion |
 | ZIP | cualquiera | `lmbd-unzip` (async) | Se descomprime primero; cada archivo interno re-dispara el router |
@@ -393,7 +393,7 @@ DYNAMODB_TABLE_FILE_PATTERN=itl-0004-itx-dev-dynamo-file_pattern-02
 DYNAMODB_TABLE_VISA_FIELDS=itl-0004-itx-dev-dynamo-visa_fields-02
 DYNAMODB_TABLE_CLIENT=itl-0004-itx-dev-dynamo-client-02
 
-STEP_FUNCTION_ARN=arn:aws:states:eu-south-2:<account-id>:stateMachine:itx-visa-orchestrator
+STEP_FUNCTION_ARN=arn:aws:states:eu-south-2:<account-id>:stateMachine:itl-0004-itx-dev-intchg-02-sfn-vi
 
 CHUNK_SIZE_MB=64
 FLUSH_BATCH_SIZE=500000
@@ -431,7 +431,7 @@ terraform apply
 ## Pendientes conocidos
 
 **Mastercard — en validacion end-to-end:**
-- Pipeline MC completo desplegado — validacion en curso con `itx-mastercard-orchestrator`
+- Pipeline MC completo desplegado — validacion en curso con `itl-0004-itx-dev-intchg-02-sfn-mc`
 - Gotchas de mc-transform (timeout multi-MTI, chunking, /tmp, var DDB) pendientes de resolver — ver `.claude/memory/gotchas.md`
 
 **General:**
@@ -439,10 +439,12 @@ terraform apply
 - `itx-glue-crawler-ebgr-role`: rol IAM propio para el crawler Mastercard
 - Renombrar crawlers y databases Glue con prefijo `itx-` consistente — verificado 2026-06-06: los 16 objetos planeados en `glue/GLUE_CATALOG_CREATION.md` existen, pero con nombres reales que omiten `intchg` respecto al plan documentado; ademas hay 5 objetos extra (databases/crawlers `poc_*`) con una tercera convencion de nombres distinta. Detalle e inventario completo en la seccion "Estado de verificacion" de ese mismo archivo.
 - Mover scripts Glue MC de bucket `itl-0004-itx-dev-poc-02-reference/` al bucket oficial `itl-0004-itx-dev-intchg-02-s3-reference/`
-- Configurar retencion de logs en CloudWatch (variable `log_retention_days = 30` en Terraform ya esta lista)
+- Configurar retencion de logs en CloudWatch (variable `log_retention_days = 30` en Terraform ya esta lista) — auditoria 2026-06-11 via `aws logs describe-log-groups`: aplicado PARCIALMENTE y con valores inconsistentes. 60d en `itx-interpreter`(huerfana), `archive-file`, `router`, `vi-clean`, `vi-extract`, `vi-store`, `vi-transform` y los logs del SFN Visa; 30d (el valor real de terraform) solo en `lmbd-test-1/2` y los logs del SFN MC. **Sin retencion (None = nunca expira):** `mc-clean`, `mc-exchange-rates`, `mc-extract`, `mc-iar`, `mc-interpreter`, `mc-store`, `mc-transform`, `vi-ardef`, `vi-exchange-rates`, `unzip` — practicamente todo Mastercard sin retencion. Aplicar 30d a estos cuando se revise.
+- Lambda huerfana `itl-0004-itx-dev-intchg-02-itx-interpreter` (10240MB/900s, LastModified 2026-05-18, **nunca invocada** — sin log streams) detectada en auditoria 2026-06-11: remanente de la convencion de nombres vieja (`itx-*`), ya reemplazada por `lmbd-mc-interpreter`. Sus "hermanas" `itx-ardef`/`itx-iar`/`itx-unzip` ya fueron borradas (solo quedan sus log groups huerfanos sin funcion). Eliminar `itx-interpreter` y los 3 log groups huerfanos cuando se confirme que no esta referenciada por nada.
 - Testing end-to-end en ambiente empresarial
 - Renombrar `glue-test-1` (job real de `glue-vi-mc-reporting` / `get_transaction.py`) a un nombre que siga la convencion (ej. `itl-0004-itx-dev-intchg-02-glue-vi-mc-reporting`); existen ademas `glue-test-2/3/4` sin uso conocido — verificar antes de tocarlos
 - `load_exchange_rates()` (reporting) usa `exchange_rate/rate_date=YYYY-MM-DD/` como fuente de tipo de cambio — hay un nuevo metodo de extraccion de tipo de cambio Visa en desarrollo que podria reemplazar/complementar esta fuente; revisar `load_exchange_rates()` cuando este disponible
+- Eliminar archivos de documentacion/infra legacy que referencian buckets y nombres de la convencion antigua (anterior a `itl-0004-itx-{env}-intchg-02-*`): `.env.example`, `step-functions/README.md`, `lambdas/router/README.md`, `infrastructure/terraform/stepfunctions.tf`, `infrastructure/deploy.sh`, `iam/README.md`, `CHANGELOG.md`. La convencion vigente es la documentada arriba en "Convencion de nombres". Antes de eliminarlos, recrear `README.md` en las carpetas correspondientes (`step-functions/`, `lambdas/router/`, `iam/`, `infrastructure/`) con la nomenclatura y nombres reales actuales. Nota: `infrastructure/terraform/stepfunctions.tf` define un solo Step Function (`itx_main_orchestrator`) pero AWS tiene dos (`sfn-vi`, `sfn-mc`) — revisar si terraform necesita 2 recursos separados antes de reescribir.
 
 ---
 

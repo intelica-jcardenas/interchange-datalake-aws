@@ -139,7 +139,8 @@ def _write_parquet_s3(df: pd.DataFrame, bucket: str, key: str) -> None:
     """Serializa un DataFrame como Parquet (snappy) y lo sube a S3."""
     buf = io.BytesIO()
     df.to_parquet(buf, index=False, compression="snappy")
-    S3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    buf.seek(0)
+    S3.put_object(Bucket=bucket, Key=key, Body=buf)
     log.info("_write_parquet_s3: written → s3://%s/%s (%d rows)", bucket, key, len(df))
  
  
@@ -174,12 +175,9 @@ def _derive_target_key(cln_s3_key: str, mti: str) -> str:
     return cln_s3_key.replace(f"400_IPM_{mti}_CLN", f"IPM_{mti}", 1)
 
 def _normalize_merge_keys(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
-    df = df.copy()
-
     for k in keys:
         if k in df.columns:
             df[k] = df[k].astype("string").str.strip()
-
     return df
 
 # ==============================================================================
@@ -334,7 +332,7 @@ def _store_output(
 
     # ── Leer CLN ─────────────────────────────────────────────
     df_cln = _read_parquet_s3(staging_bucket, cln_s3_key)
-    df_cln = _normalize_merge_keys(df_cln, KEYS)
+    _normalize_merge_keys(df_cln, KEYS)
 
     missing_keys = [k for k in KEYS if k not in df_cln.columns]
     if missing_keys:
@@ -346,7 +344,9 @@ def _store_output(
             f"CLN tiene duplicados por {KEYS}: duplicated={duplicated_cln} | {cln_s3_key}"
         )
 
-    merged = df_cln.copy()
+    merged = df_cln
+    del df_cln
+    gc.collect()
 
     log.info(
         "_store_output: CLN read | mti=%s | rows=%d cols=%d [%.2fs]",
@@ -359,8 +359,8 @@ def _store_output(
     # ── Leer CAL y fusionar por llave ─────────────────────────
     try:
         df_cal = _read_parquet_s3(staging_bucket, cal_s3_key)
-        df_cal = _normalize_merge_keys(df_cal, KEYS)
-        
+        _normalize_merge_keys(df_cal, KEYS)
+
         missing_keys = [k for k in KEYS if k not in df_cal.columns]
         if missing_keys:
             raise ValueError(f"CAL no tiene llaves {missing_keys}: {cal_s3_key}")
@@ -390,6 +390,7 @@ def _store_output(
         )
 
         del df_cal
+        gc.collect()
 
     except S3.exceptions.NoSuchKey:
         log.warning("_store_output: CAL not found (skipping) | %s", cal_s3_key)
@@ -407,8 +408,8 @@ def _store_output(
     if itx_s3_key_candidate:
         try:
             df_itx = _read_parquet_s3(staging_bucket, itx_s3_key_candidate)
-            df_itx = _normalize_merge_keys(df_itx, KEYS)
-            
+            _normalize_merge_keys(df_itx, KEYS)
+
             missing_keys = [k for k in KEYS if k not in df_itx.columns]
             if missing_keys:
                 raise ValueError(
@@ -442,6 +443,7 @@ def _store_output(
             )
 
             del df_itx
+            gc.collect()
 
         except S3.exceptions.NoSuchKey:
             log.info(

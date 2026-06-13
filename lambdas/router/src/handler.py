@@ -513,6 +513,35 @@ def _mc_unblock_chunk(data: bytes, payload_size: int = 1012, sep_size: int = 2) 
         out.extend(data[pos : pos + payload_size])
         pos += payload_size + sep_size
     return bytes(out)
+
+
+def _mc_unblock_full(data: bytes, payload_size: int = 1012, sep_size: int = 2) -> bytes:
+    """
+    Desbloquea un archivo IPM bloqueado completo usando la misma lógica de
+    unblock_1014() del mc_interpreter_handler, incluyendo valid_seps pushback.
+
+    A diferencia de _mc_unblock_chunk (que siempre salta 2 bytes), esta función
+    verifica que cada separador sea válido. Si no lo es, hace pushback: los 2
+    bytes quedan como parte del payload del siguiente bloque, evitando que el
+    stream quede desalineado en archivos con separadores no estándar.
+
+    Separadores válidos: b"\\x40\\x40" (EBCDIC space), b"\\x20\\x20" (ASCII space),
+    b"\\x00\\x00" (null), b"" (vacío — no ocurre en archivos reales pero lo acepta
+    el interpreter original).
+    """
+    valid_seps = (b"\x40\x40", b"\x20\x20", b"\x00\x00", b"")
+    stream = io.BytesIO(data)
+    out    = bytearray()
+    while True:
+        chunk = stream.read(payload_size)
+        if chunk:
+            out.extend(chunk)
+        if len(chunk) < payload_size:
+            break
+        sep = stream.read(sep_size)
+        if sep not in valid_seps:
+            stream.seek(stream.tell() - len(sep))
+    return bytes(out)
  
  
 def _mc_parse_bitmap_fields(bitmap: bytes) -> List[int]:
@@ -734,38 +763,27 @@ def extraer_fecha_mc(
 ) -> str:
     """
     Extrae file_dt del PRIMER trailer 1644/695 de un archivo Mastercard IPM.
- 
+
     Replica la lógica de add_headers_fields_697() en mc_interpreter_handler:
       DE48 del mensaje 695 → PDS tag "0105" → file_idn → file_idn[3:9] → YYMMDD
- 
-    Estrategia de lectura (desde el principio, chunk a chunk):
-      Lee el archivo en chunks de 512 KB desde el byte 0, parando en cuanto
-      encuentra el primer trailer 695. No descarga el archivo completo.
- 
+
+    Estrategia de lectura:
+      Descarga el archivo completo en una sola llamada S3 GetObject.
+
       Para archivos bloqueados (file_block=True):
-        El chunk_size se alinea a múltiplos de 1014 bytes para que
-        _mc_unblock_chunk procese bloques completos sin corrupción.
- 
-      Overlap entre chunks:
-        Se conservan los últimos 8 KB del chunk anterior y se prependen al
-        siguiente. Esto garantiza que un mensaje que quede partido justo en
-        el límite de dos chunks sea encontrado correctamente.
- 
-      Guardia MAX_CHUNKS:
-        Para archivos corruptos o sin 695, evita un loop infinito.
-        Con chunks de 512 KB: 20 chunks = ~10 MB máximo escaneados.
- 
+        Aplica _mc_unblock_full() que replica exactamente unblock_1014() del
+        mc_interpreter_handler, incluyendo valid_seps pushback. Esto es necesario
+        porque archivos con separadores no estándar (distintos de \\x40\\x40) generan
+        desalineación de mensajes si se usa _mc_unblock_chunk() (que siempre salta
+        2 bytes sin verificar). La desalineación hace que _mc_scan_for_695() no
+        encuentre el trailer 695 aunque exista en el archivo.
+
     Parámetros:
       file_block      : de clasificacion['file_block']      (patrón DynamoDB)
       interpreter_fix : de clasificacion['interpreter_fix'] (documentado; no afecta el escaneo)
     """
-    fecha_default    = datetime.utcnow().strftime("%Y-%m-%d")
-    BLOCK_SIZE       = 1014          # 1012 payload + 2 separador (formato bloqueado)
-    BLOCKS_PER_CHUNK = 8192             # ~8.3 MB por chunk → reduce requests S
-    CHUNK_PLAIN      = 8 * 1024 * 1024  # 8 MB para archivos no bloqueados
-    OVERLAP          = 8 * 1024      # 8 KB: mayor que cualquier mensaje IPM típico
-    MAX_CHUNKS       = 100            # guardia: ~10 MB máximo antes de rendirse
- 
+    fecha_default = datetime.utcnow().strftime("%Y-%m-%d")
+
     # ── 1. Tamaño del archivo (head_object, sin descarga) ─────────────────
     try:
         head      = s3.head_object(Bucket=bucket, Key=key)
@@ -773,79 +791,50 @@ def extraer_fecha_mc(
     except Exception as e:
         logger.error(f"  MC: error en head_object s3://{bucket}/{key}: {e}")
         return fecha_default
- 
+
     if file_size == 0:
         logger.warning(f"  MC: archivo vacío | key={key}")
         return fecha_default
- 
-    # ── 2. Calcular tamaño de chunk en bytes del archivo en disco ─────────
+
+    # ── 2. Descarga completa ───────────────────────────────────────────────
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        raw      = response['Body'].read()
+    except Exception as e:
+        logger.error(f"  MC: error descargando s3://{bucket}/{key}: {e}")
+        return fecha_default
+
+    logger.info(
+        f"  MC: descargado {len(raw):,} bytes | file_block={file_block} | key={key}"
+    )
+
+    # ── 3. Desbloquear si es necesario ────────────────────────────────────
     if file_block:
-        # Alinear a múltiplo de 1014 para que _mc_unblock_chunk no corrompa
-        # el límite entre bloques al procesar cada chunk.
-        chunk_size = BLOCKS_PER_CHUNK * BLOCK_SIZE   # ej. 512 × 1014 = 519 168 bytes
+        data = _mc_unblock_full(raw)
+        logger.info(f"  MC: desbloqueado {len(raw):,} → {len(data):,} bytes")
     else:
-        chunk_size = CHUNK_PLAIN                     # 524 288 bytes
- 
-    # ── 3. Leer desde el inicio, chunk a chunk, hasta encontrar el 695 ───
-    remainder   = b""   # bytes sobrantes del chunk anterior (overlap)
-    offset      = 0     # posición actual en el archivo (bytes en disco)
-    chunks_read = 0
- 
-    while offset < file_size and chunks_read < MAX_CHUNKS:
- 
-        end_byte = min(offset + chunk_size - 1, file_size - 1)
- 
-        try:
-            response  = s3.get_object(Bucket=bucket, Key=key, Range=f'bytes={offset}-{end_byte}')
-            raw_chunk = response['Body'].read()
-        except Exception as e:
-            logger.error(f"  MC: error leyendo chunk {chunks_read + 1} de s3://{bucket}/{key}: {e}")
-            return fecha_default
- 
-        chunks_read += 1
-        logger.info(
-            f"  MC: chunk {chunks_read} | bytes={offset}-{end_byte} "
-            f"(~{(end_byte - offset + 1) // 1024} KB) | file_block={file_block}"
-        )
+        data = raw
 
-        # ── 3a. Desbloquear si es necesario ───────────────────────────────
-        if file_block:
-            raw_chunk = _mc_unblock_chunk(raw_chunk)
- 
-        # ── 3b. Anteponer overlap del chunk anterior ──────────────────────
-        # Garantiza que mensajes partidos en el límite del chunk anterior
-        # sean visibles completos en este escaneo.
-        data = remainder + raw_chunk
- 
-        # ── 3c. Escanear buscando el PRIMER 695 ───────────────────────────
-        file_dt = _mc_scan_for_695(data)
- 
-        if file_dt:
-            for fmt in ("%y%m%d", "%m%d%y"):
-                try:
-                    fecha = datetime.strptime(file_dt, fmt).strftime("%Y-%m-%d")
-                    logger.info(
-                        f"  MC: fecha extraída={fecha} "
-                        f"| file_dt={file_dt!r} | chunk={chunks_read} | key={key}"
-                    )
-                    return fecha
-                except ValueError:
-                    continue
-            logger.warning(f"  MC: file_dt no parseable={file_dt!r} | key={key}")
-            return fecha_default
- 
-        # ── 3d. Guardar overlap para el siguiente chunk ───────────────────
-        remainder = data[-OVERLAP:] if len(data) > OVERLAP else data
-        offset    = end_byte + 1
+    # ── 4. Escanear buscando el PRIMER 695 ────────────────────────────────
+    file_dt = _mc_scan_for_695(data)
 
-    # ── 4. Fallback ────────────────────────────────────────────────────────
-    if chunks_read >= MAX_CHUNKS:
-        logger.warning(
-            f"  MC: límite de {MAX_CHUNKS} chunks alcanzado sin encontrar 695 | key={key}"
-        )
-    else:
-        logger.warning(f"  MC: no se encontró trailer 695 | key={key}")
- 
+    if file_dt:
+        for fmt in ("%y%m%d", "%m%d%y"):
+            try:
+                fecha = datetime.strptime(file_dt, fmt).strftime("%Y-%m-%d")
+                logger.info(
+                    f"  MC: fecha extraída={fecha} "
+                    f"| file_dt={file_dt!r} | key={key}"
+                )
+                return fecha
+            except ValueError:
+                continue
+        logger.warning(f"  MC: file_dt no parseable={file_dt!r} | key={key}")
+        return fecha_default
+
+    # ── 5. Fallback ────────────────────────────────────────────────────────
+    logger.warning(f"  MC: no se encontró trailer 695 | key={key}")
+
     return fecha_default
     
 

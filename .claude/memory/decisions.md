@@ -106,17 +106,23 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ---
 
-## Por qué el router extrae la fecha MC desde el trailer 695 en chunks (sin descarga completa)
+## Por qué el router extrae la fecha MC descargando el archivo completo (decisión revertida, sync 2026-06-12)
 
-**Decisión:** `extraer_fecha_mc()` en el router lee el archivo IPM en chunks de 8 MB buscando el primer trailer MTI 1644 / FC 695, extrae el PDS tag "0105" (file_idn) y deriva la fecha YYMMDD → YYYY-MM-DD. No descarga el archivo completo.
+**Decisión anterior (2026-05-26, superada):** `extraer_fecha_mc()` leía el archivo IPM en chunks de 8 MB buscando el primer trailer MTI 1644 / FC 695, con overlap de 8 KB entre chunks y `_mc_unblock_chunk` (siempre salta 2 bytes de separador) para archivos bloqueados. Razón original: consistencia con Visa (solo primeros 50 bytes del header) y evitar descargar archivos de hasta 1.5 GB solo para una fecha.
 
-**Razón:** Consistencia con el patrón ya usado para archivos Visa (solo los primeros 50 bytes del header). Los archivos MC pueden superar 1.5 GB — descargarlos completos en el router para extraer una fecha sería prohibitivo en costo y tiempo. El trailer 695 con la fecha suele estar en los primeros pocos MB del archivo.
+**Decisión actual (sync 2026-06-12):** `extraer_fecha_mc()` descarga el archivo completo con un único `s3.get_object()`, y para archivos bloqueados aplica una nueva función `_mc_unblock_full()` (replica `unblock_1014()` del interpreter, con `valid_seps` pushback) antes de escanear el trailer 695.
 
-**Detalles de implementación:**
-- Archivos bloqueados (`file_block=True`): chunks alineados a múltiplos de 1014 bytes + `_mc_unblock_chunk` antes de parsear
-- Overlap de 8 KB entre chunks para no cortar mensajes en el límite de chunk
-- Guardia `MAX_CHUNKS=100` (~800 MB máximo antes de retornar `datetime.utcnow()` como fallback
-- Path de extracción: `DE48 del mensaje 695 → PDS tag "0105" → file_idn[3:9] → YYMMDD`
+**Por qué se revirtió:** `_mc_unblock_chunk()` siempre asume que el separador de cada bloque de 1014 bytes son 2 bytes válidos y los descarta sin verificar. En archivos con separadores no estándar (distintos de `\x40\x40` EBCDIC space), esto desalinea el stream desde el primer bloque con separador "raro" — todo lo que viene después queda corrido 0/1/2 bytes respecto a los límites reales de mensaje, y `_mc_scan_for_695()` nunca encuentra el trailer 695 (cae al fallback `datetime.utcnow()`, registrando una fecha incorrecta en `file_control`).
+
+`_mc_unblock_full()` corrige esto con `valid_seps = (b"\x40\x40", b"\x20\x20", b"\x00\x00", b"")`: si los 2 bytes leídos después de cada bloque de 1012 no son un separador válido, hace `seek` hacia atrás y los trata como parte del payload del siguiente bloque (pushback) — exactamente la lógica de `unblock_1014()` en `lmbd-mc-interpreter`. Esta lógica de pushback requiere conocer el byte siguiente al separador candidato, lo que es frágil de implementar correctamente a través de límites de chunk (un separador podría quedar partido entre dos chunks) — por eso la solución pasó a descarga completa en vez de intentar portar el pushback al esquema de chunks+overlap.
+
+**Costo aceptado:** los archivos MC bloqueados pueden ser grandes (cientos de MB–1.5 GB), por lo que esta función ahora hace una descarga completa adicional en el router (antes de que Step Functions/transform vuelvan a leer el mismo archivo). Se aceptó el costo porque la alternativa (fecha incorrecta en `file_control` para archivos con separadores no estándar) es peor — `file_date` se usa para particionar todo el pipeline downstream.
+
+**Detalles de implementación vigentes:**
+- `_mc_unblock_full(data, payload_size=1012, sep_size=2)`: lee el archivo completo en bloques de 1012 bytes; tras cada bloque lee 2 bytes y, si no están en `valid_seps`, hace `seek(-2)` (pushback) antes de leer el siguiente bloque.
+- Archivos bloqueados (`file_block=True`): `data = _mc_unblock_full(raw)` antes de escanear
+- Sin guardias de tamaño (`MAX_CHUNKS` eliminado) — se escanea el archivo completo en memoria
+- Path de extracción sin cambios: `DE48 del mensaje 695 → PDS tag "0105" → file_idn[3:9] → YYMMDD → YYYY-MM-DD`
 
 ---
 
@@ -175,11 +181,11 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 **Decisión (sync 2026-06-11):** Replicando el patrón ya validado en Visa (ver decisión anterior), el pipeline Mastercard ahora propaga `content_hash` (MD5 del archivo fuente) a través de todas sus etapas: `lmbd-mc-interpreter` → `lmbd-mc-transform` → `lmbd-mc-extract` → `lmbd-mc-clean` → `glue-mc-calculate`. Todas estas funciones ganaron un parámetro `content_hash: str = ""`.
 
-**Razón:** Misma que Visa — sin esta columna no hay forma de saber qué archivo originó cada fila al consultar `operational` vía Athena, y el valor ya viaja en el payload del Step Function (`itx-mastercard-orchestrator`) sin costo adicional.
+**Razón:** Misma que Visa — sin esta columna no hay forma de saber qué archivo originó cada fila al consultar `operational` vía Athena, y el valor ya viaja en el payload del Step Function (`itl-0004-itx-dev-intchg-02-sfn-mc`) sin costo adicional.
 
 **Diferencia de implementación con Visa:** En Visa, `lmbd-vi-clean` propaga `content_hash` automáticamente porque itera todas las columnas del input (que ya lo trae desde transform). En Mastercard, `glue-mc-calculate` (`process_file`) lo agrega explícitamente al final con `df_final = df_final.withColumn("content_hash", F.lit(content_hash))` (Spark `lit`, no viene como columna del CLN) — porque calculate es el primer punto del pipeline MC donde se trabaja en Spark y es más simple inyectarlo ahí que propagarlo columna a columna desde el interpreter (pandas) hasta calculate.
 
-**Caso particular — `glue-mc-interchange` recibe `--content_hash` pero no lo usa:** El ASL de `itx-mastercard-orchestrator` pasa `"--content_hash.$": "$.interchange_input.content_hash"` al job de interchange, pero `interchange.py` no declara ni usa ese argumento (Glue's `getResolvedOptions` simplemente lo ignora si no está en la lista de opciones requeridas). No es un bug — `content_hash` ya queda materializado en CAL (vía `glue-mc-calculate`) y mc-store lo hereda en el merge sin necesidad de que interchange lo reescriba. Si en el futuro `interchange.py` necesita `content_hash` para algo (logging, trazabilidad de su propio output), el argumento ya está disponible en el job sin cambios en el ASL.
+**Caso particular — `glue-mc-interchange` recibe `--content_hash` pero no lo usa:** El ASL de `itl-0004-itx-dev-intchg-02-sfn-mc` pasa `"--content_hash.$": "$.interchange_input.content_hash"` al job de interchange, pero `interchange.py` no declara ni usa ese argumento (Glue's `getResolvedOptions` simplemente lo ignora si no está en la lista de opciones requeridas). No es un bug — `content_hash` ya queda materializado en CAL (vía `glue-mc-calculate`) y mc-store lo hereda en el merge sin necesidad de que interchange lo reescriba. Si en el futuro `interchange.py` necesita `content_hash` para algo (logging, trazabilidad de su propio output), el argumento ya está disponible en el job sin cambios en el ASL.
 
 ---
 
@@ -217,17 +223,19 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ---
 
-## Por qué product_program_id en glue-vi-mc-reporting usa una nueva tabla `visa_bin_products` en s3-reference (join M5)
+## Por qué product_program_id en glue-vi-mc-reporting usa una nueva tabla `visa_bin_products` en s3-reference
 
-**Decisión (2026-06-11):** `product_program_id` (antes `NULL` fijo, TODO documentado) se calcula ahora con un join M5: `product_id` (ya calculado en `glue-vi-calculate` via cruce ARDEF, presente en CLN/operational) → `bin_product_id` en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_bin_products/data.parquet` → `range_program_id`.
+**Decisión (2026-06-11):** `product_program_id` (antes `NULL` fijo, TODO documentado) se calcula ahora con un join: `product_id` (ya calculado en `glue-vi-calculate` via cruce ARDEF, presente en CLN/operational) → `bin_product_id` en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_bin_products/data.parquet` → `range_program_id`.
 
 **Origen de la tabla:** export CSV de la tabla maestra `m_visa_bin_products` de PostgreSQL legacy (58 filas: `bin_product_id, short_description, bin_card_type, range_program_id, app_creation_date, app_creation_user`), provisto por el usuario y convertido 1:1 a Parquet (sin transformación) en `visa_bin_products/data.parquet`.
 
 **Implementación en `get_transaction.py`:**
 - `load_visa_bin_products()` — nueva función junto a `load_country()`/`load_exchange_rates()`, selecciona solo `bin_product_id, range_program_id`.
-- `transform_visa_baseii()` y `transform_visa_sms()` ahora reciben `bin_products_df` como parámetro; join M5 análogo a M1/M2 (country): `df["product_id"] == bin_products_df["bin_product_id"]`, left join, alias `product_program_id_m5`.
-- `process_client_range()` y `main()` propagan `bin_products_df` (cargado y cacheado una vez, igual que `country_df`).
+- `transform_visa_baseii()` y `transform_visa_sms()` reciben `vi_bin_products_df` como parámetro; join `product_ref` (análogo a `merchant_country_ref`/`issuer_country_ref` para country): `df["product_id"] == product_ref["_bin_product_id"]`, left join, alias `product_program_id_raw` → `product_program_id`.
+- `process_client_range()` y `main()` propagan `vi_bin_products_df` (cargado y cacheado una vez, igual que `country_df`).
 - MC (`product_program_id` en `transform_mastercard`) queda como TODO separado — requiere `m_mastercard_bin_products`, tabla distinta no provista aún.
+
+**Nota (2026-06-12):** Refactor de legibilidad en `get_transaction.py` — las variables heredadas de la nomenclatura del SP legacy (`m1`, `m2`, `m3`, `m5`) se renombraron a nombres descriptivos: `merchant_country_ref`, `issuer_country_ref`, `product_ref`, `currency_alpha_ref` (MC). Mismo refactor reordenó la carga de tablas de referencia en `main()`/`process_client_range()` agrupándolas Visa-primero-luego-Mastercard, y limpió comentarios redundantes. Sin cambios de lógica/resultados — solo nombres y orden de parámetros.
 
 **Validación (2026-06-11):** Re-run `glue-test-1` (`jr_f374a87d3849a2d8f4fa1c762c9ece25a4ba51b21118f4233460476253d73f65`, `report_suffix=20260105_tst3`, EBGR 2026-01-01..2026-01-05) → SUCCEEDED. `product_program_id`: 0 nulls (antes 100% null), suma=57,849,742=legacy, value_counts idénticos (103→555,220, 102→6,491), mapeo `product_code→product_program_id` idéntico (E,F,N,P→103; G→102) en ambos sistemas. **Resuelve completamente este TODO.**
 
@@ -286,7 +294,7 @@ El bug original (`Column 'to_currency' does not exist`) solo se manifestó el 20
 
 ---
 
-## Por qué se agregó WaitForENIRelease (180s) entre Calculate e Interchange en itx-mastercard-orchestrator
+## Por qué se agregó WaitForENIRelease (180s) entre Calculate e Interchange en itl-0004-itx-dev-intchg-02-sfn-mc
 
 **Decisión (sync 2026-06-11):** En `step-functions/mastercard/asl.json`, el estado `CheckCalculateResult` (Choice) ahora tiene como `Default` un nuevo estado `WaitForENIRelease` (Type=Wait, Seconds=180), que a su vez transiciona a `PrepareInterchangeInput` (el destino anterior de `Default`).
 
@@ -321,3 +329,29 @@ El bug original (`Column 'to_currency' does not exist`) solo se manifestó el 20
 **Seguridad:** `proxy_settings.json` contiene credenciales reales de proxy (`Soporteintelica:JCbiJuhUpX` embebido en ~118 URLs). Verificar que el archivo nunca se commitee — si `git status` lo muestra como tracked/staged, hay que hacer `git rm --cached` antes de que la regla de `.gitignore` surta efecto (gitignore no afecta archivos ya trackeados).
 
 **Alternativa descartada:** Mantener la fuente de tipos de cambio anterior (la que dejó la variable `testing_1` en `env-vars.json` como placeholder de pruebas). Descartado porque no cubría los pares de moneda/fechas necesarios para `glue-mc-calculate`/`glue-mc-interchange` — detalle de la fuente anterior no documentado, se reemplazó directamente.
+
+---
+
+## Por qué lmbd-mc-clean y lmbd-mc-extract leen/escriben Parquet en streaming (iter_batches + ParquetWriter) — sync 2026-06-12
+
+**Decisión:** `_clean_1644`/`_clean_standard` (mc-clean) y `_extract_1644`/`_extract_standard` (mc-extract) dejaron de hacer `df = _read_parquet(key)` (carga el Parquet completo a un solo DataFrame) seguido de `_write_parquet_with_schema(df, ...)` (serializa todo de una vez). Ahora:
+
+1. Descargan los bytes del Parquet a un `io.BytesIO` y abren un `pq.ParquetFile` (solo lee el footer).
+2. Iteran `pf.iter_batches(batch_size=ITX_CLEAN_BATCH_SIZE | ITX_EXTRACT_BATCH_SIZE, default=100000)`.
+3. Por cada batch: `to_pandas()` → transformación (cast/rename/align) → `pa.Table` → `writer.write_table()` sobre un `pq.ParquetWriter` que escribe a otro `io.BytesIO` en memoria.
+4. `del` + `gc.collect()` en cada iteración para liberar el batch anterior antes de procesar el siguiente.
+5. Al final, `out_buf.seek(0)` + `S3.put_object(..., Body=out_buf)` — una sola subida del Parquet completo, pero nunca un DataFrame completo en memoria.
+
+En mc-clean, el schema Arrow (`_build_arrow_schema`) se construye una sola vez a partir del primer batch del primer archivo y se reutiliza para todos los archivos del mismo MTI — se extrajo a una función nueva `_align_df_to_schema()` (devuelve `pa.Table`, compartida por `_write_parquet_with_schema` y el loop de batches).
+
+**Razón:** Los Parquets de entrada de mc-clean/mc-extract (capas RAW/TRA del interpreter/transform) pueden tener millones de filas — cargar el DataFrame completo + las copias intermedias de cada transformación (`_cast_df`, `_align_df_1644`, rename, etc.) multiplica el uso de memoria varias veces sobre el tamaño del Parquet. Con `MemorySize=10240MB` ya al máximo, esto causaba presión de memoria en archivos grandes. El streaming por batches acota el pico de memoria a `batch_size` filas independientemente del tamaño total del archivo.
+
+**Cambios de configuración asociados:** `mc-clean` `Timeout` 300s→600s (compensar el overhead de iterar en batches vs. una sola pasada — más iteraciones de Python, no más trabajo total). `mc-interpreter` `EphemeralStorage` 512MB→1536MB (relacionado, ver `_process_block` abajo).
+
+**`lmbd-mc-interpreter` — mismo principio aplicado a `_process_block`:** antes construía `wide_rows` (lista de dicts) para TODO `block_buffer` de una vez (un bloque puede tener 400K+ mensajes ISO-8583 con 80+ columnas cada uno) y luego un solo `pd.DataFrame(wide_rows)`. Ahora itera `block_buffer` en sub-chunks de `ITX_INTERPRETER_BLOCK_CHUNK_SIZE` (default 10000) mensajes, construye `wide_rows`/`df_chunk` por sub-chunk, llama a `write_parquet_by_mti_block_streaming()` por sub-chunk, y libera (`del` + `gc.collect()` + `pa.default_memory_pool().release_unused()`) antes del siguiente. `file_idn`/`file_dt` (del trailer 695, ya conocidos antes de llamar a `_process_block`) se aplican igual a cada sub-chunk — no hay riesgo de procesar un sub-chunk sin contexto.
+
+**Nota — env vars sin declarar en config.json:** `ITX_CLEAN_BATCH_SIZE`, `ITX_EXTRACT_BATCH_SIZE` e `ITX_INTERPRETER_BLOCK_CHUNK_SIZE` se leen con `os.environ.get(..., "100000"/"10000")` pero ninguna está declarada en `config.json`/`env-vars.json` — mismo patrón (con default seguro, por lo que no es bug latente como `DDB_MASTERCARD_FIELDS_TABLE`) pero conviene agregarlas si se necesita tunearlas por ambiente.
+
+**Aplicable a mc-transform:** este es el mismo patrón que resolvería el gotcha pendiente "mc-transform: sin chunking en MTIs 1442, 1740 y 1644" — replicar `iter_batches` + `ParquetWriter` ahí cuando se aborde ese pendiente.
+
+**Alternativa descartada:** Aumentar `MemorySize` más allá de 10240MB. No es posible — 10240MB es el máximo de AWS Lambda.
