@@ -558,3 +558,124 @@ Mismo patrón que `reprocess_vi_calculate.py`, para `itl-0004-itx-dev-intchg-02-
 1. Continuar desarrollo de `glue-vi-mc-reporting` / `get_transaction.py` — confirmar resultado de `jr_ecbf...284c3d` (punto pendiente de la sesión 2026-06-10, ver arriba).
 2. Si se necesita reprocesar interchange en el futuro, usar `tst_files/reprocessing/reprocess_vi_interchange.py` + segundo pase de `tst_files/reprocessing/reprocess_vi_store.py`.
 4. Cuando esté disponible el nuevo método de extracción de tipo de cambio Visa, revisar si `load_exchange_rates()` debe cambiar de fuente nuevamente.
+
+---
+
+## Sesión 2026-06-16 — 3 archivos PARTIAL_SUCCESS VI (Jan 20/21/29), re-run glue-test-1 mes completo, comparativo enero 2026 vs legacy
+
+**Contexto:** El comparativo VI con legacy usando 4 días (report_suffix=20260105_tst3, sesión 2026-06-11) mostraba diferencias de filas en las fechas 20/21/29 de enero. Se identificó la causa, se corrigió y se generó el reporte del mes completo (report_suffix=202601_v2).
+
+### Paso 1 — Identificar PARTIAL_SUCCESS en DynamoDB
+
+Los usuarios reportaron que el comparativo de las fechas 20/21/29 solo tenía ~13% de las filas VI esperadas. Se consultó `file_control-02` por `file_id` de cada fecha:
+
+```powershell
+# Obtener file_id desde content_hash (cuando no se tiene el PK):
+aws dynamodb scan `
+  --profile itx-dev `
+  --table-name itl-0004-itx-dev-dynamo-file_control-02 `
+  --filter-expression "content_hash = :h" `
+  --expression-attribute-values '{":h": {"S": "<hash>"}}' `
+  --query "Items[0].{file_id:file_id.S, status:control_status.S}" --output json
+
+# Si se tiene el file_id directamente (puede ser distinto al content_hash):
+aws dynamodb get-item `
+  --profile itx-dev `
+  --table-name itl-0004-itx-dev-dynamo-file_control-02 `
+  --key '{"file_id": {"S": "<file_id>"}}' `
+  --query "Item.{status:control_status.S, store:store_result.S}" --output json
+```
+
+**Hallazgo:** los 3 archivos tenían `control_status=PARTIAL_SUCCESS` — el campo `store_result` contenía solo outputs VSS_110/120/130/140. `output_type=BASEII` había fallado durante el procesamiento original (antes del fix de `_cal_dtype_map`) y nunca fue escrito en operational.
+
+**IDs relevantes:**
+
+| Fecha | file_id (PK DDB) | content_hash |
+|-------|-----------------|--------------|
+| 2026-01-20 | `0A8221C3293EF535621FB1E35D709ACC` | `F308708F2709F2F83AF7C692B33BA292` |
+| 2026-01-21 | (leído de DDB) | `9B074C25C985C294355B65D94F24C333` |
+| 2026-01-29 | (leído de DDB) | `3F48FFF3922CECA9C75C5CE7820414A8` |
+
+**Nota:** `file_id` y `content_hash` son DISTINTOS para el caso de Jan 20 — DynamoDB usa `file_id` como PK. Si el usuario proporciona un hash, verificar con `scan` si es `file_id` o `content_hash`.
+
+### Paso 2 — Re-invocar lmbd-vi-store (BASEII únicamente)
+
+Para cada uno de los 3 archivos, construir el payload con **solo** `output_type=BASEII` (los VSS ya están escritos), con `s3_key` de la capa CLN confirmado presente en S3:
+
+```json
+{
+  "client_id": "EBGR",
+  "file_id": "<file_id>",
+  "brand": "VISA",
+  "file_type": "IN",
+  "file_date": "<YYYY-MM-DD>",
+  "content_hash": "<content_hash>",
+  "outputs": [
+    {
+      "output_type": "BASEII",
+      "s3_key": "EBGR/VISA/300_baseii_cln_drafts/file_type=IN/date=<YYYY-MM-DD>/<content_hash>.parquet"
+    }
+  ]
+}
+```
+
+```powershell
+# Guardar payload en tst_files/ (no en /tmp — no persiste entre llamadas en Windows)
+aws lambda invoke `
+  --profile itx-dev `
+  --function-name itl-0004-itx-dev-intchg-02-lmbd-vi-store `
+  --payload "file://tst_files/payload_store_<fecha>.json" `
+  --cli-binary-format raw-in-base64-out `
+  tst_files/response_store_<fecha>.json
+```
+
+**Resultado:** 3/3 SUCCESS. Filas recuperadas: Jan 20 → 131,501; Jan 21 → 112,099; Jan 29 → 110,257.
+
+### Paso 3 — Limpieza de tst_files
+
+Segunda ronda de limpieza (la primera fue el 2026-06-11). Scripts de debug de un solo uso y versiones antiguas de reportes eliminados. La carpeta `tst_files/` quedó con estructura estable y solo archivos reutilizables.
+
+### Paso 4 — Re-run glue-test-1 para el mes completo
+
+Actualizar `tst_files/glue_args/glue-test1-run-202601-args.json` cambiando `report_suffix` de `"202601"` a `"202601_v2"` (para no pisar el reporte anterior) y lanzar:
+
+```powershell
+aws glue start-job-run `
+  --profile itx-dev `
+  --job-name itl-0004-itx-dev-intchg-02-glue-test-1 `
+  --arguments "file://tst_files/glue_args/glue-test1-run-202601-args.json" `
+  --query "JobRunId" --output text
+```
+
+**Resultado:** SUCCEEDED. Parquet generado en `EBGR/REPORTING/report_transactions_EBGR_202601_v2.parquet` (s3-analytics / s3-operational según config del job).
+
+### Paso 5 — Descargar parquet y comparar vs legacy
+
+Parquet descargado localmente a `tst_files/reports/202601/` (~563 MB, reemplazando el de 535 MB del run anterior incompleto).
+
+Comparativa ejecutada con `tst_files/debug_scripts/compare_get_transaction_aggregated.py` — **sin exportar la tabla legacy completa** (~8 GB). La metodología usa:
+- Lado nuevo: lee el Parquet local en chunks de 300k filas, acumula agregados GROUP BY
+- Lado legacy: ejecuta queries `GROUP BY` directas vía `psycopg2` contra PRD (`analytics.report_transactions_ebgr_202601_tst`) — solo sumas/conteos, no filas individuales
+
+**Credenciales PRD:** en memoria de usuario `prd-db-credentials.md` (no se guardan en archivos del repo). Pasadas como variables de entorno en la línea de comando.
+
+**Tabla legacy:** `analytics.report_transactions_ebgr_202601_tst` (regenerada por el usuario para cubrir todo enero 2026). Filtro aplicado: `business_mode_code != 'A'` (igual que el SP original, excluye Acquiring).
+
+Output: `tst_files/reports/202601/comparativo_aggregated_202601_v2.md`
+
+### Resultado final (2026-06-16)
+
+| Brand | Filas nuevo | Filas legacy | Diff filas | Diff fees | % |
+|-------|-------------|--------------|------------|-----------|---|
+| VI (BASEII) | 4,051,482 | 4,051,482 | **0** | -18,679 EUR | -3.8% |
+| MC (1240+1442) | 32,336,202 | 32,336,205 | **-3** (Jan 06) | -174 EUR | <0.01% |
+
+- VI: cobertura de filas resuelta al 100%. Diferencia residual de fees (-18,679 EUR) en investigación — ver `gotchas.md` / memoria de usuario `vi_interchange_fee_bugs.md`.
+- MC: -3 filas en una sola fecha (2026-01-06), probablemente un archivo MC con `status` distinto a DONE. Fees prácticamente correctos.
+- `transaction_amount` y `scheme_fees_amount`: diff=0 para ambas marcas.
+
+### Pendiente (próxima sesión)
+
+1. Investigar VI fees -18,679 EUR (-3.8%): ATM JPY rule matching (1055 vs 1065) + dirección de `exchange_value`.
+2. Verificar MC -3 filas en 2026-01-06 — revisar `file_control-02` para esa fecha en MC.
+3. Escanear NullType en `SBSA`/`BTRLRO`/`vss_110-140` antes de generar reportes para esos clientes/tipos (pendiente de sesiones anteriores, aplica ahora que la metodología de comparativa está validada).

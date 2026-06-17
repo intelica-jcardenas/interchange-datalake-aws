@@ -58,11 +58,6 @@ Pendientes (TODO)
 
 import sys
 import boto3
-from urllib.parse import urlparse
-
-import pyarrow as pa
-import pyarrow.parquet as pq
-import pyarrow.fs as pafs
 
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
@@ -75,10 +70,7 @@ from pyspark.sql.types import (
     BooleanType,
     DoubleType,
     DateType,
-    StructType,
-    NullType,
 )
-from pyspark.sql.pandas.types import from_arrow_schema
 from pyspark.sql import SparkSession, DataFrame
 
 # =============================================================================
@@ -91,14 +83,8 @@ spark = (
     .config("spark.sql.parquet.datetimeRebaseModeInRead", "CORRECTED")
     .config("spark.sql.parquet.datetimeRebaseModeInWrite", "CORRECTED")
     .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
-    # operational MC (IPM_1240/1442) contiene date_and_time_local_transaction_de_12
-    # como TIMESTAMP(NANOS,false) — PySpark 3.3 no soporta ese subtipo al leer →
-    # AnalysisException: Illegal Parquet type. nanosAsLong=true la lee como LongType
-    # (ns desde epoch) sin error. Mismo patrón ya usado en glue-mc-calculate/interchange.
-    .config("spark.sql.legacy.parquet.nanosAsLong", "true")
     .getOrCreate()
 )
-spark.conf.set("spark.sql.legacy.parquet.nanosAsLong", "true")
 
 glueContext = GlueContext(spark.sparkContext)
 
@@ -164,154 +150,6 @@ def get_client_config(client_code: str) -> dict:
     }
 
 
-# Columnas operational con TIMESTAMP(NANOS,false) — Glue 4.0 (Spark 3.3) no puede
-# inferir ese subtipo (AnalysisException: Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))),
-# sin importar el valor de nanosAsLong (esa config solo afecta la conversión de datos
-# cuando el schema ya es explícito, no la inferencia). Único campo conocido: MTI 1240/1442.
-_NANOS_AS_LONG_COLS = {"date_and_time_local_transaction_de_12"}
-
-
-def _widest_arrow_type(t1: pa.DataType, t2: pa.DataType) -> pa.DataType:
-    """
-    Devuelve el tipo Arrow más "ancho" entre t1 y t2, suficiente para
-    representar sin pérdida los valores de ambos. Usado para unificar columnas
-    cuyo tipo físico Parquet varía entre archivos del mismo directorio
-    operational MC (decimal con distinta precisión, int64 vs double, string
-    vs null) — análogo al gotcha _cal_dtype_map de lmbd-vi-store, pero entre
-    archivos en vez de entre etapas del pipeline.
-    """
-    if t1.equals(t2):
-        return t1
-    if pa.types.is_null(t1):
-        return t2
-    if pa.types.is_null(t2):
-        return t1
-    if pa.types.is_decimal(t1) and pa.types.is_decimal(t2):
-        scale = max(t1.scale, t2.scale)
-        int_digits = max(t1.precision - t1.scale, t2.precision - t2.scale)
-        return pa.decimal128(min(int_digits + scale, 38), scale)
-    if pa.types.is_floating(t1) or pa.types.is_floating(t2):
-        return pa.float64()
-    if pa.types.is_integer(t1) and pa.types.is_integer(t2):
-        return t1 if t1.bit_width >= t2.bit_width else t2
-    # Sin regla específica (ej. string vs número): mantener el primero visto.
-    return t1
-
-
-def _align_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
-    """
-    Castea/rellena las columnas de table al schema unificado.
-
-    - Columna NANOS (_NANOS_AS_LONG_COLS): si llega como timestamp[ns], se
-      reinterpreta con .view(int64) — timestamp[ns] -> int64 no es un cast
-      válido en pyarrow porque son tipos lógicos distintos sobre el mismo
-      layout binario (ns desde epoch), .view() preserva los bytes.
-    - Columnas ausentes en table: se rellenan con null del tipo destino.
-    - Resto: .cast(field.type) (decimal con precisión menor -> mayor,
-      int64 -> double, null -> tipo real, todos castings seguros).
-    """
-    arrays = []
-    for field in schema:
-        if field.name in table.column_names:
-            col = table.column(field.name)
-            if field.name in _NANOS_AS_LONG_COLS and pa.types.is_timestamp(col.type):
-                col = pa.chunked_array(
-                    [chunk.view(pa.int64()) for chunk in col.chunks], type=pa.int64()
-                )
-            elif not col.type.equals(field.type):
-                col = col.cast(field.type)
-        else:
-            col = pa.nulls(table.num_rows, type=field.type)
-        arrays.append(col)
-    return pa.Table.from_arrays(arrays, schema=schema)
-
-
-def _read_operational_via_pyarrow(base_path: str, client_id: str) -> DataFrame | None:
-    """
-    Lee todos los Parquet bajo base_path con PyArrow y construye el DataFrame
-    de Spark en el driver — usado cuando spark.read.parquet() falla por
-    TIMESTAMP(NANOS) (error de inferencia de schema) o por
-    SchemaColumnConvertNotSupportedException (tipos físicos inconsistentes
-    entre archivos: decimal con distinta precisión, int64 vs double, string
-    vs null — ver gotcha tipos operational MC IPM_1240/1442). PyArrow lee
-    ambos casos sin error (confirmado por scan_mc_operational_schema_variance.py).
-
-    Por archivo:
-      - lee la tabla completa con PyArrow
-      - agrega columnas derivadas del path: particiones Hive (file_type, date),
-        file_id (= content_hash, nombre del archivo) y customer_code
-
-    Luego calcula un schema unificado (tipo más ancho por columna, ver
-    _widest_arrow_type), fuerza _NANOS_AS_LONG_COLS a int64 (equivalente a
-    spark.sql.legacy.parquet.nanosAsLong=true) y descarta columnas que quedan
-    100% null en todos los archivos. Castea cada tabla a ese schema
-    (_align_table_to_schema), concatena, convierte a pandas y construye el
-    DataFrame de Spark con ese schema explícito.
-    """
-    parsed = urlparse(base_path)
-    bucket = parsed.netloc
-    prefix = parsed.path.lstrip("/")
-
-    s3 = boto3.client("s3")
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = [
-        obj["Key"]
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
-        for obj in page.get("Contents", [])
-        if obj["Key"].endswith(".parquet")
-    ]
-    if not keys:
-        return None
-
-    fs = pafs.S3FileSystem()
-    tables = []
-    for key in keys:
-        with fs.open_input_file(f"{bucket}/{key}") as f:
-            table = pq.ParquetFile(f).read()
-
-        n = table.num_rows
-        partitions = dict(part.split("=", 1) for part in key.split("/") if "=" in part)
-        for col_name, value in partitions.items():
-            table = table.append_column(col_name, pa.array([value] * n, type=pa.string()))
-
-        file_id = key.rsplit("/", 1)[-1].rsplit(".parquet", 1)[0]
-        table = table.append_column("file_id", pa.array([file_id] * n, type=pa.string()))
-        table = table.append_column("customer_code", pa.array([client_id] * n, type=pa.string()))
-
-        tables.append(table)
-
-    # Schema unificado: tipo más ancho por columna entre todos los archivos.
-    unified_fields = {}
-    for table in tables:
-        for field in table.schema:
-            if field.name not in unified_fields:
-                unified_fields[field.name] = field.type
-            else:
-                unified_fields[field.name] = _widest_arrow_type(
-                    unified_fields[field.name], field.type
-                )
-
-    for col_name in _NANOS_AS_LONG_COLS:
-        if col_name in unified_fields:
-            unified_fields[col_name] = pa.int64()
-
-    # Columnas 100% null en TODOS los archivos: sin tipo real, se descartan.
-    unified_fields = {
-        name: dtype
-        for name, dtype in unified_fields.items()
-        if not pa.types.is_null(dtype)
-    }
-    unified_schema = pa.schema(
-        [pa.field(name, dtype) for name, dtype in unified_fields.items()]
-    )
-
-    aligned = [_align_table_to_schema(table, unified_schema) for table in tables]
-    unified = pa.concat_tables(aligned)
-
-    pdf = unified.to_pandas()
-    return spark.createDataFrame(pdf, schema=from_arrow_schema(unified_schema))
-
-
 def read_operational(
     client_id: str, brand: str, data_type: str, start_date: str, end_date: str
 ) -> DataFrame | None:
@@ -324,73 +162,31 @@ def read_operational(
       - file_id       : nombre del archivo Parquet (= content_hash)
 
     Las particiones Hive (file_type, date) son añadidas automáticamente
-    por Spark como columnas del DataFrame (o derivadas del path por PyArrow
-    en el fallback, ver _read_operational_via_pyarrow).
+    por Spark como columnas del DataFrame.
     """
     base_path = f"s3://{OPERATIONAL_BUCKET}/{client_id}/{brand}/{data_type}/"
 
     try:
         df = spark.read.parquet(base_path)
-
-        # Columnas 100% null en algunos archivos se infieren como NullType y
-        # rompen SchemaColumnConvertNotSupportedException al leer el directorio
-        # junto a archivos donde tienen tipo real. No se usan en el reporte:
-        # se excluyen del schema antes de leer.
-        null_type_cols = [
-            f.name for f in df.schema.fields if isinstance(f.dataType, NullType)
-        ]
-        if null_type_cols:
-            log_info(f"[read_operational] Excluding null-typed columns: {null_type_cols}")
-            reduced_schema = StructType(
-                [f for f in df.schema.fields if f.name not in null_type_cols]
-            )
-            df = spark.read.schema(reduced_schema).parquet(base_path)
-
-        df = df.filter(F.col("date").between(start_date, end_date))
-
-        if df.rdd.isEmpty():
-            log_info(
-                f"[read_operational] No rows for {client_id}/{brand}/{data_type} "
-                f"in [{start_date}, {end_date}]"
-            )
-            return None
-
-        df = (
-            df.withColumn("_path", F.input_file_name())
-            .withColumn("file_id", F.regexp_extract("_path", r"/([^/]+)\.parquet$", 1))
-            .withColumn("customer_code", F.lit(client_id))
-            .drop("_path")
-        )
     except Exception as e:
-        msg = str(e)
-        is_nanos_error = "Illegal Parquet type" in msg and "TIMESTAMP(NANOS" in msg
-        is_type_mismatch = "SchemaColumnConvertNotSupportedException" in msg
-        if not (is_nanos_error or is_type_mismatch):
-            log_info(f"[read_operational] No data at {base_path}: {e}")
-            return None
+        log_info(f"[read_operational] No data at {base_path}: {e}")
+        return None
 
+    df = df.filter(F.col("date").between(start_date, end_date))
+
+    if df.rdd.isEmpty():
         log_info(
-            f"[read_operational] {base_path}: tipos Parquet inconsistentes "
-            f"entre archivos (TIMESTAMP(NANOS) o decimal/int/null), "
-            f"leyendo via PyArrow"
+            f"[read_operational] No rows for {client_id}/{brand}/{data_type} "
+            f"in [{start_date}, {end_date}]"
         )
-        try:
-            df = _read_operational_via_pyarrow(base_path, client_id)
-        except Exception as e2:
-            log_info(f"[read_operational] No data at {base_path}: {e2}")
-            return None
-        if df is None:
-            log_info(f"[read_operational] No data at {base_path}")
-            return None
+        return None
 
-        df = df.filter(F.col("date").between(start_date, end_date))
-
-        if df.rdd.isEmpty():
-            log_info(
-                f"[read_operational] No rows for {client_id}/{brand}/{data_type} "
-                f"in [{start_date}, {end_date}]"
-            )
-            return None
+    df = (
+        df.withColumn("_path", F.input_file_name())
+        .withColumn("file_id", F.regexp_extract("_path", r"/([^/]+)\.parquet$", 1))
+        .withColumn("customer_code", F.lit(client_id))
+        .drop("_path")
+    )
 
     log_info(
         f"[read_operational] Loaded {client_id}/{brand}/{data_type}: {df.count()} rows"

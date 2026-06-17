@@ -99,6 +99,8 @@ from typing import Any, Optional
  
 import boto3
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
  
 log = logging.getLogger()
 log.setLevel(logging.INFO)
@@ -133,16 +135,65 @@ def _read_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
     """Lee un único archivo Parquet desde S3 y retorna un DataFrame."""
     body = S3.get_object(Bucket=bucket, Key=key)["Body"].read()
     return pd.read_parquet(io.BytesIO(body))
- 
- 
-def _write_parquet_s3(df: pd.DataFrame, bucket: str, key: str) -> None:
-    """Serializa un DataFrame como Parquet (snappy) y lo sube a S3."""
+
+
+def _read_parquet_s3_with_schema(bucket: str, key: str) -> tuple[pd.DataFrame, pa.Schema]:
+    """Lee un Parquet desde S3 y retorna (DataFrame, schema Arrow original)."""
+    body = S3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    table = pq.read_table(io.BytesIO(body))
+    return table.to_pandas(), table.schema
+
+
+def _restore_schema(table: pa.Table, cln_dtype_map: dict[str, pa.DataType]) -> pa.Table:
+    """
+    Restaura tipos Arrow degradados por el round-trip pandas/pyarrow en _store_output.
+
+    - Columnas presentes en cln_dtype_map (schema autoritativo de mc-clean, vía
+      _build_arrow_schema/DynamoDB mastercard_fields): se castean a su tipo
+      original, excepto timestamps, que siempre se fuerzan a "us" (el lector
+      vectorizado de Spark rechaza TIMESTAMP(NANOS) aunque nanosAsLong=true).
+    - Columnas no provenientes del CLN (CAL/ITX, ej. settlement_report_amount):
+      NullType -> string, decimal128(p, s) -> decimal128(18, s), timestamp -> "us".
+    """
+    for i, field in enumerate(table.schema):
+        current_type = field.type
+        target_type: Optional[pa.DataType] = None
+
+        if field.name in cln_dtype_map:
+            target_type = cln_dtype_map[field.name]
+            if pa.types.is_timestamp(target_type):
+                target_type = pa.timestamp("us")
+        elif pa.types.is_null(current_type):
+            target_type = pa.string()
+        elif pa.types.is_decimal(current_type) and current_type.precision != 18:
+            target_type = pa.decimal128(18, current_type.scale)
+        elif pa.types.is_timestamp(current_type):
+            target_type = pa.timestamp("us")
+
+        if target_type is not None and target_type != current_type:
+            try:
+                table = table.set_column(
+                    i,
+                    field.with_type(target_type),
+                    table.column(i).cast(target_type, safe=False),
+                )
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+                log.warning(
+                    "_restore_schema: no se pudo castear columna %s (%s -> %s): %s",
+                    field.name, current_type, target_type, exc,
+                )
+
+    return table
+
+
+def _write_table_s3(table: pa.Table, bucket: str, key: str) -> None:
+    """Serializa una tabla Arrow como Parquet (snappy) y la sube a S3."""
     buf = io.BytesIO()
-    df.to_parquet(buf, index=False, compression="snappy")
+    pq.write_table(table, buf, compression="snappy")
     buf.seek(0)
     S3.put_object(Bucket=bucket, Key=key, Body=buf)
-    log.info("_write_parquet_s3: written → s3://%s/%s (%d rows)", bucket, key, len(df))
- 
+    log.info("_write_table_s3: written → s3://%s/%s (%d rows)", bucket, key, table.num_rows)
+
  
 def _key_exists(bucket: str, key: str) -> bool:
     """Verifica si una clave existe en S3 sin descargar el objeto."""
@@ -330,8 +381,8 @@ def _store_output(
         _derive_itx_key(cln_s3_key, mti) if mti in MTIS_WITH_ITX else None
     )
 
-    # ── Leer CLN ─────────────────────────────────────────────
-    df_cln = _read_parquet_s3(staging_bucket, cln_s3_key)
+    # ── Leer CLN (capturando schema Arrow original) ───────────
+    df_cln, cln_schema = _read_parquet_s3_with_schema(staging_bucket, cln_s3_key)
     _normalize_merge_keys(df_cln, KEYS)
 
     missing_keys = [k for k in KEYS if k not in df_cln.columns]
@@ -343,6 +394,10 @@ def _store_output(
         raise ValueError(
             f"CLN tiene duplicados por {KEYS}: duplicated={duplicated_cln} | {cln_s3_key}"
         )
+
+    # Llaves excluidas: _normalize_merge_keys las castea a string nullable
+    # para el merge, independientemente de su tipo original en el CLN.
+    cln_dtype_map = {f.name: f.type for f in cln_schema if f.name not in KEYS}
 
     merged = df_cln
     del df_cln
@@ -461,10 +516,17 @@ def _store_output(
     records = len(merged)
     columns = len(merged.columns)
 
-    # ── Escribir operational ──────────────────────────────────
-    _write_parquet_s3(merged, operational_bucket, target_s3_key)
-
+    # ── Restaurar schema (CLN) y normalizar (CAL/ITX) ─────────
+    merged_table = pa.Table.from_pandas(merged, preserve_index=False)
     del merged
+    gc.collect()
+
+    merged_table = _restore_schema(merged_table, cln_dtype_map)
+
+    # ── Escribir operational ──────────────────────────────────
+    _write_table_s3(merged_table, operational_bucket, target_s3_key)
+
+    del merged_table
     gc.collect()
 
     log.info(

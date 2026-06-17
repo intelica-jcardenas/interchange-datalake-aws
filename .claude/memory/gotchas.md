@@ -74,11 +74,25 @@ Implementado con un único `LEFT JOIN` contra `rollup_group_df` (distinct de `ro
 
 Columnas del CAL 100% null para ciertos `file_id` (`message_reason_code`, `type_of_purchase`) se degradaban a NullType (INT32) en el round-trip pandas/pyarrow, rompiendo `spark.read.parquet(directorio)` cuando convivían con archivos donde la columna sí tenía `string`. Fix: generalización de `_cal_int_cols` → `_cal_dtype_map` (restaura NullType→string además de float64→int64). Reprocesados 56/56 archivos `EBGR/VISA/baseii_drafts/file_type=IN` (2026-01-01..2026-01-30) — 0 columnas NullType tras el fix; validado por el re-run de `glue-test-1` (gotcha anterior).
 
+**Caso adicional (2026-06-16) — 3 archivos con `status=PARTIAL_SUCCESS`:** Detectado al comparar el reporte EBGR enero 2026 completo (report_suffix=202601_v2) contra legacy: las fechas 2026-01-20, 2026-01-21 y 2026-01-29 mostraban ~13% de las filas esperadas. Causa: esos 3 archivos habían sido procesados originalmente **antes** de que el fix de `_cal_dtype_map` estuviera desplegado — `output_type=BASEII` falló por NullType durante el procesamiento original y DynamoDB quedó con `status=PARTIAL_SUCCESS` (solo VSS_110/120/130/140 se habían escrito). El `output_type=BASEII` nunca fue escrito en operational. Reprocesados con `lmbd-vi-store` (solo BASEII, CLN/CAL/ITX confirmados presentes en S3): 3/3 SUCCESS. Tras crawler re-run y re-ejecución del reporte: VI count = 4,051,482 / 4,051,482 (diff=0). **Señal de alerta:** si el comparativo con legacy muestra que ciertas fechas tienen ~13% de las filas esperadas (no 0%), verificar `status` en DynamoDB `file_control-02` — puede ser un `PARTIAL_SUCCESS` silencioso, no un error de datos.
+
+**Cómo identificar `PARTIAL_SUCCESS` en DynamoDB:**
+```powershell
+aws dynamodb get-item `
+  --profile itx-dev `
+  --table-name itl-0004-itx-dev-dynamo-file_control-02 `
+  --key '{"file_id": {"S": "<file_id>"}}' `
+  --query "Item.{status:control_status.S, store_result:store_result.S}"
+```
+Si `store_result.outputs[]` no incluye `output_type=BASEII`, ese output falló.
+
+**Distinción `file_id` vs `content_hash`:** DynamoDB `file_control-02` usa `file_id` como PK (no `content_hash`). Si se tiene solo el `content_hash`, usar `scan` con `filter-expression "content_hash = :h"` para obtener el `file_id` real. En el caso de Jan 20: `file_id=0A8221C3293EF535621FB1E35D709ACC` (PK) pero `content_hash=F308708F2709F2F83AF7C692B33BA292` (distinto).
+
 **Pendiente:** verificar el mismo problema en `SBSA`/`BTRLRO` y otros `output_type` (VSS_110/120/130/140) si sus reportes fallan con la misma excepción.
 
-**Si vuelve a aparecer:** usar `tst_files/debug_scripts/scan_nulltype_columns.py` para listar archivos/columnas afectadas, mapear `content_hash→file_id` via `file_control` y reprocesar con `lmbd-vi-store`.
+**Si vuelve a aparecer:** usar `tst_files/debug_scripts/scan_nulltype_columns.py` para listar archivos/columnas afectadas, mapear via `file_control` (scan por rango de fechas + `control_status=PARTIAL_SUCCESS`) y reprocesar con `lmbd-vi-store`.
 
-**Estado:** Resuelto. Detalle completo (debugging, escaneo, reprocesamiento) → `.claude/memory/gotchas_archive.md`.
+**Estado:** Resuelto y validado para EBGR enero 2026 completo (2026-06-16). Detalle completo (debugging, escaneo, reprocesamiento) → `.claude/memory/gotchas_archive.md`.
 
 ---
 

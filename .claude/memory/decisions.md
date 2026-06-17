@@ -2,6 +2,8 @@
 
 Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qué**, el **por qué** y las **alternativas descartadas**.
 
+Las decisiones con implementación/validación extensas fueron resumidas aquí — el detalle completo (pasos de implementación, tablas de validación, reprocesos) está en `.claude/memory/decisions_archive.md` (no cargado automáticamente).
+
 ---
 
 ## Por qué ARDEF e IAR no usan Step Functions
@@ -87,42 +89,37 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ## Por qué mc-store fusiona CLN + CAL + ITX por llave (file_id, file_idn, ref_id) y no por posición (axis=1)
 
-**Decisión (actualizada 2026-06-11):** `lmbd-mc-store` (`_store_output`) ya NO usa `pd.concat(frames, axis=1)` por índice posicional. Ahora fusiona CLN + CAL + ITX con `df.merge(..., on=KEYS, how="left", validate="one_to_one")`, donde `KEYS = ["file_id", "file_idn", "ref_id"]`. Antes de cada merge:
-- `_normalize_merge_keys(df, KEYS)` castea las columnas llave a `string` nullable y aplica `.str.strip()` (evita mismatches por espacios o tipos mixtos int/str).
-- Se valida que las 3 columnas llave existan en CLN/CAL/ITX (`raise ValueError` si falta alguna).
-- Se valida que no haya duplicados por `KEYS` en ninguno de los tres frames (`raise ValueError` si `df.duplicated(subset=KEYS).sum() > 0`).
-- Solo se agregan al merge las columnas de CAL/ITX que no existen ya en `merged` (mismo principio que la versión anterior: "solo columnas nuevas").
-- CAL e ITX siguen siendo opcionales: `S3.exceptions.NoSuchKey` (o cualquier excepción de lectura/merge) se loguea como warning y el merge continúa solo con lo que ya se tiene — igual que antes.
+**Decisión (actualizada 2026-06-11):** `lmbd-mc-store` (`_store_output`) ya NO usa `pd.concat(frames, axis=1)` por índice posicional. Ahora fusiona CLN + CAL + ITX con `df.merge(..., on=KEYS, how="left", validate="one_to_one")`, donde `KEYS = ["file_id", "file_idn", "ref_id"]`. Antes de cada merge: `_normalize_merge_keys()` castea las llaves a `string` nullable + `.str.strip()`; se valida que las 3 columnas existan en CLN/CAL/ITX y que no haya duplicados por `KEYS` (`raise ValueError` si fallan). Solo se agregan columnas de CAL/ITX que no existen ya en `merged`. CAL e ITX siguen opcionales: cualquier excepción de lectura/merge se loguea como warning y el merge continúa con lo disponible.
 
-**Decisión anterior (superada, documentada por completo):** `pd.concat(frames, axis=1)` — merge horizontal por índice posicional, asumiendo que CLN/CAL/ITX para el mismo MTI y archivo tienen exactamente el mismo número de filas en el mismo orden.
+**Decisión anterior (superada):** `pd.concat(frames, axis=1)` — merge horizontal por índice posicional, asumiendo mismo número de filas y orden entre CLN/CAL/ITX.
 
-**Razón del cambio:** La garantía de orden posicional entre etapas (CLN/CAL/ITX) resultó frágil en la práctica — `glue-mc-calculate` y `glue-mc-interchange` corren en Spark, donde el orden de las filas de salida no está garantizado entre ejecuciones aunque el contenido sea el mismo (shuffles, particionamiento). Un join por llave es la forma correcta de garantizar que cada fila de CAL/ITX se una con la fila CLN correcta, independientemente del orden físico de cada Parquet. `ref_id` se agregó como tercera columna de `glue-mc-interchange` (`run_interchange_mti`, ver más abajo) precisamente porque `file_id + file_idn` por sí solos no son suficientes para identificar de forma única cada registro dentro de un mismo archivo/MTI — `ref_id` es el identificador de fila a nivel de mensaje IPM.
+**Razón del cambio:** El orden posicional entre etapas Spark (`glue-mc-calculate`/`glue-mc-interchange`) no está garantizado entre ejecuciones (shuffles/particionamiento) aunque el contenido sea el mismo. Un join por llave garantiza la fila correcta independientemente del orden físico. `ref_id` se agregó como tercera llave porque `file_id + file_idn` por sí solos no identifican de forma única cada mensaje IPM dentro de un archivo.
 
-**Por qué falla rápido (`raise ValueError`) en vez de degradar:** Si las llaves no son únicas o no existen, un `how="left"` silencioso produciría duplicación de filas (fan-out) o nulls masivos en las columnas nuevas — un bug de este tipo es mucho más difícil de detectar en `operational` (Athena) que en el log del Lambda. Las validaciones convierten un dato incorrecto silencioso en un error explícito en CloudWatch.
+**Por qué falla rápido (`raise ValueError`):** un `how="left"` silencioso con llaves no únicas/faltantes produciría fan-out o nulls masivos en las columnas nuevas — mucho más difícil de detectar en Athena que en CloudWatch.
 
-**Alternativa descartada:** Mantener el merge posicional y solo "arreglar" el orden en Spark con `orderBy` antes de escribir CAL/ITX. Descartado porque requeriría garantizar el mismo `orderBy` determinístico en CAL e ITX (etapas independientes, con sus propios shuffles/joins) — más frágil y más difícil de auditar que validar llaves explícitas.
+**Alternativa descartada:** Mantener el merge posicional + `orderBy` determinístico en CAL/ITX. Descartado por requerir el mismo orden en etapas independientes con sus propios shuffles/joins — más frágil que validar llaves explícitas.
 
-**Impacto en `glue-mc-interchange`:** `run_interchange_mti()` ahora incluye `F.col("ref_id")` en la selección de columnas de salida (antes no estaba) — es requisito para que mc-store pueda usarlo como llave de merge.
+**Impacto en `glue-mc-interchange`:** `run_interchange_mti()` ahora incluye `F.col("ref_id")` en la salida — requisito para que mc-store lo use como llave de merge.
+
+Detalle completo → `.claude/memory/decisions_archive.md`.
 
 ---
 
 ## Por qué el router extrae la fecha MC descargando el archivo completo (decisión revertida, sync 2026-06-12)
 
-**Decisión anterior (2026-05-26, superada):** `extraer_fecha_mc()` leía el archivo IPM en chunks de 8 MB buscando el primer trailer MTI 1644 / FC 695, con overlap de 8 KB entre chunks y `_mc_unblock_chunk` (siempre salta 2 bytes de separador) para archivos bloqueados. Razón original: consistencia con Visa (solo primeros 50 bytes del header) y evitar descargar archivos de hasta 1.5 GB solo para una fecha.
+**Decisión actual (sync 2026-06-12):** `extraer_fecha_mc()` descarga el archivo completo con un único `s3.get_object()`, y para archivos bloqueados aplica `_mc_unblock_full()` (replica `unblock_1014()` del interpreter, con `valid_seps` pushback) antes de escanear el trailer 695.
 
-**Decisión actual (sync 2026-06-12):** `extraer_fecha_mc()` descarga el archivo completo con un único `s3.get_object()`, y para archivos bloqueados aplica una nueva función `_mc_unblock_full()` (replica `unblock_1014()` del interpreter, con `valid_seps` pushback) antes de escanear el trailer 695.
+**Decisión anterior (2026-05-26, superada):** leía el archivo en chunks de 8 MB (overlap 8 KB) con `_mc_unblock_chunk` (siempre saltaba 2 bytes de separador sin verificar). Razón original: consistencia con Visa y evitar descargar archivos de hasta 1.5 GB solo por una fecha.
 
-**Por qué se revirtió:** `_mc_unblock_chunk()` siempre asume que el separador de cada bloque de 1014 bytes son 2 bytes válidos y los descarta sin verificar. En archivos con separadores no estándar (distintos de `\x40\x40` EBCDIC space), esto desalinea el stream desde el primer bloque con separador "raro" — todo lo que viene después queda corrido 0/1/2 bytes respecto a los límites reales de mensaje, y `_mc_scan_for_695()` nunca encuentra el trailer 695 (cae al fallback `datetime.utcnow()`, registrando una fecha incorrecta en `file_control`).
+**Por qué se revirtió:** `_mc_unblock_chunk()` asumía que el separador de cada bloque de 1014 bytes eran siempre 2 bytes válidos. En archivos con separadores no estándar (≠`\x40\x40` EBCDIC space), esto desalineaba el stream desde el primer bloque "raro" — `_mc_scan_for_695()` nunca encontraba el trailer y caía al fallback `datetime.utcnow()`, registrando `file_date` incorrecto (afecta el particionamiento de todo el pipeline downstream).
 
-`_mc_unblock_full()` corrige esto con `valid_seps = (b"\x40\x40", b"\x20\x20", b"\x00\x00", b"")`: si los 2 bytes leídos después de cada bloque de 1012 no son un separador válido, hace `seek` hacia atrás y los trata como parte del payload del siguiente bloque (pushback) — exactamente la lógica de `unblock_1014()` en `lmbd-mc-interpreter`. Esta lógica de pushback requiere conocer el byte siguiente al separador candidato, lo que es frágil de implementar correctamente a través de límites de chunk (un separador podría quedar partido entre dos chunks) — por eso la solución pasó a descarga completa en vez de intentar portar el pushback al esquema de chunks+overlap.
+`_mc_unblock_full()` corrige esto con `valid_seps = (b"\x40\x40", b"\x20\x20", b"\x00\x00", b"")`: si los 2 bytes tras cada bloque de 1012 no son un separador válido, hace `seek(-2)` (pushback) y los trata como parte del payload del siguiente bloque — misma lógica que `unblock_1014()` del interpreter. El pushback requiere conocer el byte siguiente al separador candidato, frágil de portar a través de límites de chunk — por eso se optó por descarga completa.
 
-**Costo aceptado:** los archivos MC bloqueados pueden ser grandes (cientos de MB–1.5 GB), por lo que esta función ahora hace una descarga completa adicional en el router (antes de que Step Functions/transform vuelvan a leer el mismo archivo). Se aceptó el costo porque la alternativa (fecha incorrecta en `file_control` para archivos con separadores no estándar) es peor — `file_date` se usa para particionar todo el pipeline downstream.
+**Costo aceptado:** descarga completa adicional en el router para archivos MC bloqueados (cientos de MB–1.5 GB) — aceptado porque la alternativa (fecha incorrecta en `file_control`) es peor.
 
-**Detalles de implementación vigentes:**
-- `_mc_unblock_full(data, payload_size=1012, sep_size=2)`: lee el archivo completo en bloques de 1012 bytes; tras cada bloque lee 2 bytes y, si no están en `valid_seps`, hace `seek(-2)` (pushback) antes de leer el siguiente bloque.
-- Archivos bloqueados (`file_block=True`): `data = _mc_unblock_full(raw)` antes de escanear
-- Sin guardias de tamaño (`MAX_CHUNKS` eliminado) — se escanea el archivo completo en memoria
-- Path de extracción sin cambios: `DE48 del mensaje 695 → PDS tag "0105" → file_idn[3:9] → YYMMDD → YYYY-MM-DD`
+**Path de extracción sin cambios:** `DE48 del mensaje 695 → PDS tag "0105" → file_idn[3:9] → YYMMDD → YYYY-MM-DD`.
+
+Detalle de implementación (`_mc_unblock_full`) → `.claude/memory/decisions_archive.md`.
 
 ---
 
@@ -225,21 +222,17 @@ Decisiones no obvias tomadas durante el desarrollo. Cada entrada explica el **qu
 
 ## Por qué product_program_id en glue-vi-mc-reporting usa una nueva tabla `visa_bin_products` en s3-reference
 
-**Decisión (2026-06-11):** `product_program_id` (antes `NULL` fijo, TODO documentado) se calcula ahora con un join: `product_id` (ya calculado en `glue-vi-calculate` via cruce ARDEF, presente en CLN/operational) → `bin_product_id` en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_bin_products/data.parquet` → `range_program_id`.
+**Decisión (2026-06-11):** `product_program_id` (antes `NULL` fijo, TODO documentado) se calcula ahora con un join: `product_id` (ya calculado en `glue-vi-calculate` via cruce ARDEF) → `bin_product_id` en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_bin_products/data.parquet` (58 filas, export 1:1 de `m_visa_bin_products` legacy) → `range_program_id`.
 
-**Origen de la tabla:** export CSV de la tabla maestra `m_visa_bin_products` de PostgreSQL legacy (58 filas: `bin_product_id, short_description, bin_card_type, range_program_id, app_creation_date, app_creation_user`), provisto por el usuario y convertido 1:1 a Parquet (sin transformación) en `visa_bin_products/data.parquet`.
+**Implementación:** nueva función `load_visa_bin_products()`; `transform_visa_baseii()`/`transform_visa_sms()` reciben `vi_bin_products_df`, join `product_ref` (análogo a `merchant_country_ref`/`issuer_country_ref`). MC (`transform_mastercard`) queda como TODO separado — requiere `m_mastercard_bin_products`, no provista aún.
 
-**Implementación en `get_transaction.py`:**
-- `load_visa_bin_products()` — nueva función junto a `load_country()`/`load_exchange_rates()`, selecciona solo `bin_product_id, range_program_id`.
-- `transform_visa_baseii()` y `transform_visa_sms()` reciben `vi_bin_products_df` como parámetro; join `product_ref` (análogo a `merchant_country_ref`/`issuer_country_ref` para country): `df["product_id"] == product_ref["_bin_product_id"]`, left join, alias `product_program_id_raw` → `product_program_id`.
-- `process_client_range()` y `main()` propagan `vi_bin_products_df` (cargado y cacheado una vez, igual que `country_df`).
-- MC (`product_program_id` en `transform_mastercard`) queda como TODO separado — requiere `m_mastercard_bin_products`, tabla distinta no provista aún.
+**Nota (2026-06-12):** refactor de nombres en `get_transaction.py` — variables legacy `m1/m2/m3/m5` renombradas a `merchant_country_ref`/`issuer_country_ref`/`product_ref`/`currency_alpha_ref`; sin cambios de lógica/resultados.
 
-**Nota (2026-06-12):** Refactor de legibilidad en `get_transaction.py` — las variables heredadas de la nomenclatura del SP legacy (`m1`, `m2`, `m3`, `m5`) se renombraron a nombres descriptivos: `merchant_country_ref`, `issuer_country_ref`, `product_ref`, `currency_alpha_ref` (MC). Mismo refactor reordenó la carga de tablas de referencia en `main()`/`process_client_range()` agrupándolas Visa-primero-luego-Mastercard, y limpió comentarios redundantes. Sin cambios de lógica/resultados — solo nombres y orden de parámetros.
+**Validación (2026-06-11):** re-run `glue-test-1` (`report_suffix=20260105_tst3`, EBGR 2026-01-01..2026-01-05) → SUCCEEDED. `product_program_id`: 0 nulls (antes 100%), suma=57,849,742=legacy, value_counts y mapeo `product_code→product_program_id` idénticos al legacy. **Resuelve completamente este TODO.**
 
-**Validación (2026-06-11):** Re-run `glue-test-1` (`jr_f374a87d3849a2d8f4fa1c762c9ece25a4ba51b21118f4233460476253d73f65`, `report_suffix=20260105_tst3`, EBGR 2026-01-01..2026-01-05) → SUCCEEDED. `product_program_id`: 0 nulls (antes 100% null), suma=57,849,742=legacy, value_counts idénticos (103→555,220, 102→6,491), mapeo `product_code→product_program_id` idéntico (E,F,N,P→103; G→102) en ambos sistemas. **Resuelve completamente este TODO.**
+**Alternativa descartada:** calcular en `glue-vi-calculate` (como los otros campos ARDEF). Descartado porque `product_program_id` es atributo del *producto* (tabla pequeña, 58 filas, cambia raramente) — más simple resolverlo via join liviano en el reporting job.
 
-**Alternativa descartada:** Calcular `product_program_id` directamente en `glue-vi-calculate` (como los otros campos ARDEF). Descartado porque `product_program_id` es un atributo del *producto* (tabla pequeña, 58 filas, cambia raramente) no de la transacción — más simple resolverlo en el reporting job via join liviano que mantenerlo sincronizado en cada `calculate.parquet`.
+Detalle completo → `.claude/memory/decisions_archive.md`.
 
 ---
 
@@ -261,26 +254,16 @@ El bug original (`Column 'to_currency' does not exist`) solo se manifestó el 20
 
 ## Por qué se agregaron business_transaction_cycle y settlement_report_currency_code en glue-vi-calculate
 
-**Decisión (2026-06-11):** Dos nuevos campos calculados en `glue/scripts/visa/calculate/calculate.py`, BASEII pasa de 28 a 30 campos, SMS de 26 a 27.
+**Decisión (2026-06-11):** Dos campos nuevos en `glue/scripts/visa/calculate/calculate.py` (BASEII 28→30, SMS 26→27), requeridos por `get_transaction.py` y no materializados antes en `calculate.parquet`.
 
-**`business_transaction_cycle`** (BASEII/draft, `calc_business_transaction_cycle_draft`):
-- Deriva de `draft_code` (transaction_code) + `usage_code`, replicando la clasificación del SP legacy:
-  - `draft_code in (05,06,07)` (purchase): `usage=1→11`, `usage=2→23`, `usage=9→6`, otro→255
-  - `draft_code in (15,16,17,35,36,37)` (reversal): `usage=1→1`, `usage=9→4`, otro→255
-  - `draft_code in (25,26,27)` (chargeback): `usage=1→11`, `usage=9→6`, `usage=2→25`, otro→255
-  - cualquier otro `draft_code` → 255
-- SMS (`calc_business_transaction_cycle_sms`): la lógica es exclusiva de transaction_code BASEII — para SMS el campo se mantiene `NULL` (igual que en legacy), por eso existe la función dedicada que solo hace `F.lit(None).cast(IntegerType())`.
+- **`business_transaction_cycle`** (BASEII/draft, `calc_business_transaction_cycle_draft`): deriva de `draft_code`+`usage_code` replicando la clasificación del SP legacy (purchase/reversal/chargeback × usage_code → código 1-255; cualquier otro `draft_code` → 255). SMS (`calc_business_transaction_cycle_sms`): siempre `NULL` (igual que legacy).
+- **`settlement_report_currency_code`** (solo BASEII/draft, `calc_settlement_report_currency_code_draft`): `local_currency_code` del cliente (tabla `client-02`) si `calc_jurisdiction∈(on-us,off-us)` y `settlement_flag!=0`, sino `settlement_currency_code`. Sin equivalente SMS.
 
-**`settlement_report_currency_code`** (solo BASEII/draft, `calc_settlement_report_currency_code_draft`):
-- Si `calc_jurisdiction in (on-us, off-us)` y `settlement_flag != 0` → `local_currency_code` del cliente (tabla `client-02`, ya cargado en `client_data` vía `get_client_data()` — el mismo mecanismo que ya usaba `--dynamodb_table_client`).
-- Caso contrario → `settlement_currency_code` del cliente.
-- No existe equivalente para SMS — el campo no se agrega a `calculate_sms_fields`.
+**Validación (2026-06-11):** contra `93BF199C85D2DF243AFDABEE5572E8C0` (EBGR, 2026-01-03, 269,725 filas BASEII): ambos campos 0 nulls, distribución/mapeo correctos (100% `"EUR"` para EBGR).
 
-**Razón:** ambos campos son requeridos por el reporte (`glue-vi-mc-reporting` / `get_transaction.py`) y no estaban materializados en `calculate.parquet`; agregarlos en calculate evita que el reporting tenga que recalcularlos con su propia lógica duplicada.
+**Reproceso masivo:** los 100 archivos EBGR/VISA/IN de enero 2026 (calculate+store) reprocesados y confirmados en catálogo Glue tras re-crawl. Detalle en `manual_execution.md` → "Sesión 2026-06-11".
 
-**Validación (2026-06-11):** contra `93BF199C85D2DF243AFDABEE5572E8C0` (EBGR, 2026-01-03, 269,725 filas BASEII): `business_transaction_cycle` int32, 0 nulls, distribución por `draft_code`/`usage_code` coincide con la tabla de mapeo (ej. `draft_code∈{05,06,07,25}` + `usage_code=1` → `11`). `settlement_report_currency_code` string, 0 nulls, 100% `"EUR"` para EBGR (`local_currency_code=settlement_currency_code=EUR`).
-
-**Reproceso masivo (2026-06-11):** ambos campos se reprocesaron para los 100 archivos EBGR/VISA/IN de enero 2026 (calculate + store) y se confirmaron en el catálogo Glue tras re-crawl (`business_transaction_cycle: int`, `settlement_report_currency_code: string` en `operational_ebgr_visa.baseii_drafts`). Detalle del reproceso masivo en `manual_execution.md` → "Sesión 2026-06-11".
+Detalle completo (tabla de mapeo draft_code/usage_code → business_transaction_cycle) → `.claude/memory/decisions_archive.md`.
 
 ---
 
@@ -308,50 +291,58 @@ El bug original (`Column 'to_currency' does not exist`) solo se manifestó el 20
 
 ## Por qué lmbd-mc-exchange-rates se reescribió con scraping vía proxies (ProxyManager + orquestador/worker encadenado)
 
-**Decisión (sync 2026-06-11):** `lambdas/mastercard/exchange-rates/src/handler.py` se reescribió casi por completo (+678 líneas) para obtener tipos de cambio Mastercard scrapeando `https://www.mastercard.com/marketingservices/public/mccom-services/currency-conversions/conversion-rates` (la API pública que alimenta el conversor de Mastercard), en vez de la fuente anterior.
+**Decisión (sync 2026-06-11):** `lambdas/mastercard/exchange-rates/src/handler.py` reescrito (+678 líneas) para scrapear la API pública del conversor Mastercard (`mccom-services/currency-conversions/conversion-rates`), en vez de la fuente anterior.
 
-**Componentes nuevos:**
-- **`ProxyManager`** (clase thread-safe): pool de proxies con `pick()` round-robin, `report_failure()`/`report_success()` — banea un proxy tras `PROXY_BAN_AFTER=1` fallo consecutivo, y enmascara credenciales en los logs (`_mask_proxy_url`).
-- **`validate_proxies()`**: al arrancar, prueba cada proxy con una consulta real (USD→EUR) y descarta los que no responden 200 — evita gastar tiempo en proxies muertos durante el scraping real.
-- **Arquitectura orquestador/worker encadenada** (`mode="orchestrator"|"worker"` en el evento de invocación):
-  - `run_orchestrator()`: genera el rango de fechas (`BEGIN_DATE`..`END_DATE`), carga todos los pares de moneda desde `resources/currencies.json`, los divide en `NUM_CHUNKS=10` chunks, borra los Parquets existentes de cada fecha (`delete_existing_parquets`), e invoca el primer worker (`chunk_index=0`) por fecha vía `invoke_next_worker()` (invocación async, `InvocationType="Event"`).
-  - `run_worker()`: procesa su chunk con `ThreadPoolExecutor(MAX_WORKERS=9)` (cada thread = `process_sub_chunk`, con su propio proxy via `ProxyManager.pick()`), escribe el resultado a `s3://{S3_BUCKET}/{S3_PREFIX}/exchange_date={date}/`, e invoca el siguiente worker de la cadena (`chunk_index+1`) hasta agotar `chunks`.
-- Esta arquitectura encadenada evita el timeout de un solo Lambda (900s máx) cuando el número de pares de moneda × fechas es grande — cada worker procesa solo 1 de 10 chunks y se auto-relanza.
+**Componentes nuevos:** `ProxyManager` (pool round-robin, banea un proxy tras `PROXY_BAN_AFTER=1` fallo, enmascara credenciales en logs); `validate_proxies()` (descarta proxies muertos al arrancar); arquitectura orquestador/worker encadenada (`mode="orchestrator"|"worker"`) — el orquestador divide los pares de moneda en `NUM_CHUNKS=10` por fecha e invoca el primer worker; cada worker procesa su chunk con `ThreadPoolExecutor(MAX_WORKERS=9)`, escribe a `exchange_date={date}/` y se auto-relanza para el siguiente chunk — evita el timeout de 900s.
 
-**Razón:** Mastercard no expone una API/feed oficial de tipos de cambio históricos accesible para este proyecto; la única fuente disponible es la API pública del conversor web, que aplica rate-limiting/bloqueo por IP agresivo — de ahí la necesidad de rotar proxies y espaciar requests (`PAUSE_MIN/MAX` entre 1.0-1.3s por request).
+**Razón:** Mastercard no expone API oficial de tipos de cambio históricos; la API pública del conversor aplica rate-limiting/bloqueo agresivo por IP — requiere rotar proxies y espaciar requests (1.0-1.3s).
 
-**Nuevos archivos de recursos:**
-- `lambdas/mastercard/exchange-rates/src/resources/currencies.json` (commiteado) — catálogo `{alphaCd, currNam}` usado para generar todos los pares `[src, dst]` con `src != dst`.
-- `lambdas/mastercard/exchange-rates/src/resources/proxy_settings.json` (**NO commiteado** — agregado a `.gitignore` vía `**/resources/proxy_settings.json`) — contiene URLs de proxy con credenciales reales (`usuario:password@host:puerto`). Estructura: `proxy_settings.proxy_list_mastercard` (preferido) con fallback a `proxy_settings.proxy_list`, filtrando `status=="active"`.
+**Archivos nuevos:** `resources/currencies.json` (commiteado, catálogo de pares de moneda); `resources/proxy_settings.json` (**NO commiteado**, credenciales reales de proxy — en `.gitignore`; verificar que no quede tracked).
 
-**Cambios de configuración asociados:** `Timeout` 300s→750s (la cadena de workers necesita más margen por invocación), `MemorySize` 2048→512 MB (el trabajo es I/O-bound, no necesita memoria alta), `VpcConfig` removido (el scraping necesita salida a internet pública, no a recursos VPC privados), `env-vars.json` limpiado de la variable de prueba `testing_1`.
+**Config asociada:** Timeout 300s→750s, MemorySize 2048→512MB (I/O-bound), VpcConfig removido (necesita internet público).
 
-**Seguridad:** `proxy_settings.json` contiene credenciales reales de proxy (`Soporteintelica:JCbiJuhUpX` embebido en ~118 URLs). Verificar que el archivo nunca se commitee — si `git status` lo muestra como tracked/staged, hay que hacer `git rm --cached` antes de que la regla de `.gitignore` surta efecto (gitignore no afecta archivos ya trackeados).
+**Alternativa descartada:** mantener la fuente anterior — no cubría los pares de moneda/fechas necesarios para `glue-mc-calculate`/`glue-mc-interchange`.
 
-**Alternativa descartada:** Mantener la fuente de tipos de cambio anterior (la que dejó la variable `testing_1` en `env-vars.json` como placeholder de pruebas). Descartado porque no cubría los pares de moneda/fechas necesarios para `glue-mc-calculate`/`glue-mc-interchange` — detalle de la fuente anterior no documentado, se reemplazó directamente.
+Detalle completo (firma de cada componente, estructura de `proxy_settings.json`) → `.claude/memory/decisions_archive.md`.
 
 ---
 
 ## Por qué lmbd-mc-clean y lmbd-mc-extract leen/escriben Parquet en streaming (iter_batches + ParquetWriter) — sync 2026-06-12
 
-**Decisión:** `_clean_1644`/`_clean_standard` (mc-clean) y `_extract_1644`/`_extract_standard` (mc-extract) dejaron de hacer `df = _read_parquet(key)` (carga el Parquet completo a un solo DataFrame) seguido de `_write_parquet_with_schema(df, ...)` (serializa todo de una vez). Ahora:
+**Decisión:** `_clean_*`/`_extract_*` dejaron de cargar el Parquet completo a un DataFrame + serializar todo de una vez. Ahora: `pq.ParquetFile` (solo footer) → `iter_batches(batch_size=ITX_CLEAN_BATCH_SIZE|ITX_EXTRACT_BATCH_SIZE, default=100000)` → por batch: `to_pandas()` → transformar (cast/rename/align) → `pa.Table` → `ParquetWriter.write_table()` a un `BytesIO` en memoria → `del`+`gc.collect()` por iteración → una sola subida final a S3. En mc-clean, el schema Arrow (`_build_arrow_schema`) se construye una vez (primer batch) y se reutiliza — extraído a `_align_df_to_schema()`.
 
-1. Descargan los bytes del Parquet a un `io.BytesIO` y abren un `pq.ParquetFile` (solo lee el footer).
-2. Iteran `pf.iter_batches(batch_size=ITX_CLEAN_BATCH_SIZE | ITX_EXTRACT_BATCH_SIZE, default=100000)`.
-3. Por cada batch: `to_pandas()` → transformación (cast/rename/align) → `pa.Table` → `writer.write_table()` sobre un `pq.ParquetWriter` que escribe a otro `io.BytesIO` en memoria.
-4. `del` + `gc.collect()` en cada iteración para liberar el batch anterior antes de procesar el siguiente.
-5. Al final, `out_buf.seek(0)` + `S3.put_object(..., Body=out_buf)` — una sola subida del Parquet completo, pero nunca un DataFrame completo en memoria.
+**Razón:** los Parquets de entrada (RAW/TRA) pueden tener millones de filas — cargar el DataFrame completo + copias intermedias multiplica memoria varias veces sobre `MemorySize=10240MB` (ya al máximo). El streaming acota el pico a `batch_size` filas.
 
-En mc-clean, el schema Arrow (`_build_arrow_schema`) se construye una sola vez a partir del primer batch del primer archivo y se reutiliza para todos los archivos del mismo MTI — se extrajo a una función nueva `_align_df_to_schema()` (devuelve `pa.Table`, compartida por `_write_parquet_with_schema` y el loop de batches).
+**Config asociada:** `mc-clean` Timeout 300s→600s; `mc-interpreter` EphemeralStorage 512MB→1536MB.
 
-**Razón:** Los Parquets de entrada de mc-clean/mc-extract (capas RAW/TRA del interpreter/transform) pueden tener millones de filas — cargar el DataFrame completo + las copias intermedias de cada transformación (`_cast_df`, `_align_df_1644`, rename, etc.) multiplica el uso de memoria varias veces sobre el tamaño del Parquet. Con `MemorySize=10240MB` ya al máximo, esto causaba presión de memoria en archivos grandes. El streaming por batches acota el pico de memoria a `batch_size` filas independientemente del tamaño total del archivo.
+**`lmbd-mc-interpreter` — mismo principio en `_process_block`:** itera `block_buffer` en sub-chunks de `ITX_INTERPRETER_BLOCK_CHUNK_SIZE` (default 10000), construye `df_chunk` y escribe por sub-chunk vía `write_parquet_by_mti_block_streaming()`, liberando memoria (`del`+`gc.collect()`+`release_unused()`) entre sub-chunks.
 
-**Cambios de configuración asociados:** `mc-clean` `Timeout` 300s→600s (compensar el overhead de iterar en batches vs. una sola pasada — más iteraciones de Python, no más trabajo total). `mc-interpreter` `EphemeralStorage` 512MB→1536MB (relacionado, ver `_process_block` abajo).
+**Nota:** `ITX_CLEAN_BATCH_SIZE`/`ITX_EXTRACT_BATCH_SIZE`/`ITX_INTERPRETER_BLOCK_CHUNK_SIZE` no declaradas en `config.json` (default seguro vía `os.environ.get`).
 
-**`lmbd-mc-interpreter` — mismo principio aplicado a `_process_block`:** antes construía `wide_rows` (lista de dicts) para TODO `block_buffer` de una vez (un bloque puede tener 400K+ mensajes ISO-8583 con 80+ columnas cada uno) y luego un solo `pd.DataFrame(wide_rows)`. Ahora itera `block_buffer` en sub-chunks de `ITX_INTERPRETER_BLOCK_CHUNK_SIZE` (default 10000) mensajes, construye `wide_rows`/`df_chunk` por sub-chunk, llama a `write_parquet_by_mti_block_streaming()` por sub-chunk, y libera (`del` + `gc.collect()` + `pa.default_memory_pool().release_unused()`) antes del siguiente. `file_idn`/`file_dt` (del trailer 695, ya conocidos antes de llamar a `_process_block`) se aplican igual a cada sub-chunk — no hay riesgo de procesar un sub-chunk sin contexto.
+**Aplicable a mc-transform:** mismo patrón resolvería el gotcha pendiente "mc-transform: sin chunking en MTIs 1442, 1740 y 1644".
 
-**Nota — env vars sin declarar en config.json:** `ITX_CLEAN_BATCH_SIZE`, `ITX_EXTRACT_BATCH_SIZE` e `ITX_INTERPRETER_BLOCK_CHUNK_SIZE` se leen con `os.environ.get(..., "100000"/"10000")` pero ninguna está declarada en `config.json`/`env-vars.json` — mismo patrón (con default seguro, por lo que no es bug latente como `DDB_MASTERCARD_FIELDS_TABLE`) pero conviene agregarlas si se necesita tunearlas por ambiente.
+**Alternativa descartada:** aumentar `MemorySize` más allá de 10240MB — no es posible (máximo de AWS Lambda).
 
-**Aplicable a mc-transform:** este es el mismo patrón que resolvería el gotcha pendiente "mc-transform: sin chunking en MTIs 1442, 1740 y 1644" — replicar `iter_batches` + `ParquetWriter` ahí cuando se aborde ese pendiente.
+Detalle completo → `.claude/memory/decisions_archive.md`.
 
-**Alternativa descartada:** Aumentar `MemorySize` más allá de 10240MB. No es posible — 10240MB es el máximo de AWS Lambda.
+---
+
+## Por qué lmbd-mc-store restaura el schema Arrow del CLN antes de escribir operational (mismo patrón que `_cal_dtype_map` en lmbd-vi-store)
+
+**Decisión (2026-06-13):** `_store_output()` lee el CLN con `_read_parquet_s3_with_schema()` (`pq.read_table()`) y captura `cln_dtype_map = {nombre: tipo Arrow}` para todas las columnas excepto `KEYS`. Tras el merge CLN+CAL+ITX, convierte a `pa.Table` y llama `_restore_schema(merged_table, cln_dtype_map)`: columnas en `cln_dtype_map` → castea al tipo original (timestamps siempre `pa.timestamp("us")`); columnas nuevas (CAL/ITX) → `NullType→string`, `decimal128(p,s)→decimal128(18,s)` si `p≠18`, `timestamp→"us"`. Cast `safe=False`; si falla, warning y queda con tipo inferido (no aborta el archivo). Escribe con `_write_table_s3()` (schema explícito) — `_write_parquet_s3()` (sin schema) se eliminó.
+
+**Razón:** mismo problema del gotcha "operational MC (IPM_1240/1442): TIMESTAMP(NANOS) y tipos inconsistentes...". El CLN ya tiene schema explícito consistente (`_build_arrow_schema`), pero `pd.read_parquet()`+`df.to_parquet()` sin schema re-infería tipos por archivo (`int64+nulls→double`, `string 100%-null→NullType`, `decimal128(18,s)→decimal128(p_inferido,s)`), rompiendo `spark.read.parquet()` con `SchemaColumnConvertNotSupportedException` y `AnalysisException: Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))`.
+
+Mismo principio que deja a Visa en "0 inconsistencias" (`_cal_dtype_map`, ver decisión de lmbd-vi-store). **Diferencia con Visa:** en Visa el schema autoritativo es el CAL; en MC es el CLN (CAL/ITX de Spark/Glue no tienen schema fijo declarado).
+
+**`function_code`:** confirmado columna del CLN (no CAL/ITX) — `cln_dtype_map` la restaura a `int64` sin cast adicional.
+
+**Validación local (2026-06-13):** `tst_files/debug_scripts/test_mc_store_local.py` contra triple real (IPM_1240, EBGR, 2026-01-01, 22,419 filas, 148 columnas): 29 columnas corregidas, 0 remanentes con NullType/decimal≠18/timestamp≠us.
+
+**Despliegue y reproceso (2026-06-13):** handler subido; `reprocess_mc_store.py` IN (120/120) + OUT (18/18) SUCCESS; `scan_mc_operational_schema_variance.py` → 0 inconsistencias en IPM_1240 (138 archivos) e IPM_1442 (5 archivos); `spark.read.parquet()` confirmado sin error (3,783,441 + 1 filas).
+
+**Alternativa descartada:** `enableVectorizedReader=false` en `get_transaction.py` — habría mitigado el síntoma sin corregir el dato físico.
+
+**Limpieza get_transaction.py (2026-06-13):** eliminado código Option A sin uso (`_NANOS_AS_LONG_COLS`, `_widest_arrow_type`, `_align_table_to_schema`, `_read_operational_via_pyarrow`, exclusión NullType, `spark.sql.legacy.parquet.nanosAsLong` + imports asociados). `read_operational()` quedó como `spark.read.parquet()` simple. Re-validado (`report_suffix=20260102_0105_mc_v3`).
+
+Detalle completo (tabla de las 29 columnas corregidas) → `.claude/memory/decisions_archive.md`.
