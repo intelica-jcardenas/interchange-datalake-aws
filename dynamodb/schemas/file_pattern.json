@@ -1,0 +1,39 @@
+﻿{
+    "Table": {
+        "AttributeDefinitions": [
+            {
+                "AttributeName": "pattern_id",
+                "AttributeType": "S"
+            }
+        ],
+        "TableName": "itl-0004-itx-dev-dynamo-file_pattern-02",
+        "KeySchema": [
+            {
+                "AttributeName": "pattern_id",
+                "KeyType": "HASH"
+            }
+        ],
+        "TableStatus": "ACTIVE",
+        "CreationDateTime": "2026-04-23T16:56:25.655000-05:00",
+        "ProvisionedThroughput": {
+            "NumberOfDecreasesToday": 0,
+            "ReadCapacityUnits": 1,
+            "WriteCapacityUnits": 1
+        },
+        "TableSizeBytes": 4119,
+        "ItemCount": 18,
+        "TableArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-file_pattern-02",
+        "TableId": "34654574-2372-466f-b972-c48690fee4bc",
+        "SSEDescription": {
+            "Status": "ENABLED",
+            "SSEType": "KMS",
+            "KMSMasterKeyArn": "arn:aws:kms:eu-south-2:861276092327:key/560dd37d-d216-49bb-90ff-8d21f03db55f"
+        },
+        "DeletionProtectionEnabled": false,
+        "WarmThroughput": {
+            "ReadUnitsPerSecond": 1,
+            "WriteUnitsPerSecond": 1,
+            "Status": "ACTIVE"
+        }
+    }
+}

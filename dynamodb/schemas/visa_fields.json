@@ -1,52 +1,48 @@
-{
+﻿{
     "Table": {
         "AttributeDefinitions": [
             {
-                "AttributeName": "client_id",
+                "AttributeName": "column_name",
                 "AttributeType": "S"
             },
             {
-                "AttributeName": "file_id",
-                "AttributeType": "S"
-            },
-            {
-                "AttributeName": "file_processing_date",
+                "AttributeName": "type_record",
                 "AttributeType": "S"
             }
         ],
-        "TableName": "itx-file-control",
+        "TableName": "itl-0004-itx-dev-dynamo-visa_fields-02",
         "KeySchema": [
             {
-                "AttributeName": "file_id",
+                "AttributeName": "type_record",
                 "KeyType": "HASH"
+            },
+            {
+                "AttributeName": "column_name",
+                "KeyType": "RANGE"
             }
         ],
         "TableStatus": "ACTIVE",
-        "CreationDateTime": "2026-03-05T15:04:45.023000+00:00",
+        "CreationDateTime": "2026-04-29T10:35:49.481000-05:00",
         "ProvisionedThroughput": {
             "NumberOfDecreasesToday": 0,
             "ReadCapacityUnits": 0,
             "WriteCapacityUnits": 0
         },
-        "TableSizeBytes": 294022,
-        "ItemCount": 55,
-        "TableArn": "arn:aws:dynamodb:us-east-1:293472517631:table/itx-file-control",
-        "TableId": "5b4c30dd-693e-4d2b-a201-a84c9dd4d3b5",
+        "TableSizeBytes": 79592,
+        "ItemCount": 430,
+        "TableArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-visa_fields-02",
+        "TableId": "f7258edc-f092-41a0-849e-4059186c7f5a",
         "BillingModeSummary": {
             "BillingMode": "PAY_PER_REQUEST",
-            "LastUpdateToPayPerRequestDateTime": "2026-03-05T15:04:45.023000+00:00"
+            "LastUpdateToPayPerRequestDateTime": "2026-04-29T10:35:49.481000-05:00"
         },
         "GlobalSecondaryIndexes": [
             {
-                "IndexName": "client-date-index",
+                "IndexName": "type-record-index",
                 "KeySchema": [
                     {
-                        "AttributeName": "client_id",
+                        "AttributeName": "type_record",
                         "KeyType": "HASH"
-                    },
-                    {
-                        "AttributeName": "file_processing_date",
-                        "KeyType": "RANGE"
                     }
                 ],
                 "Projection": {
@@ -58,9 +54,9 @@
                     "ReadCapacityUnits": 0,
                     "WriteCapacityUnits": 0
                 },
-                "IndexSizeBytes": 294022,
-                "ItemCount": 55,
-                "IndexArn": "arn:aws:dynamodb:us-east-1:293472517631:table/itx-file-control/index/client-date-index",
+                "IndexSizeBytes": 79592,
+                "ItemCount": 430,
+                "IndexArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-visa_fields-02/index/type-record-index",
                 "WarmThroughput": {
                     "ReadUnitsPerSecond": 12000,
                     "WriteUnitsPerSecond": 4000,
@@ -68,6 +64,11 @@
                 }
             }
         ],
+        "SSEDescription": {
+            "Status": "ENABLED",
+            "SSEType": "KMS",
+            "KMSMasterKeyArn": "arn:aws:kms:eu-south-2:861276092327:key/560dd37d-d216-49bb-90ff-8d21f03db55f"
+        },
         "DeletionProtectionEnabled": false,
         "WarmThroughput": {
             "ReadUnitsPerSecond": 12000,

@@ -219,7 +219,9 @@ interchange-datalake-aws/
 │   └── terraform/                  # IaC Terraform
 ├── scripts/                        # Utilitarios locales de desarrollo (no se despliegan)
 │   ├── sync-lambdas.ps1            # Descarga config + codigo de Lambdas desde AWS al repo
-│   └── sync-glue.ps1               # Descarga config + scripts de Glue Jobs desde AWS al repo
+│   ├── sync-glue.ps1               # Descarga Jobs (config+script), Databases y Crawlers de Glue desde AWS al repo
+│   ├── sync-dynamodb.ps1           # Descarga schemas (describe-table) e items de tablas DynamoDB desde AWS al repo
+│   └── sync-step-functions.ps1     # Descarga definiciones ASL de Step Functions desde AWS al repo
 └── .env.example                    # Template de variables de entorno
 ```
 
@@ -329,7 +331,9 @@ Patron de nomenclatura: `itl-0004-itx-{env}-intchg-02-glue-{marca}-{job}`
 | `itl-0004-itx-dev-intchg-02-glue-vi-interchange` | Visa | G.2X × 4 | Reporte consolidado de interchange |
 | `itl-0004-itx-dev-intchg-02-glue-mc-calculate` | MC | G.1X × 2 | Calculo de fees Mastercard |
 | `itl-0004-itx-dev-intchg-02-glue-mc-interchange` | MC | G.1X × 2 | Reporte consolidado interchange MC |
-| `itl-0004-itx-dev-intchg-02-glue-test-1` | Visa/MC | G.1X × 2 | Reporte de transacciones (`glue-vi-mc-reporting` / `get_transaction.py`) — un cliente por ejecucion. Nombre real pendiente de renombrar (ver Pendientes). |
+| `itl-0004-itx-dev-intchg-02-glue-test-1` | Visa/MC | G.1X × 2 | Reporte de transacciones (`get_transaction.py`) — un cliente por ejecucion. Nombre real pendiente de renombrar (ver Pendientes). |
+| `itl-0004-itx-dev-intchg-02-glue-test-3` | Visa | G.1X × 2 | Data Quality Visa (`vi_data_quality.py`). Nombre real pendiente de renombrar (ver Pendientes). |
+| `itl-0004-itx-dev-intchg-02-glue-test-4` | MC | G.1X × 2 | Data Quality Mastercard — script en desarrollo local por el equipo, pendiente de subida a S3. |
 
 Glue Version: 4.0
 
@@ -442,7 +446,7 @@ terraform apply
 - Configurar retencion de logs en CloudWatch (variable `log_retention_days = 30` en Terraform ya esta lista) — auditoria 2026-06-11 via `aws logs describe-log-groups`: aplicado PARCIALMENTE y con valores inconsistentes. 60d en `itx-interpreter`(huerfana), `archive-file`, `router`, `vi-clean`, `vi-extract`, `vi-store`, `vi-transform` y los logs del SFN Visa; 30d (el valor real de terraform) solo en `lmbd-test-1/2` y los logs del SFN MC. **Sin retencion (None = nunca expira):** `mc-clean`, `mc-exchange-rates`, `mc-extract`, `mc-iar`, `mc-interpreter`, `mc-store`, `mc-transform`, `vi-ardef`, `vi-exchange-rates`, `unzip` — practicamente todo Mastercard sin retencion. Aplicar 30d a estos cuando se revise.
 - Lambda huerfana `itl-0004-itx-dev-intchg-02-itx-interpreter` (10240MB/900s, LastModified 2026-05-18, **nunca invocada** — sin log streams) detectada en auditoria 2026-06-11: remanente de la convencion de nombres vieja (`itx-*`), ya reemplazada por `lmbd-mc-interpreter`. Sus "hermanas" `itx-ardef`/`itx-iar`/`itx-unzip` ya fueron borradas (solo quedan sus log groups huerfanos sin funcion). Eliminar `itx-interpreter` y los 3 log groups huerfanos cuando se confirme que no esta referenciada por nada.
 - Testing end-to-end en ambiente empresarial
-- Renombrar `glue-test-1` (job real de `glue-vi-mc-reporting` / `get_transaction.py`) a un nombre que siga la convencion (ej. `itl-0004-itx-dev-intchg-02-glue-vi-mc-reporting`); existen ademas `glue-test-2/3/4` sin uso conocido — verificar antes de tocarlos
+- Renombrar `glue-test-1/3/4` a nombres que sigan la convencion (ej. `itl-0004-itx-dev-intchg-02-glue-vi-mc-reporting`, `glue-vi-data-quality`, `glue-mc-data-quality`); `glue-test-2` sin uso conocido — verificar antes de tocar. Al renombrar, actualizar `$AllJobs` en `scripts/sync-glue.ps1`
 - `load_exchange_rates()` (reporting) usa `exchange_rate/rate_date=YYYY-MM-DD/` como fuente de tipo de cambio — hay un nuevo metodo de extraccion de tipo de cambio Visa en desarrollo que podria reemplazar/complementar esta fuente; revisar `load_exchange_rates()` cuando este disponible
 - Eliminar archivos de documentacion/infra legacy que referencian buckets y nombres de la convencion antigua (anterior a `itl-0004-itx-{env}-intchg-02-*`): `.env.example`, `step-functions/README.md`, `lambdas/router/README.md`, `infrastructure/terraform/stepfunctions.tf`, `infrastructure/deploy.sh`, `iam/README.md`, `CHANGELOG.md`. La convencion vigente es la documentada arriba en "Convencion de nombres". Antes de eliminarlos, recrear `README.md` en las carpetas correspondientes (`step-functions/`, `lambdas/router/`, `iam/`, `infrastructure/`) con la nomenclatura y nombres reales actuales. Nota: `infrastructure/terraform/stepfunctions.tf` define un solo Step Function (`itx_main_orchestrator`) pero AWS tiene dos (`sfn-vi`, `sfn-mc`) — revisar si terraform necesita 2 recursos separados antes de reescribir.
 
@@ -493,14 +497,31 @@ Prerequisito: `aws sso login --profile itx-dev` y `$env:AWS_PROFILE = "itx-dev"`
 ```
 
 **`sync-glue.ps1`** — descarga desde AWS al repo:
-- `get-job` → `config.json`
-- `DefaultArguments` → `args.json`
-- Script PySpark desde S3 → `glue/scripts/*/`
+- Jobs: `get-job` → `config.json` + `args.json` + script PySpark desde S3 → `glue/scripts/*/`
+- Databases: `get-database` → `glue/databases/<sufijo>.json` (prefijo `itl_0004_itx_dev_02_`)
+- Crawlers: `get-crawler` → `glue/crawlers/<sufijo>.json` (prefijo `itl_0004_itx_dev_02_`)
 
 ```powershell
-.\scripts\sync-glue.ps1                   # todos
-.\scripts\sync-glue.ps1 -Group mc         # solo Mastercard
-.\scripts\sync-glue.ps1 -Job vi-calculate # uno especifico
+.\scripts\sync-glue.ps1                              # todo (jobs + databases + crawlers)
+.\scripts\sync-glue.ps1 -Resource jobs               # solo jobs
+.\scripts\sync-glue.ps1 -Resource databases          # solo databases
+.\scripts\sync-glue.ps1 -Resource crawlers           # solo crawlers
+.\scripts\sync-glue.ps1 -Resource jobs -Group mc      # jobs Mastercard
+.\scripts\sync-glue.ps1 -Resource jobs -Group reports # jobs de reportes y DQ (test-1, test-3)
+.\scripts\sync-glue.ps1 -Job vi-calculate             # un job especifico
+.\scripts\sync-glue.ps1 -Name operational_ebgr_visa   # un database/crawler especifico
+```
+
+**`sync-dynamodb.ps1`** — descarga desde AWS al repo:
+- Schemas: `describe-table` → `dynamodb/schemas/<sufijo>.json` (prefijo `itl-0004-itx-dev-dynamo-`, sufijo `-02`)
+- Items: `scan` → `dynamodb/items/<sufijo>.json` — solo tablas de configuracion (`client`, `file_pattern`, `visa_fields`, `mastercard_fields`); `file_control` excluida (datos operacionales)
+
+```powershell
+.\scripts\sync-dynamodb.ps1                          # todo (schemas + items)
+.\scripts\sync-dynamodb.ps1 -Resource schemas        # solo schemas
+.\scripts\sync-dynamodb.ps1 -Resource items          # solo items
+.\scripts\sync-dynamodb.ps1 -Table visa_fields       # tabla especifica (schemas + items)
+.\scripts\sync-dynamodb.ps1 -Resource schemas -Table client
 ```
 
 ---
@@ -512,3 +533,4 @@ Archivos con contexto acumulado del proyecto — decisiones tomadas y problemas 
 - Decisiones de arquitectura: @.claude/memory/decisions.md
 - Gotchas y problemas conocidos: @.claude/memory/gotchas.md
 - Ejecución manual / debugging paso a paso: @.claude/memory/manual_execution.md
+- Pendientes activos (checklist): @.claude/memory/pending.md

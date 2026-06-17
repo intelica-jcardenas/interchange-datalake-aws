@@ -1,0 +1,627 @@
+﻿{
+    "TableName":  "itl-0004-itx-dev-dynamo-file_pattern-02",
+    "Count":  18,
+    "Items":  [
+                  {
+                      "created_at":  {
+                                         "S":  "2026-01-06 17:41:21"
+                                     },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "VI Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "1"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "VISA"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "Eurobank VISA Incoming (tiene drafts + VSS)"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:[Ii]\\d{4})"
+                                      },
+                      "customer_code":  {
+                                            "S":  "EBGR"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "10"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "BTRLRO MASTERCARD Incoming"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:iep_.*\\.ipm|early_.*\\.ipm|MCI\\.AR\\.T112\\.M.*)$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BTRLRO"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "11"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "BTRLRO MASTERCARD Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:OMC_.*[^-][^A][^S][^C][^I][^I][^.][^t][^x][^t])$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BTRLRO"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "12"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "BTRLRO MASTERCARD Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:IPM.*)$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BTRLRO"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "13"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "ERSTHU MASTESCARD Incoming"
+                                      },
+                      "file_format":  {
+                                          "S":  "^MCI.AR.T112.*$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "ERSTHU"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "14"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "ERSTHU MASTESCARD Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "^MCI.AR.R111.*$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "ERSTHU"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  false
+                                          },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "15"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "EURBGR MASTESCARD Incoming"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:T11200A[1-9]d.*|T11200AT0(?:\\..*|.*)|T112T0\\..*)$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "EBGR"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "16"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "EURBGR MASTESCARD Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:TOCEURO.*|ONUSIPM.*)$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "EBGR"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "17"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "NCBJM MASTESCARD Incoming"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:T112|TT112).*"
+                                      },
+                      "customer_code":  {
+                                            "S":  "NCBJM"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "18"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "NCBJM MASTESCARD Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(?:MC_)?R06_CLNCBJ_JM_(?:INTERNATIONALTRXNS|JMDINTERNATIONALTRXNS|LOCALTRXNS).*[^-][^A][^S][^C][^I][^I][^.][^t][^x][^t]$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "NCBJM"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-01-06 17:41:21"
+                                     },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "VI Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "2"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "VISA"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "Standar Bank VISA Outgoing (solo drafts)"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:Local_VISA_Outgoing)|(?:VISA_Outward)"
+                                      },
+                      "customer_code":  {
+                                            "S":  "SBSA"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-01-06 17:41:21"
+                                     },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "VI Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "3"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "VISA"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "Standar Bank VISA Outgoing (solo drafts)"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:VISA_Inward)"
+                                      },
+                      "customer_code":  {
+                                            "S":  "SBSA"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-01-06 17:41:21"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "4"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  false
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "Standar Bank MASTERCARD Incoming (solo drafts)"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:MasterCard_Inward)"
+                                      },
+                      "customer_code":  {
+                                            "S":  "SBSA"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-01-06 17:41:21"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "5"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  false
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "Standar Bank MASTERCARD Outgoing (solo drafts)"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:Local_MasterCard_Outgoing)|(?:MasterCard_Outward)|(?:CPS)"
+                                      },
+                      "customer_code":  {
+                                            "S":  "SBSA"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-08 17:41:21"
+                                     },
+                      "direction":  {
+                                        "S":  "IAR"
+                                    },
+                      "file_type":  {
+                                        "S":  "IAR"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "6"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  ""
+                                      },
+                      "file_format":  {
+                                          "S":  "^MCI\\.AR\\.T067\\.B\\.CCAR1212\\.D\\d{6}\\.T\\d{6}\\.A001$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BTRLRO"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-12 18:56:58"
+                                     },
+                      "direction":  {
+                                        "S":  "ARDEF"
+                                    },
+                      "file_type":  {
+                                        "S":  "ARDEF"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "7"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "VISA"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "BTRLRO VISA ARDEF (Account Range Definition File)"
+                                      },
+                      "file_format":  {
+                                          "S":  "^(\\d{4}-\\d{2}-\\d{2}_)?repository\\.ardef\\.txt$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BTRLRO"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "8"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "BRDRO MASTERCARD Incoming"
+                                      },
+                      "file_format":  {
+                                          "S":  "^MI.*$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BRDRO"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-05-20 00:00:00"
+                                     },
+                      "interpreter_fix":  {
+                                              "BOOL":  true
+                                          },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "MC Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "9"
+                                     },
+                      "brand":  {
+                                    "S":  "MASTERCARD"
+                                },
+                      "file_block":  {
+                                         "BOOL":  true
+                                     },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "BRDRO MASTERCARD Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "^MO.*$"
+                                      },
+                      "customer_code":  {
+                                            "S":  "BRDRO"
+                                        }
+                  }
+              ]
+}

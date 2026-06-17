@@ -1,0 +1,50 @@
+﻿{
+    "Crawler": {
+        "Name": "itl_0004_itx_dev_02_glue_crawler_staging_ebgr_mc",
+        "Role": "itl-0004-itx-dev-intchg-02-glue-role",
+        "Targets": {
+            "S3Targets": [
+                {
+                    "Path": "s3://itl-0004-itx-dev-intchg-02-s3-staging/EBGR/MC/",
+                    "Exclusions": []
+                }
+            ],
+            "JdbcTargets": [],
+            "MongoDBTargets": [],
+            "DynamoDBTargets": [],
+            "CatalogTargets": [],
+            "DeltaTargets": [],
+            "IcebergTargets": [],
+            "HudiTargets": []
+        },
+        "DatabaseName": "itl_0004_itx_dev_02_glue_database_staging_ebgr_mc",
+        "Classifiers": [],
+        "RecrawlPolicy": {
+            "RecrawlBehavior": "CRAWL_EVERYTHING"
+        },
+        "SchemaChangePolicy": {
+            "UpdateBehavior": "UPDATE_IN_DATABASE",
+            "DeleteBehavior": "DEPRECATE_IN_DATABASE"
+        },
+        "LineageConfiguration": {
+            "CrawlerLineageSettings": "DISABLE"
+        },
+        "State": "READY",
+        "CrawlElapsedTime": 0,
+        "CreationTime": "2026-06-04T16:16:09-05:00",
+        "LastUpdated": "2026-06-04T16:16:09-05:00",
+        "LastCrawl": {
+            "Status": "SUCCEEDED",
+            "LogGroup": "/aws-glue/crawlers",
+            "LogStream": "itl_0004_itx_dev_02_glue_crawler_staging_ebgr_mc",
+            "MessagePrefix": "6dd84747-5d48-4a16-82ad-5bfd2ca65615",
+            "StartTime": "2026-06-16T14:25:18-05:00"
+        },
+        "Version": 1,
+        "Configuration": "{\"Version\":1.0,\"Grouping\":{\"TableGroupingPolicy\":\"CombineCompatibleSchemas\",\"TableLevelConfiguration\":4},\"CreatePartitionIndex\":true}",
+        "LakeFormationConfiguration": {
+            "UseLakeFormationCredentials": false,
+            "AccountId": ""
+        }
+    }
+}

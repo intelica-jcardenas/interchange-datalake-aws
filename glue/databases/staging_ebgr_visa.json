@@ -1,0 +1,18 @@
+﻿{
+    "Database": {
+        "Name": "itl_0004_itx_dev_02_glue_database_staging_ebgr_visa",
+        "Description": "Etapas intermedias VISA cliente EBGR (RAW → EXT → CLN → CAL → ITX)",
+        "CreateTime": "2026-06-04T16:16:07-05:00",
+        "CreateTableDefaultPermissions": [
+            {
+                "Principal": {
+                    "DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"
+                },
+                "Permissions": [
+                    "ALL"
+                ]
+            }
+        ],
+        "CatalogId": "861276092327"
+    }
+}

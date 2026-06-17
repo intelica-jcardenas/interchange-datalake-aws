@@ -1,43 +1,47 @@
-{
+﻿{
     "Table": {
         "AttributeDefinitions": [
             {
-                "AttributeName": "customer_code",
+                "AttributeName": "column_name",
                 "AttributeType": "S"
             },
             {
-                "AttributeName": "pattern_id",
+                "AttributeName": "type_record",
                 "AttributeType": "S"
             }
         ],
-        "TableName": "itx-file-pattern",
+        "TableName": "itl-0004-itx-dev-dynamo-mastercard_fields-02",
         "KeySchema": [
             {
-                "AttributeName": "pattern_id",
+                "AttributeName": "type_record",
                 "KeyType": "HASH"
+            },
+            {
+                "AttributeName": "column_name",
+                "KeyType": "RANGE"
             }
         ],
         "TableStatus": "ACTIVE",
-        "CreationDateTime": "2026-03-05T15:04:46.050000+00:00",
+        "CreationDateTime": "2026-05-18T16:27:08.149000-05:00",
         "ProvisionedThroughput": {
             "NumberOfDecreasesToday": 0,
             "ReadCapacityUnits": 0,
             "WriteCapacityUnits": 0
         },
-        "TableSizeBytes": 1106,
-        "ItemCount": 5,
-        "TableArn": "arn:aws:dynamodb:us-east-1:293472517631:table/itx-file-pattern",
-        "TableId": "d97c1821-f171-4849-96e5-e6e1af1f1854",
+        "TableSizeBytes": 37304,
+        "ItemCount": 209,
+        "TableArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-mastercard_fields-02",
+        "TableId": "2ce147d3-59e0-4ca7-b10e-5f0e37cce618",
         "BillingModeSummary": {
             "BillingMode": "PAY_PER_REQUEST",
-            "LastUpdateToPayPerRequestDateTime": "2026-03-05T15:04:46.050000+00:00"
+            "LastUpdateToPayPerRequestDateTime": "2026-05-18T16:27:08.149000-05:00"
         },
         "GlobalSecondaryIndexes": [
             {
-                "IndexName": "customer-code-index",
+                "IndexName": "type-record-index",
                 "KeySchema": [
                     {
-                        "AttributeName": "customer_code",
+                        "AttributeName": "type_record",
                         "KeyType": "HASH"
                     }
                 ],
@@ -50,9 +54,9 @@
                     "ReadCapacityUnits": 0,
                     "WriteCapacityUnits": 0
                 },
-                "IndexSizeBytes": 1106,
-                "ItemCount": 5,
-                "IndexArn": "arn:aws:dynamodb:us-east-1:293472517631:table/itx-file-pattern/index/customer-code-index",
+                "IndexSizeBytes": 37234,
+                "ItemCount": 209,
+                "IndexArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-mastercard_fields-02/index/type-record-index",
                 "WarmThroughput": {
                     "ReadUnitsPerSecond": 12000,
                     "WriteUnitsPerSecond": 4000,
@@ -60,6 +64,11 @@
                 }
             }
         ],
+        "SSEDescription": {
+            "Status": "ENABLED",
+            "SSEType": "KMS",
+            "KMSMasterKeyArn": "arn:aws:kms:eu-south-2:861276092327:key/560dd37d-d216-49bb-90ff-8d21f03db55f"
+        },
         "DeletionProtectionEnabled": false,
         "WarmThroughput": {
             "ReadUnitsPerSecond": 12000,

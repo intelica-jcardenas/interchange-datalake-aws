@@ -1,0 +1,244 @@
+﻿{
+  "TableName": "itl-0004-itx-dev-dynamo-client-02",
+  "Count": 5,
+  "Items": [
+    {
+      "issuing_bins_8_digits": {
+        "S": ""
+      },
+      "duplicate_on_us_flag_visa": {
+        "S": ""
+      },
+      "file_iar_block": {
+        "S": "TRUE"
+      },
+      "client_id": {
+        "S": "BTRLRO"
+      },
+      "local_currency_code": {
+        "S": "RON"
+      },
+      "file_mc_encoding_in": {
+        "S": "Latin-1"
+      },
+      "client_name": {
+        "S": "Bank Transilvania"
+      },
+      "issuing_bins_6_digits": {
+        "S": ""
+      },
+      "customer_country": {
+        "S": "ROM"
+      },
+      "report_currency_code": {
+        "S": ""
+      },
+      "acquiring_bins": {
+        "S": ""
+      },
+      "file_mc_block_out": {
+        "S": "TRUE"
+      },
+      "file_iar_encoding": {
+        "S": "Latin-1"
+      },
+      "file_mc_block_in": {
+        "S": "TRUE"
+      },
+      "duplicate_on_us_flag_mastercard": {
+        "S": ""
+      },
+      "settlement_currency_code": {
+        "S": "EUR"
+      },
+      "file_mc_encoding_out": {
+        "S": "cp500"
+      }
+    },
+    {
+      "duplicate_on_us_flag_visa": {
+        "S": "FALSE"
+      },
+      "file_iar_block": {
+        "S": "TRUE"
+      },
+      "client_id": {
+        "S": "DEMO"
+      },
+      "local_currency_code": {
+        "S": "DOP"
+      },
+      "file_mc_encoding_in": {
+        "S": "cp500"
+      },
+      "client_name": {
+        "S": "Demo Client"
+      },
+      "customer_country": {
+        "S": "DOM"
+      },
+      "report_currency_code": {
+        "S": "DOP"
+      },
+      "file_mc_block_out": {
+        "S": "TRUE"
+      },
+      "file_iar_encoding": {
+        "S": "cp500"
+      },
+      "file_mc_block_in": {
+        "S": "TRUE"
+      },
+      "duplicate_on_us_flag_mastercard": {
+        "S": "FALSE"
+      },
+      "settlement_currency_code": {
+        "S": "USD"
+      },
+      "file_mc_encoding_out": {
+        "S": "cp500"
+      }
+    },
+    {
+      "issuing_bins_8_digits": {
+        "S": ""
+      },
+      "duplicate_on_us_flag_visa": {
+        "S": "FALSE"
+      },
+      "file_iar_block": {
+        "S": "TRUE"
+      },
+      "client_id": {
+        "S": "EBGR"
+      },
+      "local_currency_code": {
+        "S": "EUR"
+      },
+      "file_mc_encoding_in": {
+        "S": "cp500"
+      },
+      "client_name": {
+        "S": "Eurobank"
+      },
+      "issuing_bins_6_digits": {
+        "S": ""
+      },
+      "customer_country": {
+        "S": "GRC"
+      },
+      "report_currency_code": {
+        "S": "EUR"
+      },
+      "acquiring_bins": {
+        "S": ""
+      },
+      "file_mc_block_out": {
+        "S": "TRUE"
+      },
+      "file_iar_encoding": {
+        "S": "cp500"
+      },
+      "file_mc_block_in": {
+        "S": "TRUE"
+      },
+      "duplicate_on_us_flag_mastercard": {
+        "S": "FALSE"
+      },
+      "settlement_currency_code": {
+        "S": "EUR"
+      },
+      "file_mc_encoding_out": {
+        "S": "cp500"
+      }
+    },
+    {
+      "duplicate_on_us_flag_visa": {
+        "S": "FALSE"
+      },
+      "file_iar_block": {
+        "S": "TRUE"
+      },
+      "client_id": {
+        "S": "NXGR"
+      },
+      "local_currency_code": {
+        "S": "EUR"
+      },
+      "file_mc_encoding_in": {
+        "S": "Latin-1"
+      },
+      "client_name": {
+        "S": "Nexi Group Greece"
+      },
+      "customer_country": {
+        "S": "GRC"
+      },
+      "report_currency_code": {
+        "S": "EUR"
+      },
+      "file_mc_block_out": {
+        "S": "FALSE"
+      },
+      "file_iar_encoding": {
+        "S": "Latin-1"
+      },
+      "file_mc_block_in": {
+        "S": "FALSE"
+      },
+      "duplicate_on_us_flag_mastercard": {
+        "S": "FALSE"
+      },
+      "settlement_currency_code": {
+        "S": "EUR"
+      },
+      "file_mc_encoding_out": {
+        "S": "cp500"
+      }
+    },
+    {
+      "duplicate_on_us_flag_visa": {
+        "S": "TRUE"
+      },
+      "file_iar_block": {
+        "S": "TRUE"
+      },
+      "client_id": {
+        "S": "SBSA"
+      },
+      "local_currency_code": {
+        "S": "ZAR"
+      },
+      "file_mc_encoding_in": {
+        "S": "cp500"
+      },
+      "client_name": {
+        "S": "Standard Bank South Africa"
+      },
+      "customer_country": {
+        "S": "ZAF"
+      },
+      "report_currency_code": {
+        "S": "ZAR"
+      },
+      "file_mc_block_out": {
+        "S": "FALSE"
+      },
+      "file_iar_encoding": {
+        "S": "cp500"
+      },
+      "file_mc_block_in": {
+        "S": "FALSE"
+      },
+      "duplicate_on_us_flag_mastercard": {
+        "S": "TRUE"
+      },
+      "settlement_currency_code": {
+        "S": "USD"
+      },
+      "file_mc_encoding_out": {
+        "S": "cp500"
+      }
+    }
+  ]
+}

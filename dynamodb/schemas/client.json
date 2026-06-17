@@ -1,0 +1,39 @@
+﻿{
+    "Table": {
+        "AttributeDefinitions": [
+            {
+                "AttributeName": "client_id",
+                "AttributeType": "S"
+            }
+        ],
+        "TableName": "itl-0004-itx-dev-dynamo-client-02",
+        "KeySchema": [
+            {
+                "AttributeName": "client_id",
+                "KeyType": "HASH"
+            }
+        ],
+        "TableStatus": "ACTIVE",
+        "CreationDateTime": "2026-04-23T16:56:26.373000-05:00",
+        "ProvisionedThroughput": {
+            "NumberOfDecreasesToday": 0,
+            "ReadCapacityUnits": 1,
+            "WriteCapacityUnits": 1
+        },
+        "TableSizeBytes": 1745,
+        "ItemCount": 5,
+        "TableArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-client-02",
+        "TableId": "d951aa82-08f5-46d5-b985-0bbc3ddb7438",
+        "SSEDescription": {
+            "Status": "ENABLED",
+            "SSEType": "KMS",
+            "KMSMasterKeyArn": "arn:aws:kms:eu-south-2:861276092327:key/560dd37d-d216-49bb-90ff-8d21f03db55f"
+        },
+        "DeletionProtectionEnabled": false,
+        "WarmThroughput": {
+            "ReadUnitsPerSecond": 1,
+            "WriteUnitsPerSecond": 1,
+            "Status": "ACTIVE"
+        }
+    }
+}
