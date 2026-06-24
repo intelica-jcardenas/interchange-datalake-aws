@@ -679,3 +679,150 @@ Output: `tst_files/reports/202601/comparativo_aggregated_202601_v2.md`
 1. Investigar VI fees -18,679 EUR (-3.8%): ATM JPY rule matching (1055 vs 1065) + dirección de `exchange_value`.
 2. Verificar MC -3 filas en 2026-01-06 — revisar `file_control-02` para esa fecha en MC.
 3. Escanear NullType en `SBSA`/`BTRLRO`/`vss_110-140` antes de generar reportes para esos clientes/tipos (pendiente de sesiones anteriores, aplica ahora que la metodología de comparativa está validada).
+
+---
+
+## Sesión 2026-06-18 — fix glue-test-1 DefaultArguments, restructura pending.md, reproceso calc_vss_aggregation_level (VSS EBGR enero 2026)
+
+### Paso 1 — Fix glue-test-1 DefaultArguments (args.json perdía args en sync)
+
+**Problema:** `glue/scripts/reports/get_transaction/args.json` solo tenía 4 keys porque los 9 argumentos job-específicos (`operational_bucket`, `reference_bucket`, `analytics_bucket`, `dynamodb_table_client`, `client_code`, `start_date`, `end_date`, `report_suffix`, `scheme_fee`) no estaban en `DefaultArguments` del job en AWS — `sync-glue.ps1` solo descarga `DefaultArguments`, así que se perdían en cada sync.
+
+**Fix:** agregar los 9 args a `DefaultArguments` via `aws glue update-job`. El payload requiere `Role`, `Command` y `GlueVersion` además de `DefaultArguments` (sin ellos AWS retorna error). Escribir el JSON a un archivo temporal **UTF-8 sin BOM** (PowerShell 5.1 escribe BOM por defecto; usar `New-Object System.Text.UTF8Encoding($false)`).
+
+```powershell
+# Obtener Role, Command, GlueVersion del job actual:
+$job = (aws glue get-job --profile itx-dev --job-name itl-0004-itx-dev-intchg-02-glue-test-1 | ConvertFrom-Json).Job
+
+# Construir payload:
+$payload = @{
+    Role = $job.Role
+    Command = @{ Name = $job.Command.Name; ScriptLocation = $job.Command.ScriptLocation; PythonVersion = $job.Command.PythonVersion }
+    GlueVersion = $job.GlueVersion
+    DefaultArguments = @{
+        "--enable-job-insights" = "true"
+        "--job-language" = "python"
+        "--conf" = "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true"
+        "--enable-continuous-cloudwatch-log" = "true"
+        "--operational_bucket" = "itl-0004-itx-dev-intchg-02-s3-operational"
+        "--reference_bucket" = "itl-0004-itx-dev-intchg-02-s3-reference"
+        "--analytics_bucket" = "itl-0004-itx-dev-intchg-02-s3-analytics"
+        "--dynamodb_table_client" = "itl-0004-itx-dev-dynamo-client-02"
+        "--client_code" = "EBGR"
+        "--start_date" = "2026-01-01"
+        "--end_date" = "2026-01-31"
+        "--report_suffix" = "202601"
+        "--scheme_fee" = "false"
+    }
+}
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText("$PWD\tmp_update_job.json", ($payload | ConvertTo-Json -Depth 5), $utf8NoBom)
+aws glue update-job --profile itx-dev --job-name itl-0004-itx-dev-intchg-02-glue-test-1 --job-update file://tmp_update_job.json
+Remove-Item tmp_update_job.json
+```
+
+**Resultado:** `args.json` actualizado de 4 a 13 keys al hacer sync posterior.
+
+### Paso 2 — Restructura pending.md + inventario cleanup para infra
+
+`pending.md` fue restructurado: MC pipeline ya completamente validado (sección eliminada), items reporting actualizados (MC transform + TIMESTAMP resueltos eliminados), ítems de nomenclatura/cleanup consolidados en nueva sección "Cleanup de recursos obsoletos" organizada por servicio (Glue, S3, Lambda, CloudWatch). El inventario es para el equipo de infra — no ejecutar directamente.
+
+### Paso 3 — Reproceso calc_vss_aggregation_level: glue-vi-calculate (105 archivos VSS)
+
+`calc_vss_aggregation_level` había sido reescrito en S3 (2026-06-12) pero el operational de EBGR enero 2026 tenía valores `2` en hojas VSS. Se re-ejecutó `glue-vi-calculate` para regenerar los CAL con la lógica correcta.
+
+Script: `tst_files/reprocessing/reprocess_vi_calculate.py` (DATE_TO cambiado de `2026-01-30` a `2026-01-31` para incluir los 5 archivos del día 31). Mismo mecanismo que sesión 2026-06-11 (MaxConcurrentRuns=50, límite efectivo=45, poll 30s, start_delay 1.5s).
+
+**Resultado:** `tst_files/reprocessing/reprocess_vi_calculate_log.jsonl` — **105/105 SUCCEEDED**, 0 fallos.
+
+### Paso 4 — Reproceso lmbd-vi-store VSS-only (105 archivos)
+
+Solo los outputs VSS_110/120/130/140 necesitaban regenerarse — el BASEII ya estaba correcto desde el reproceso de 2026-06-11/16. Script nuevo: `tst_files/reprocessing/reprocess_vi_vss_store.py` — igual que `reprocess_vi_store.py` pero filtra `outputs` a `VSS_OUTPUT_TYPES = {"VSS_110", "VSS_120", "VSS_130", "VSS_140"}` antes de construir el payload.
+
+```python
+VSS_OUTPUT_TYPES = {"VSS_110", "VSS_120", "VSS_130", "VSS_140"}
+outputs = [
+    {"output_type": o["output_type"], "s3_key": o["cln_s3_key"]}
+    for o in store_result.get("outputs", [])
+    if o.get("cln_s3_key") and o["output_type"] in VSS_OUTPUT_TYPES
+]
+```
+
+`ThreadPoolExecutor(max_workers=20)`, `InvocationType="RequestResponse"`.
+
+**Resultado:** `tst_files/reprocessing/reprocess_vi_vss_store_log.jsonl` — **105/105 SUCCESS**, 0 fallos.
+
+### Paso 5 — Re-crawl operational EBGR VISA
+
+```powershell
+aws glue start-crawler --profile itx-dev --name itl_0004_itx_dev_02_glue_crawler_operational_ebgr_visa
+```
+
+**Resultado:** SUCCEEDED. `vss_aggregation_level` con valores correctos en catálogo (0/1/10 en vez de 2 para hojas).
+
+---
+
+## Sesión 2026-06-23 — scan SBSA enero 2026, fix mc-store OOM (streaming), reproceso SBSA MC IN 2026-01-03, cleanup tst_files
+
+**Contexto:** Detección y resolución del único archivo con error en SBSA enero 2026. Implementación de streaming en `lmbd-mc-store` para soportar archivos grandes.
+
+### Paso 1 — Scan DynamoDB SBSA enero 2026
+
+```powershell
+# Escribir filter JSON con utf8NoBom, luego:
+aws dynamodb scan --profile itx-dev `
+  --table-name itl-0004-itx-dev-dynamo-file_control-02 `
+  --filter-expression "client_id = :c AND file_processing_date BETWEEN :d1 AND :d2" `
+  --expression-attribute-values file://tmp_filter.json `
+  --query "Items[].{file_id:file_id.S, processing_date:file_processing_date.S, status:control_status.S, brand:brand_id.S, file_type:file_type.S, error:error_message.S}" `
+  --output json
+```
+
+**Nota campos correctos DynamoDB:** `brand_id` (no `brand`), `file_processing_date` (no `file_date`). El campo `error_message` contiene el error como string JSON cuando hay fallo.
+
+**Resultado:** 50 items, todos `control_status=DONE`. Único con `error_message` no-null: `E0C717BF7FC307E63E8E29918E813B02` (MC IN 2026-01-03, 1.86 GB) — `Runtime.OutOfMemory` en fase STORE.
+
+### Paso 2 — Diagnostico OOM y fix mc-store streaming
+
+Ver gotchas.md → "lmbd-mc-store: OOM en bloques CLN grandes". Config: Timeout 300s → 900s.
+
+### Paso 3 — Construir payload mc-store (33 bloques CLN)
+
+Listar CLN files por MTI con `aws s3 ls`, construir payload en `tst_files/payloads/sbsa_mc_store_20260103.json`:
+
+```powershell
+# Por MTI (1240, 1442, 1644, 1740):
+$cln = aws s3 ls "s3://.../SBSA/MC/400_IPM_{mti}_CLN/file_type=IN/date=2026-01-03/" `
+  --profile itx-dev | Select-String "<file_id>" | ForEach-Object { ($_ -split "\s+")[3] }
+# Agregar cada archivo como {"mti": "...", "s3_key": "SBSA/MC/400_IPM_{mti}_CLN/.../archivo"}
+```
+
+### Paso 4 — Invocar mc-store y verificar resultado
+
+```powershell
+aws lambda invoke --profile itx-dev `
+  --function-name itl-0004-itx-dev-intchg-02-lmbd-mc-store `
+  --payload file://tst_files/payloads/sbsa_mc_store_20260103.json `
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 960 `
+  tst_files/payloads/sbsa_mc_store_response.json
+```
+
+**Resultado:** SUCCEEDED — 33 outputs, 2,445,146 records, 353s, 2,946 MB memoria.
+
+### Paso 5 — Actualizar DynamoDB con store_result
+
+El Lambda mc-store NO actualiza DynamoDB (lo hace el Step Function). Para reprocesos manuales, reconstruir desde logs CloudWatch y actualizar con boto3:
+
+```python
+# Parsear logs: extraer pares START (cln_key) + END (records, cols, batches)
+# Derivar cal/itx/target keys con replace("400_IPM_{mti}_CLN", "...")
+# Actualizar con boto3:
+table.update_item(
+    Key={'file_id': '<file_id>'},
+    UpdateExpression='SET store_result = :sr, process_finish_ts = :ts, error_message = :null',
+    ExpressionAttributeValues={':sr': json.dumps(store_result), ':ts': now, ':null': None}
+)
+# IMPORTANTE: usar SET error_message = :null (None), NUNCA REMOVE error_message
+```
+
+**Resultado:** DDB actualizado — `store_result` con 33 outputs, `error_message = None`, `control_status = DONE`.

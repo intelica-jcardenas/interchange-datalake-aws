@@ -660,12 +660,12 @@
                                     }
                   },
                   {
-                      "length":  {
-                                     "N":  "99"
-                                 },
                       "type_record":  {
                                           "S":  "DE"
                                       },
+                      "length":  {
+                                     "N":  "99"
+                                 },
                       "subfield":  {
                                        "S":  "0"
                                    },

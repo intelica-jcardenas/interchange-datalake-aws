@@ -5,7 +5,7 @@
         "JobRunQueuingEnabled": false,
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-06-08T08:24:12.537000-05:00",
-        "LastModifiedOn": "2026-06-17T16:59:13.070000-05:00",
+        "LastModifiedOn": "2026-06-22T17:01:39.333000-05:00",
         "ExecutionProperty": {
             "MaxConcurrentRuns": 1
         },
@@ -30,11 +30,11 @@
             "--analytics_bucket": "itl-0004-itx-dev-intchg-02-s3-analytics"
         },
         "MaxRetries": 0,
-        "AllocatedCapacity": 10,
+        "AllocatedCapacity": 2,
         "Timeout": 2880,
-        "MaxCapacity": 10.0,
+        "MaxCapacity": 2.0,
         "WorkerType": "G.1X",
-        "NumberOfWorkers": 10,
+        "NumberOfWorkers": 2,
         "GlueVersion": "4.0"
     }
 }

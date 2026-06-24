@@ -4,7 +4,27 @@ Problemas encontrados durante el desarrollo, con su causa raíz y solución reco
 
 ---
 
-## glue-vi-calculate: calc_vss_aggregation_level — lógica recursiva daba nivel 2 a todas las hojas — RESUELTO (pendiente validar)
+## lmbd-mc-store: OOM en bloques CLN grandes (archivos >500 MB) — RESUELTO Y VALIDADO
+
+**Archivo:** `lambdas/mastercard/store/src/handler.py` (función `_store_output`)
+**Detectado:** 2026-06-23 al reprocesar SBSA MC IN 2026-01-03 (1.86 GB, bloque mayor 298 MB CLN)
+
+**Causa raíz:** `_store_output` cargaba el Parquet CLN completo con `pq.read_table().to_pandas()`. Un bloque de 298 MB con ~150 columnas string expandía a >10 GB en pandas, matando el Lambda con `Runtime.OutOfMemory`.
+
+**Fix (2026-06-23):** streaming via `pq.ParquetFile.iter_batches(batch_size=ITX_STORE_BATCH_SIZE, default=100k)`:
+- CLN: se descarga completo (bytes) pero se itera en batches de 100k filas; pico por batch ~150 MB
+- CAL e ITX: se cargan completos en memoria — son pequeños (~14 MB y ~27 MB)
+- Schema de salida: derivado del primer batch (`_restore_schema(batch, cln_dtype_map, output_schema=None)`) y forzado en los siguientes (`output_schema` no-None)
+- Escritura incremental a `pq.ParquetWriter(output_buf, schema, "snappy")`, una sola subida S3 al cerrar
+- Config: Timeout 300s → **900s** para archivos grandes; `ITX_STORE_BATCH_SIZE` ajustable via env var
+
+**Validación (2026-06-23):** SBSA MC IN 2026-01-03 — 33 bloques, 2,445,146 records, 353s, **2,946 MB** pico (vs ~10 GB antes).
+
+**Si vuelve a aparecer OOM en mc-store:** verificar que el handler en AWS sea la versión streaming (ZIP ≥5.7 KB; función `iter_batches` presente). El bloque problemático suele ser el más grande del MTI 1240 — identificar con `aws s3 ls` por tamaño.
+
+---
+
+## glue-vi-calculate: calc_vss_aggregation_level — lógica recursiva daba nivel 2 a todas las hojas — RESUELTO Y VALIDADO
 
 **Archivo:** `glue/scripts/visa/calculate/calculate.py` (función `calc_vss_aggregation_level`)
 **Detectado/corregido:** sync 2026-06-12 (cambio traído de AWS, no documentado hasta ahora)
@@ -22,7 +42,7 @@ Implementado con un único `LEFT JOIN` contra `rollup_group_df` (distinct de `ro
 
 **Si vuelve a aparecer (`vss_aggregation_level` no tiene valores `0`, o tiene `2` donde debería haber `0`):** verificar que el script en S3 (`s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/visa/calculate.py`) tenga la versión join-based, no la recursiva de 3 iteraciones.
 
-**Estado:** código corregido (ya está en S3/AWS, traído al repo via sync 2026-06-13). Pendiente: (1) re-ejecutar `glue-vi-calculate` + `lmbd-vi-store` para algún `file_id` con registros VSS y validar `value_counts(vss_aggregation_level)` — debe incluir `0` para hojas; (2) revisar si algún reporte (`get_transaction.py`) o el contraste DQ contra VSS en `glue-vi-interchange` asumía el valor incorrecto `2`.
+**Estado:** RESUELTO Y VALIDADO 2026-06-18. Reproceso masivo EBGR enero 2026: 105/105 `glue-vi-calculate` SUCCEEDED + 105/105 `lmbd-vi-store` VSS-only SUCCESS + crawler `itl_0004_itx_dev_02_glue_crawler_operational_ebgr_visa` SUCCEEDED. Pendiente: revisar si `get_transaction.py` o `glue-vi-interchange` asumían el valor incorrecto `2` para hojas cuando se usen datos VSS en reportes.
 
 ---
 

@@ -31,18 +31,23 @@
             "CrawlerLineageSettings": "DISABLE"
         },
         "State": "READY",
+        "Schedule": {
+            "ScheduleExpression": "cron(31 21 * * ? *)",
+            "State": "SCHEDULED"
+        },
         "CrawlElapsedTime": 0,
         "CreationTime": "2026-06-08T16:31:14-05:00",
-        "LastUpdated": "2026-06-10T12:02:05-05:00",
+        "LastUpdated": "2026-06-18T16:44:22-05:00",
         "LastCrawl": {
-            "Status": "SUCCEEDED",
+            "Status": "FAILED",
+            "ErrorMessage": "Encountered Glue Catalog API Throttle. com.amazonaws.services.glue.model.ThrottlingException: Rate exceeded (Service: AWSGlue; Status Code: 400; Error Code: ThrottlingException; Request ID: 33941d90-ff79-4b3d-a874-01304532f3e8; Proxy: null)",
             "LogGroup": "/aws-glue/crawlers",
             "LogStream": "itl_0004_itx_dev_02_glue_crawler_exchange_rates",
-            "MessagePrefix": "eb28d257-4bdf-4974-867a-9e99fe9a8c16",
-            "StartTime": "2026-06-08T17:02:31-05:00"
+            "MessagePrefix": "ba1d666a-8ffe-4620-bcb3-8f270ef99f47",
+            "StartTime": "2026-06-22T16:31:45-05:00"
         },
-        "Version": 5,
-        "Configuration": "{\"Version\":1.0,\"Grouping\":{\"TableGroupingPolicy\":\"CombineCompatibleSchemas\",\"TableLevelConfiguration\":4},\"CreatePartitionIndex\":true}",
+        "Version": 9,
+        "Configuration": "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"}},\"Grouping\":{\"TableLevelConfiguration\":4},\"CreatePartitionIndex\":true}",
         "LakeFormationConfiguration": {
             "UseLakeFormationCredentials": false,
             "AccountId": ""

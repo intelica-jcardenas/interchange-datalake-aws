@@ -1,67 +1,99 @@
 # Pendientes del proyecto
 
 Checklist vivo. Marcar `[x]` cuando se resuelva, con fecha y breve nota.
-Última actualización: 2026-06-17.
+Última actualización: 2026-06-23.
 
 ---
 
 ## Pipeline Visa — bugs / validación
 
-- [ ] **VI fees -18,679 EUR (-3.8%)** — diferencia residual de interchange fees en comparativo EBGR enero 2026 vs legacy. Componentes sospechosos: ATM JPY (rule 1055 vs 1065) + dirección de `exchange_value`. Ver `gotchas.md` → "matching incorrecto intelica_id ATM JPY".
-- [ ] **ATM JPY rule 1055 vs 1065** — `glue-vi-interchange` asigna regla 1055 ("ATM AF") en vez de 1065 ("ATM AF JPN", fee_fixed=0.50 USD). 1 transacción, diff=-29.64. Requiere investigar qué campo en `visa_rules` diferencia ambas reglas.
-- [ ] **`exchange_value` dirección** — validar si `exchange_rate/data.parquet` guarda `fee_ccy/source_ccy` (~1.08 para EUR→USD) o inverso (~0.926). Afecta fórmula de `calculate_fee_amounts` en `glue-vi-interchange`.
-- [ ] **`calc_vss_aggregation_level`** — reescritura a join simple (sync 2026-06-12) pendiente re-run con archivo VSS real y validar que aparezcan valores `0` para hojas.
-- [ ] **`glue-vi-interchange` reproceso masivo EBGR enero 2026** — `tst_files/reprocessing/reprocess_vi_interchange.py` creado 2026-06-11 pero NO ejecutado. Bloqueo: si se corre, el `operational/baseii_drafts` queda desincronizado hasta hacer un segundo pase de `reprocess_vi_store.py`. Ejecutar cuando los bugs de fees (ATM JPY + exchange_value) estén investigados, para hacer un único ciclo interchange → store.
-
----
-
-## Pipeline Mastercard — gotchas vigentes en lmbd-mc-transform
-
-- [ ] **Timeout multi-MTI** — procesa 4 MTIs secuencialmente, puede superar 400s si todos están presentes. Solución: invocar 1 Lambda por MTI desde Step Functions.
-- [ ] **Sin chunking en MTIs 1442, 1740, 1644** — solo 1240 tiene chunking dinámico. Riesgo OOM en archivos grandes.
-- [ ] **EphemeralStorage /tmp insuficiente** — default 512MB; `transform_ipm_1240` escribe Parquet completo en /tmp antes de subir a S3.
-- [ ] **`DDB_MASTERCARD_FIELDS_TABLE` no declarada** — hardcodeada a `itl-0004-itx-dev-dynamo-mastercard_fields-02`; romperá en ambiente empresarial. Agregar a `config.json` y `env-vars.json`.
-- [ ] **MC -3 filas en 2026-01-06** — comparativo vs legacy muestra -3 filas en esa fecha. Verificar `file_control-02` para esa fecha (puede ser un `status != DONE`).
-- [ ] **Validación end-to-end `sfn-mc`** — pipeline MC completo desplegado, validación en curso con `itl-0004-itx-dev-intchg-02-sfn-mc`.
+- [ ] **VI fees -18,679 EUR (-3.8%)** — diferencia residual en comparativo EBGR enero 2026 vs legacy. Dos sub-investigaciones bloqueantes:
+  - **ATM JPY rule 1055 vs 1065**: `glue-vi-interchange` asigna 1055 ("ATM AF") en vez de 1065 ("ATM AF JPN", fee_fixed=0.50 USD) para 1 transacción. Investigar qué campo en `visa_rules` diferencia ambas reglas.
+  - **`exchange_value` dirección**: validar si `exchange_rate/data.parquet` guarda `fee_ccy/source_ccy` (~1.08 EUR→USD) o inverso (~0.926). Afecta fórmula de `calculate_fee_amounts` en `glue-vi-interchange`.
+- [ ] **`glue-vi-interchange` reproceso masivo EBGR enero 2026** — `tst_files/reprocessing/reprocess_vi_interchange.py` listo pero NO ejecutado. Ejecutar una vez resueltas las dos sub-investigaciones de fees arriba; seguir con un pase de `reprocess_vi_store.py` para sincronizar operational.
 
 ---
 
 ## Reporting (`get_transaction.py`)
 
-- [ ] **`scheme_fees_amount`** — flujo no implementado, retorna 0.0. Pendiente diseño + implementación.
+- [ ] **`scheme_fees_amount`** — flujo no implementado, retorna 0.0. Pendiente diseño + implementación. **Próximo:** implementar para cliente SBSA usando el mes de enero 2026 que se está procesando (archivos subidos 2026-06-23).
 - [ ] **SMS transform** — skeleton con `# VERIFY`. Falta Parquet de muestra SMS para validar.
-- [ ] **MC transform** — skeleton con `# VERIFY`. Pendiente datos limpios MC en operational.
-- [ ] **MC TIMESTAMP(NANOS) en `get_transaction.py`** — `spark.read.parquet()` sobre `EBGR/MC/IPM_1240/` (138 archivos) falla con `AnalysisException: Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))` porque el lector vectorizado ignora `nanosAsLong`. Fix propuesto sin probar: agregar `.config("spark.sql.parquet.enableVectorizedReader", "false")` a la SparkSession. Si funciona, eliminar los helpers `_read_operational_via_pyarrow`/`_widest_arrow_type`/`_align_table_to_schema`. Ver `gotchas.md` → "operational MC TIMESTAMP(NANOS)".
-- [ ] **Escaneo NullType en SBSA, BTRLRO y vss_110-140** — antes de generar reportes para esos clientes/tipos, correr `tst_files/debug_scripts/scan_nulltype_columns.py` ajustando el prefijo S3. Si hay columnas NullType, reprocesar con `lmbd-vi-store` (mismo patrón que EBGR enero 2026).
-- [ ] **Migrar fuente de tipos de cambio de `exchange_rate/` a `exchange-rates/`** — actualmente varios jobs leen de `s3-reference/exchange_rate/rate_date=YYYY-MM-DD/` (columnas: `currency_from, currency_to, exchange_value, brand`). La fuente definitiva será `exchange-rates/brand={Visa,MasterCard}/exchange_date=YYYY-MM-DD/` (columnas reales: `currency_from, currency_to, currency_from_code, currency_to_code, exchange_value`) — aún en desarrollo/completado por el equipo. Cuando `exchange-rates/` tenga cobertura completa de pares y fechas, actualizar: (1) `get_transaction.py` → `load_exchange_rates()`; (2) `glue-mc-calculate` y `glue-mc-interchange` si leen de esa fuente; (3) `glue-vi-interchange` si aplica. También adaptar el mapeo de nombres de columna en cada job.
-- [ ] **`glue-test-3` (vi_data_quality.py)** — descargado 2026-06-17. Pendiente integrar en flujo / definir cómo se invoca.
-- [ ] **`glue-test-4` (mc_data_quality.py)** — script en desarrollo local por el equipo. Cuando se suba a S3: descomentar en `scripts/sync-glue.ps1 $AllJobs` y ejecutar sync.
+- [ ] **Migrar fuente de tipos de cambio de `exchange_rate/` a `exchange-rates/`** — la fuente definitiva será `exchange-rates/brand={Visa,MasterCard}/exchange_date=YYYY-MM-DD/` (columnas: `currency_from, currency_to, currency_from_code, currency_to_code, exchange_value`). Cuando tenga cobertura completa, actualizar: (1) `get_transaction.py` → `load_exchange_rates()`; (2) `glue-mc-calculate` y `glue-mc-interchange`; (3) `glue-vi-interchange` si aplica. Adaptar mapeo de nombres de columna en cada job.
+- [ ] **`glue-test-3` (vi_data_quality.py)** — descargado 2026-06-17. Pendiente definir cómo se invoca e integrarlo al flujo.
+- [ ] **`glue-test-4` (mc_data_quality.py)** — en desarrollo local por el equipo. Cuando se suba a S3: descomentar en `scripts/sync-glue.ps1 $AllJobs` y ejecutar sync.
 
 ---
 
 ## Infraestructura AWS
 
-- [ ] **Lambda huérfana `itx-interpreter`** — `itl-0004-itx-dev-intchg-02-itx-interpreter` (10240MB/900s, LastModified 2026-05-18, nunca invocada). Remanente de convención antigua. Eliminar tras confirmar que nada la referencia.
-- [ ] **Log groups huérfanos** — `itx-ardef`, `itx-iar`, `itx-unzip` (sin función asociada). Eliminar.
-- [ ] **Retención CloudWatch** — aplicar 30d a los grupos sin retención: `mc-clean`, `mc-exchange-rates`, `mc-extract`, `mc-iar`, `mc-interpreter`, `mc-store`, `mc-transform`, `vi-ardef`, `vi-exchange-rates`, `unzip`. Los grupos de producción (`archive-file`, `router`, `vi-*`, SFN Visa) tienen 60d inconsistente — normalizar a 30d también.
-- [ ] **Rol IAM `itx-lambda-extract-role`** — `lmbd-vi-extract` comparte rol del router. Crear rol propio con permisos mínimos (S3 read/write staging, DynamoDB read visa-fields).
+- [ ] **Rol IAM `itx-lambda-extract-role`** — `lmbd-vi-extract` comparte rol del router. Crear rol propio con permisos mínimos.
 - [ ] **Rol IAM `itx-glue-crawler-ebgr-role`** — crawler Mastercard sin rol propio.
-- [ ] **Mover scripts Glue MC** — de `itl-0004-itx-dev-poc-02-reference/` a `itl-0004-itx-dev-intchg-02-s3-reference/`.
-
----
-
-## Nomenclatura y cleanup Glue
-
-- [ ] **Renombrar `glue-test-1/3/4`** — a nombres con convención corporativa (ej. `glue-vi-mc-reporting`, `glue-vi-data-quality`, `glue-mc-data-quality`). Al renombrar, actualizar `$AllJobs` en `scripts/sync-glue.ps1`.
-- [ ] **`glue-test-2`** — sin uso conocido. Verificar antes de eliminar.
-- [ ] **Renombrar crawlers/databases `poc_*`** — existen 5 objetos con tercera convención de nombres. Inventario completo en `glue/GLUE_CATALOG_CREATION.md`.
-
 ---
 
 ## Documentación / cleanup legacy
 
-- [ ] **Eliminar archivos con convención antigua** — `.env.example`, `step-functions/README.md`, `lambdas/router/README.md`, `infrastructure/deploy.sh`, `iam/README.md`, `CHANGELOG.md`. Recrear README.md en cada carpeta con la nomenclatura actual antes de eliminar.
-- [ ] **`infrastructure/terraform/stepfunctions.tf`** — define 1 SFN (`itx_main_orchestrator`) pero AWS tiene 2 (`sfn-vi`, `sfn-mc`). Revisar y actualizar a 2 recursos antes de reescribir el archivo.
+- [ ] **Eliminar archivos con convención antigua** — `.env.example`, `step-functions/README.md`, `lambdas/router/README.md`, `infrastructure/deploy.sh`, `iam/README.md`, `CHANGELOG.md`. Recrear README.md por carpeta con nomenclatura actual antes de eliminar.
+- [ ] **`infrastructure/terraform/stepfunctions.tf`** — define 1 SFN (`itx_main_orchestrator`) pero AWS tiene 2 (`sfn-vi`, `sfn-mc`). Actualizar a 2 recursos antes de reescribir.
+
+---
+
+## Cleanup de recursos obsoletos (para equipo de infra)
+
+Inventario detallado con orden de ejecución: `tst_files/ticket_cleanup_itx_dev.txt`. Listo para ejecutar (2026-06-23).
+
+Inventario de objetos a eliminar por convención antigua o sin uso. Organizado por servicio.
+
+### AWS Glue
+
+**Crawlers — eliminar:**
+- `itl-0004-itx-dev-intchg-02-crawler-staging` — convención antigua (guiones), nunca ejecutado, apunta a todo `s3-staging/`
+- `itl-0004-itx-dev-intchg-02-crawler-reference` — convención antigua (guiones), apunta a `s3-reference/exchange-rates/`, escribe a database `poc_itx_reference`
+
+**Databases — eliminar:**
+- `itl_0004_itx_dev_poc_ebgr_visa_staging` — convención `poc_*`, nunca populada
+- `itl_0004_itx_dev_poc_interchange_analytics` — convención `poc_*`, sin crawler asociado
+- `itl_0004_itx_dev_poc_itx_reference` — convención `poc_*`, usada por `crawler-reference` (a eliminar)
+
+**Jobs — renombrar** (pendiente de coordinación, actualizar `$AllJobs` en `sync-glue.ps1` al renombrar):
+- `itl-0004-itx-dev-intchg-02-glue-test-1` → `itl-0004-itx-dev-intchg-02-glue-vi-mc-reporting`
+- `itl-0004-itx-dev-intchg-02-glue-test-3` → `itl-0004-itx-dev-intchg-02-glue-vi-data-quality`
+- `itl-0004-itx-dev-intchg-02-glue-test-4` → `itl-0004-itx-dev-intchg-02-glue-mc-data-quality`
+
+### AWS S3
+
+**Buckets POC — eliminar** (convención `itl-0004-itx-dev-poc-02-*`, reemplazados por `intchg-02`):
+- `itl-0004-itx-dev-poc-02-analytics`
+- `itl-0004-itx-dev-poc-02-archive`
+- `itl-0004-itx-dev-poc-02-landing`
+- `itl-0004-itx-dev-poc-02-operational`
+- `itl-0004-itx-dev-poc-02-staging`
+- `itl-0004-itx-dev-poc-02-reference` — scripts Glue MC ya migrados al bucket oficial (verificado 2026-06-18), puede eliminarse
+
+### AWS Lambda
+
+**Lambda — eliminar:**
+- `itl-0004-itx-dev-intchg-02-itx-interpreter` — convención antigua (`itx-*`), nunca invocada (LastModified 2026-05-18), reemplazada por `lmbd-mc-interpreter`
+- `itl-0004-itx-dev-mastercard-exchange-rates` — convención sin `intchg-02`, reemplazada por `lmbd-mc-exchange-rates` (LastModified 2026-05-15)
+- `itl-0004-itx-dev-poc-testhello` — test POC descartable
+
+### AWS CloudWatch Logs
+
+**Log groups huérfanos — eliminar** (función Lambda ya no existe):
+- `/aws/lambda/itl-0004-itx-dev-intchg-02-itx-ardef`
+- `/aws/lambda/itl-0004-itx-dev-intchg-02-itx-iar`
+- `/aws/lambda/itl-0004-itx-dev-intchg-02-itx-unzip`
+
+**Log groups — eliminar junto con su Lambda** (se vuelven huérfanos al borrar la función):
+- `/aws/lambda/itl-0004-itx-dev-intchg-02-itx-interpreter` (60d) — junto a Lambda `itx-interpreter`
+- `/aws/lambda/itl-0004-itx-dev-mastercard-exchange-rates` (sin retención) — junto a Lambda `mastercard-exchange-rates`
+- `poc-testhello`: sin log group (nunca se invocó)
+
+**Log groups — aplicar retención 30d** (actualmente sin retención):
+- `mc-clean`, `mc-exchange-rates`, `mc-extract`, `mc-iar`, `mc-interpreter`, `mc-store`, `mc-transform`
+- `vi-ardef`, `vi-exchange-rates`, `unzip`
+
+**Log groups — normalizar a 30d** (actualmente 60d inconsistente):
+- `archive-file`, `router`, `vi-clean`, `vi-extract`, `vi-store`, `vi-transform`, SFN Visa
 
 ---
 

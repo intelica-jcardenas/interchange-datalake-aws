@@ -4,23 +4,28 @@
     "Runtime": "python3.11",
     "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-mc-exchange-rates-role",
     "Handler": "handler.lambda_handler",
-    "CodeSize": 10338,
+    "CodeSize": 11090,
     "Description": "",
     "Timeout": 750,
     "MemorySize": 512,
-    "LastModified": "2026-06-11T21:15:40.000+0000",
-    "CodeSha256": "Lx4nRNRd9BG1jlEatwlAAfsT3RXAtmLgaNIbkaYHDHc=",
+    "LastModified": "2026-06-23T16:00:28.000+0000",
+    "CodeSha256": "9kScR7Vp1XEDEAUZgxvGuYW3f2/7cmEx1WjGiftIfmk=",
     "Version": "$LATEST",
     "VpcConfig": {
-        "SubnetIds": [],
-        "SecurityGroupIds": [],
-        "VpcId": "",
+        "SubnetIds": [
+            "subnet-03cb8477fb39f639e",
+            "subnet-0b02ad525f046501b"
+        ],
+        "SecurityGroupIds": [
+            "sg-07565e1ecf3294bf9"
+        ],
+        "VpcId": "vpc-0101d2c447b67e9db",
         "Ipv6AllowedForDualStack": false
     },
     "TracingConfig": {
         "Mode": "PassThrough"
     },
-    "RevisionId": "680102a2-e1c3-469f-9698-11d2f353c6ff",
+    "RevisionId": "7c4e1cdb-8ed7-4941-a7ba-a37b9836ea86",
     "Layers": [
         {
             "Arn": "arn:aws:lambda:eu-south-2:861276092327:layer:itl-0004-itx-dev-lambda-layer-pyarrow-curl_cffi:2",

@@ -4,10 +4,10 @@
     "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-vi-exchange-rates-role",
     "CodeSize": 0,
     "Description": "Final Settings",
-    "Timeout": 900,
+    "Timeout": 750,
     "MemorySize": 2048,
-    "LastModified": "2026-06-11T21:16:35.000+0000",
-    "CodeSha256": "c0b941381d791715dc7c4d5040b9a61daf0d75770f07682a5fb6a432fc3f80ea",
+    "LastModified": "2026-06-23T16:01:00.000+0000",
+    "CodeSha256": "10061d4643131c3d90f0dd3daee698b67bcd0ec1c6944237c96342e152d7a90d",
     "Version": "$LATEST",
     "VpcConfig": {
         "SubnetIds": [
@@ -23,7 +23,7 @@
     "TracingConfig": {
         "Mode": "PassThrough"
     },
-    "RevisionId": "293b5f34-eb6e-448d-af1f-b0d329ab0e22",
+    "RevisionId": "8ad851c7-2824-484d-9406-19d871bb6f33",
     "State": "Active",
     "LastUpdateStatus": "Successful",
     "PackageType": "Image",
