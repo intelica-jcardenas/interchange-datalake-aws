@@ -624,7 +624,7 @@ def assign_rules_simple(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame:
  
     work = (
         df_eval
-        .withColumn("work_id", F.monotonically_increasing_id())
+        #.withColumn("work_id", F.monotonically_increasing_id())
         .withColumn("jurisdiction_u", F.upper(F.trim(F.col("jurisdiction").cast("string"))))
         .withColumn("ird_u", F.upper(F.trim(F.col("ird").cast("string"))))
         .withColumn("txn_date_d", F.to_date(F.col("txn_date")))
@@ -676,13 +676,21 @@ def assign_rules_simple(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame:
         .withColumn(
             "rn",
             F.row_number().over(
-                Window.partitionBy(F.col("w.work_id"))
+                #Window.partitionBy(F.col("w.work_id"))
+                Window.partitionBy(
+                    F.col("w.file_id"),
+                    F.col("w.file_idn"),
+                    F.col("w.ref_id")
+                )
                 .orderBy(F.col("r.rule_key").asc_nulls_last())
             )
         )
         .filter(F.col("rn") == 1)
         .select(
-            F.col("w.work_id").alias("work_id_match"),
+            F.col("w.file_id").alias("file_id_match"),
+            F.col("w.file_idn").alias("file_idn_match"),
+            F.col("w.ref_id").alias("ref_id_match"),
+            #F.col("w.work_id").alias("work_id_match"),
             F.col("r.rule_key").alias("rule"),
             F.col("r.region_country_code").cast("string").alias("region_country_code"),
             F.col("r.intelica_id").cast("string").alias("intelica_id"),
@@ -701,7 +709,11 @@ def assign_rules_simple(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame:
         work.alias("w")
         .join(
             ranked_rules.alias("r"),
-            F.col("w.work_id") == F.col("r.work_id_match"),
+            #F.col("w.work_id") == F.col("r.work_id_match"),
+            #"left",
+            (F.col("w.file_id") == F.col("r.file_id_match"))
+            & (F.col("w.file_idn") == F.col("r.file_idn_match"))
+            & (F.col("w.ref_id") == F.col("r.ref_id_match")),
             "left",
         )
     )
@@ -1195,7 +1207,6 @@ def run_interchange_mti(
     df_exchange_rate = read_parquet(spark, exchange_rate_path, "REF exchange_rate").cache()
     df_rules = read_parquet(spark, rules_path, "REF mc_rules").cache()
 
-
     calc_by_key: Dict[str, str] = {
         stem_from_uri(p): p
         for p in calc_files
@@ -1229,15 +1240,15 @@ def run_interchange_mti(
 
             if os.getenv("DEBUG_WRITE_STEPS", "0") == "1":
                 pre_eval_file = build_output_file_path(
-                output_base=output_base,
-                client_id=client_id,
-                file_type=file_type,
-                process_date=file_date,
-                source_file_name=key,
-                target_subdir=f"DEBUG_{mti}_PRE_EVAL",
-            )
-            #write_single_parquet(df_eval, pre_eval_file, aws_region)
-            
+                    output_base=output_base,
+                    client_id=client_id,
+                    file_type=file_type,
+                    process_date=file_date,
+                    source_file_name=key,
+                    target_subdir=f"DEBUG_{mti}_PRE_EVAL",
+                )
+                write_single_parquet(df_eval, pre_eval_file, aws_region)
+
             df_assign = assign_rules_simple(
                 df_eval=df_eval,
                 df_rules=df_rules,
@@ -1245,14 +1256,14 @@ def run_interchange_mti(
 
             if os.getenv("DEBUG_WRITE_STEPS", "0") == "1":
                 assign_file = build_output_file_path(
-                output_base=output_base,
-                client_id=client_id,
-                file_type=file_type,
-                process_date=file_date,
-                source_file_name=key,
-                target_subdir=f"DEBUG_{mti}_ASSIGN",
-            )
-            #write_single_parquet(df_assign, assign_file, aws_region)
+                    output_base=output_base,
+                    client_id=client_id,
+                    file_type=file_type,
+                    process_date=file_date,
+                    source_file_name=key,
+                    target_subdir=f"DEBUG_{mti}_ASSIGN",
+                )
+                write_single_parquet(df_assign, assign_file, aws_region)
  
             df_fee = calculate_mastercard_fee_pyspark(
                 df_assign=df_assign,
@@ -1262,10 +1273,8 @@ def run_interchange_mti(
 
             df_fee_final = df_fee.select(
                 F.col("file_id"),
-                #F.col("file_type"),
                 F.col("file_idn"),
                 F.col("ref_id"),
-                #F.col("file_date"),
                 F.col("rate_currency"),
                 F.col("rate_variable"),
                 F.col("rate_fixed"),
@@ -1279,9 +1288,6 @@ def run_interchange_mti(
                 F.col("ird"),
                 F.col("valid_from"),
                 F.col("valid_until"),
-                
-                #F.lit("GLUE").alias("app_creation_user"),
-                #F.current_timestamp().alias("app_creation_date"),
             )
  
             final_file = build_output_file_path(

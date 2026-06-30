@@ -38,7 +38,7 @@ $AllJobs = [ordered]@{
     # Reportes y Data Quality
     "test-1"         = @{ Group="reports"; Dir="glue\scripts\reports\get_transaction" }
     "test-3"         = @{ Group="reports"; Dir="glue\scripts\reports\vi_data_quality" }
-    # "test-4"       = @{ Group="reports"; Dir="glue\scripts\reports\mc_data_quality" }  # MC DQ — pendiente subida por el equipo
+    "test-4"         = @{ Group="reports"; Dir="glue\scripts\reports\mc_data_quality" }
 }
 
 # Invoca AWS CLI capturando stdout como UTF-8 via System.Diagnostics.Process.

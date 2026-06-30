@@ -33,6 +33,13 @@
         "CrawlElapsedTime": 0,
         "CreationTime": "2026-06-04T16:16:09-05:00",
         "LastUpdated": "2026-06-04T16:16:09-05:00",
+        "LastCrawl": {
+            "Status": "SUCCEEDED",
+            "LogGroup": "/aws-glue/crawlers",
+            "LogStream": "itl_0004_itx_dev_02_glue_crawler_staging_sbsa_visa",
+            "MessagePrefix": "5ea2472e-985b-449b-bbee-f82d70a00795",
+            "StartTime": "2026-06-28T19:36:13-05:00"
+        },
         "Version": 1,
         "Configuration": "{\"Version\":1.0,\"Grouping\":{\"TableGroupingPolicy\":\"CombineCompatibleSchemas\",\"TableLevelConfiguration\":4},\"CreatePartitionIndex\":true}",
         "LakeFormationConfiguration": {

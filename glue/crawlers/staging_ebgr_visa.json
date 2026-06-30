@@ -37,8 +37,8 @@
             "Status": "SUCCEEDED",
             "LogGroup": "/aws-glue/crawlers",
             "LogStream": "itl_0004_itx_dev_02_glue_crawler_staging_ebgr_visa",
-            "MessagePrefix": "e0979f77-c392-4097-86b2-99e46e028af9",
-            "StartTime": "2026-06-12T16:45:49-05:00"
+            "MessagePrefix": "a4733c26-cdc3-4f6a-ad9e-a592051ecd5d",
+            "StartTime": "2026-06-28T19:36:06-05:00"
         },
         "Version": 1,
         "Configuration": "{\"Version\":1.0,\"Grouping\":{\"TableGroupingPolicy\":\"CombineCompatibleSchemas\",\"TableLevelConfiguration\":4},\"CreatePartitionIndex\":true}",

@@ -19,7 +19,7 @@ Salida
   Una sola escritura por ejecución, cubriendo el rango [start_date, end_date].
   report_suffix es un parámetro del job (ej: "202601", "202601_v2").
 
-Schema de salida (31 columnas — idéntico a report_transactions en PostgreSQL)
+Schema de salida (32 columnas — idéntico a report_transactions en PostgreSQL)
 ----------------------------------------------------------------------
   customer_code, file_id, row_id, customer_country_code, business_mode_code,
   brand_code, processing_date, processing_month, transaction_date,
@@ -47,13 +47,8 @@ Pendientes (TODO)
 -----------------
   - scheme_fees_amount : join con Parquet de scheme fees cuando el flujo esté
                          disponible — actualmente retorna 0.0
-  - SMS column names   : verificar nombres exactos contra Parquet operational SMS
-  - MC (1240/1442)     : nombres de columna verificados contra Parquet operational
-                         (2026-06-12). Pendiente de validar contra el SP legacy:
-                         el swap de columna de país por MTI (is_1442) en customer/
-                         merchant/issuer_country_code, y la lógica invertida de
-                         is_reversal_or_chargeback (message_reversal_indicator
-                         NULL = reversal en 1442, NOT NULL = reversal en 1240).
+  - SMS activación     : bloque comentado en generate_report() — pendiente validación
+                         end-to-end con datos reales antes de activar
 """
 
 import sys
@@ -131,6 +126,7 @@ OPERATIONAL_BUCKET = args["operational_bucket"]
 BUCKET_REF = args["reference_bucket"]
 ANALYTICS_BUCKET = args["analytics_bucket"]
 DDB_CLIENT_TABLE = args["dynamodb_table_client"]
+
 
 # =============================================================================
 # HELPERS
@@ -340,7 +336,6 @@ def _apply_duplicate_on_us(df: DataFrame, brand: str) -> DataFrame:
     una copia con business_mode_code='I' (Issuer).
     Equivalente al bloque duplicate_on_us_flag en el SP.
     """
-    dup_suffix = f" ON-US DUP ({brand.upper()} ACQ TO ISS)"
     dup_df = df.filter(
         (F.col("jurisdiction_code") == "on-us") & (F.col("business_mode_code") == "A")
     ).withColumn("business_mode_code", F.lit("I"))
@@ -362,7 +357,6 @@ def _join_exchange_rates(
     """
     xr = xrate_df.filter(F.col("to_currency") == report_currency)
 
-    # X1: moneda transacción → report_currency
     x1 = xr.select(
         F.col("exchange_date").alias("_xr1_date"),
         F.col("from_currency").alias("_xr1_from"),
@@ -374,7 +368,6 @@ def _join_exchange_rates(
         how="left",
     ).drop("_xr1_date", "_xr1_from")
 
-    # X2: moneda del fee → report_currency
     x2 = xr.select(
         F.col("exchange_date").alias("_xr2_date"),
         F.col("from_currency").alias("_xr2_from"),
@@ -440,7 +433,6 @@ def transform_visa_baseii(
         product_ref, df["product_id"] == product_ref["_bin_product_id"], how="left"
     ).drop("_bin_product_id")
 
-    # -- Joins de tipo de cambio --
     df = _join_exchange_rates(
         df,
         xrate_df,
@@ -449,12 +441,10 @@ def transform_visa_baseii(
         report_currency=report_currency,
     )
 
-    # -- Transformaciones de columnas --
     df = df.select(
         F.col("customer_code").cast(StringType()),
         F.col("file_id").cast(StringType()),
         F.col("record").cast(IntegerType()).alias("row_id"),
-        # customer_country_code: Issuer → issuer_country_ref (ardef); Acquirer → merchant_country_ref
         F.when(F.col("business_mode") == "ISSUING", F.col("issuer_country_alt"))
         .when(F.col("business_mode") == "ACQUIRING", F.col("merchant_country_alt"))
         .cast(StringType())
@@ -508,14 +498,12 @@ def transform_visa_baseii(
         .cast(StringType())
         .alias("interchange_rule"),
         F.lit(report_currency).alias("reported_currency_code"),
-        # transaction_amount = source_amount * X1 (fallback 1.0)
         (F.coalesce(F.col("xr1_rate"), F.lit(1.0)) * F.col("source_amount"))
         .cast(DoubleType())
         .alias("transaction_amount"),
-        # interchange_fees_amount = interchange_fee_amount * X2 (fallback X1, luego 1.0)
         (
-            F.coalesce(F.col("xr2_rate"), F.col("xr1_rate"), F.lit(1.0))
-            * F.col("interchange_fee_amount")
+            F.coalesce(F.col("xr1_rate"), F.lit(1.0))
+            * F.col("interchange_fee_amount_itx")
         )
         .cast(DoubleType())
         .alias("interchange_fees_amount"),
@@ -544,10 +532,10 @@ def transform_visa_sms(
     """
     Equivalente a analytics.get_visa_sms_transactions().
 
-    NOTA: nombres de columna pendientes de verificar contra Parquet operational SMS.
-    Los nombres marcados con # VERIFY son supuestos basados en el SP y el
-    pipeline de clean; confirmar cuando haya un archivo SMS de muestra disponible.
+    PENDIENTE: validación end-to-end con datos reales antes de activar.
     """
+    df = df.filter(F.col("local_draft_date").isNotNull())
+
     merchant_country_ref = country_df.select(
         F.col("country_code").alias("_country_code_merchant"),
         F.col("country_code_alternative").alias("merchant_country_alt"),
@@ -556,10 +544,9 @@ def transform_visa_sms(
         F.col("country_code").alias("_country_code_issuer"),
         F.col("country_code_alternative").alias("issuer_country_alt"),
     )
-    # VERIFY: en SMS el país del merchant es card_acceptor_country
     df = df.join(
         merchant_country_ref,
-        df["card_acceptor_country"] == merchant_country_ref["_country_code_merchant"],  # VERIFY col name
+        df["card_acceptor_country"] == merchant_country_ref["_country_code_merchant"],
         how="left",
     ).drop("_country_code_merchant")
     df = df.join(
@@ -576,23 +563,23 @@ def transform_visa_sms(
         product_ref, df["product_id"] == product_ref["_bin_product_id"], how="left"
     ).drop("_bin_product_id")
 
-    # VERIFY: moneda de transacción en SMS es transaction_currency_code (numérico)
-    # Como el exchange rate usa códigos alfabéticos, necesitamos el campo alphabético
-    # Verificar si el Parquet SMS tiene source_currency_code_alphabetic o similar
     df = _join_exchange_rates(
         df,
         xrate_df,
-        src_currency_col="source_currency_code_alphabetic",  # VERIFY
-        fee_currency_col="interchange_fee_currency",  # VERIFY
+        src_currency_col="source_currency_code_alphabetic",
+        fee_currency_col="interchange_fee_currency",
         report_currency=report_currency,
     )
+
+    xr3 = xrate_df.filter(
+        (F.col("from_currency") == "USD") & (F.col("to_currency") == report_currency)
+    ).select(F.col("exchange_date").alias("_xr3_date"), F.col("fx_rate").alias("xr3_rate"))
+    df = df.join(xr3, df["date"] == xr3["_xr3_date"], how="left").drop("_xr3_date")
 
     df = df.select(
         F.col("customer_code").cast(StringType()),
         F.col("file_id").cast(StringType()),
         F.col("record").cast(IntegerType()).alias("row_id"),
-        # En SMS: issuer_acquirer_indicator ya es I/A directamente (no derivado de file_type)
-        # customer_country_code: I → issuer_country_ref; A → merchant_country_ref
         F.when(F.col("business_mode") == "ISSUING", F.col("issuer_country_alt"))
         .when(F.col("business_mode") == "ACQUIRING", F.col("merchant_country_alt"))
         .cast(StringType())
@@ -606,85 +593,55 @@ def transform_visa_sms(
         F.date_format(F.col("date").cast(DateType()), "yyyy-MM").alias(
             "processing_month"
         ),
-        F.col("local_transaction_date")
-        .cast(DateType())
-        .alias("transaction_date"),  # VERIFY col name
+        F.col("local_draft_date").cast(DateType()).alias("transaction_date"),
         F.date_format(
-            F.col("local_transaction_date").cast(DateType()), "yyyy-MM"
-        ).alias("transaction_month"),  # VERIFY
-        F.when(
-            F.col("transaction_code_sms").isin("05", "25"), F.lit("PUR")
-        )  # VERIFY col name
+            F.col("local_draft_date").cast(DateType()), "yyyy-MM"
+        ).alias("transaction_month"),
+        F.when(F.col("transaction_code_sms").isin("05", "25"), F.lit("PUR"))
         .when(F.col("transaction_code_sms").isin("06", "26"), F.lit("CRD"))
         .when(F.col("transaction_code_sms").isin("07", "27"), F.lit("CSH"))
         .otherwise(F.lit("OTH"))
         .alias("transaction_group_code"),
-        F.col("business_transaction_type")
-        .cast(StringType())
-        .alias("transaction_type_id"),
+        F.col("business_transaction_type").cast(StringType()).alias("transaction_type_id"),
         F.col("jurisdiction").cast(StringType()).alias("jurisdiction_code"),
         F.col("merchant_country_alt").cast(StringType()).alias("merchant_country_code"),
-        F.col("merchants_type")
-        .cast(IntegerType())
-        .alias("mcc_code"),  # VERIFY col name
-        F.trim(F.upper(F.col("card_acceptor_name")))
-        .cast(StringType())
-        .alias("merchant"),  # VERIFY
-        F.trim(F.upper(F.col("card_acceptor_id_sms")))
-        .cast(StringType())
-        .alias("merchant_id"),  # VERIFY
-        F.trim(F.upper(F.col("card_acceptor_terminal_id")))
-        .cast(StringType())
-        .alias("terminal_id"),  # VERIFY
-        F.col("acquiring_institution_id_1")
-        .cast(IntegerType())
-        .alias("acquirer_bin"),  # VERIFY
+        F.col("`merchant's_type`").cast(IntegerType()).alias("mcc_code"),
+        F.trim(F.upper(F.col("card_acceptor_name"))).cast(StringType()).alias("merchant"),
+        F.trim(F.upper(F.col("card_acceptor_id_sms"))).cast(StringType()).alias("merchant_id"),
+        F.trim(F.upper(F.col("card_acceptor_terminal_id"))).cast(StringType()).alias("terminal_id"),
+        F.col("acquiring_institution_id_1").cast(IntegerType()).alias("acquirer_bin"),
         F.col("issuer_country_alt").cast(StringType()).alias("issuer_country_code"),
-        F.col("card_number")
-        .substr(1, 6)
-        .cast(IntegerType())
-        .alias("issuer_bin_6"),  # VERIFY
+        F.col("card_number").substr(1, 6).cast(IntegerType()).alias("issuer_bin_6"),
         F.col("issuer_bin_8").cast(IntegerType()).alias("issuer_bin_8"),
         F.col("funding_source").cast(StringType()).alias("funding_source_code"),
         F.col("product_program_id_raw").cast(IntegerType()).alias("product_program_id"),
         F.col("product_id").cast(StringType()).alias("product_code"),
-        F.when(
-            F.col("mailtelephone_or_electronic_commerce_indicator") == " ", F.lit("CPR")
-        )  # VERIFY col name
+        F.when(F.col("mail_telephone_or_electronic_commerce_indicator") == " ", F.lit("CPR"))
         .when(
-            F.col("mailtelephone_or_electronic_commerce_indicator").rlike("^[1-9]$"),
+            F.col("mail_telephone_or_electronic_commerce_indicator").rlike("^[1-9]$"),
             F.lit("CNP"),
         )
         .otherwise(F.lit("UNK"))
         .alias("card_present_code"),
-        F.col("reversal_indicator")
-        .cast(BooleanType())
-        .alias("is_reversal_or_chargeback"),
-        F.col("interchange_fee_descriptor")
-        .cast(StringType())
-        .alias("interchange_rule"),
+        F.col("reversal_indicator").cast(BooleanType()).alias("is_reversal_or_chargeback"),
+        F.col("interchange_fee_descriptor").cast(StringType()).alias("interchange_rule"),
         F.lit(report_currency).alias("reported_currency_code"),
-        # SMS tiene lógica especial: si transaction_amount=0 usa cryptogram_amount + surcharge_amount_sms
         F.when(
-            F.col("transaction_amount") == 0,
-            F.coalesce(F.col("xr1_rate"), F.lit(1.0))
-            * (
-                F.col("cryptogram_amount")
-                + F.col("surcharge_amount_sms")  # VERIFY col names
-            ),
+            F.col("source_amount") == 0,
+            F.coalesce(F.col("xr3_rate"), F.lit(1.0))
+            * (F.col("cryptogram_amount") + F.col("surcharge_amount_sms")),
         )
         .otherwise(
-            F.coalesce(F.col("xr1_rate"), F.lit(1.0))
-            * F.col("transaction_amount")  # VERIFY
+            F.coalesce(F.col("xr1_rate"), F.lit(1.0)) * F.col("source_amount")
         )
         .cast(DoubleType())
         .alias("transaction_amount"),
         (
-            F.coalesce(F.col("xr2_rate"), F.col("xr1_rate"), F.lit(1.0))
+            F.coalesce(F.col("xr1_rate"), F.lit(1.0))
             * F.col("interchange_fee_amount")
         )
         .cast(DoubleType())
-        .alias("interchange_fees_amount"),  # VERIFY
+        .alias("interchange_fees_amount"),
         F.lit(0.0).cast(DoubleType()).alias("scheme_fees_amount"),
     )
 
@@ -723,20 +680,25 @@ def transform_mastercard(
     → range_program_id (product_program_id), igual patrón que Visa con
     visa_bin_products.
 
-    Swap de columna de país según MTI (is_1442) e is_reversal_or_chargeback
-    invertido: ver Pendientes (TODO) en el docstring del módulo.
     """
+    df = df.withColumn(
+        "_effective_product_id",
+        F.coalesce(
+            F.col("licensed_product_identifier_pds_3"),
+            F.col("gcms_product_identifier"),
+        ),
+    )
+
     product_ref = mc_bin_products_df.select(
         F.col("bin_product_id").alias("_bin_product_id"),
         F.col("range_program_id").alias("product_program_id_raw"),
     )
     df = df.join(
         product_ref,
-        df["gcms_product_identifier"] == product_ref["_bin_product_id"],
+        df["_effective_product_id"] == product_ref["_bin_product_id"],
         how="left",
     ).drop("_bin_product_id")
 
-    # currency_alpha_ref: moneda numérica (ISO 4217) → alfabética, misma condición IN/OUT que el monto
     currency_alpha_ref = currency_df.select(
         F.col("currency_numeric_code").alias("_currency_numeric"),
         F.col("currency_alphabetic_code").alias("src_currency_alpha"),
@@ -759,16 +721,21 @@ def transform_mastercard(
         how="left",
     ).drop("_currency_numeric", "_src_currency_numeric")
 
-    # -- Join de tipo de cambio --
+    df = df.withColumn(
+        "_fee_currency_mc",
+        F.when(F.col("file_type") == "IN", F.col("src_currency_alpha"))
+        .otherwise(F.col("rate_currency")),
+    )
+
     df = _join_exchange_rates(
         df,
         xrate_df,
         src_currency_col="src_currency_alpha",
-        fee_currency_col="rate_currency",
+        fee_currency_col="_fee_currency_mc",
         report_currency=report_currency,
     )
+    df = df.drop("_fee_currency_mc")
 
-    # Lógica MTI 1442: customer_country invierte la fuente de país respecto a 1240
     is_1442 = F.col("type_mti") == "1442"
 
     df = df.select(
@@ -816,7 +783,6 @@ def transform_mastercard(
         .cast(StringType())
         .alias("transaction_type_id"),
         F.col("jurisdiction").cast(StringType()).alias("jurisdiction_code"),
-        # merchant_country: 1240 → card_acceptor_country; 1442 → iar_country
         F.when(~is_1442, F.col("card_acceptor_country_code_de_43_6"))
         .when(is_1442, F.col("iar_country"))
         .cast(StringType())
@@ -841,7 +807,6 @@ def transform_mastercard(
             F.col("acquirer_reference_data_de_31").substr(2, 6).cast(IntegerType())
         )
         .alias("acquirer_bin"),
-        # issuer_country: 1240 → iar_country; 1442 → card_acceptor_country
         F.when(~is_1442, F.col("iar_country"))
         .when(is_1442, F.col("card_acceptor_country_code_de_43_6"))
         .cast(StringType())
@@ -850,12 +815,11 @@ def transform_mastercard(
         F.col("pan_de_2").substr(1, 8).cast(IntegerType()).alias("issuer_bin_8"),
         F.col("funding_source").cast(StringType()).alias("funding_source_code"),
         F.col("product_program_id_raw").cast(IntegerType()).alias("product_program_id"),
-        F.col("gcms_product_identifier").cast(StringType()).alias("product_code"),
+        F.col("_effective_product_id").cast(StringType()).alias("product_code"),
         F.when(F.col("pos_entry_mode_de_22").substr(6, 1) == "1", F.lit("CPR"))
         .when(F.col("pos_entry_mode_de_22").substr(6, 1) == "0", F.lit("CNP"))
         .otherwise(F.lit("UNK"))
         .alias("card_present_code"),
-        # is_reversal_or_chargeback: lógica diferente según MTI
         F.when(
             (~is_1442)
             & F.col("message_reversal_indicator_pds_25").isNotNull()
@@ -877,7 +841,6 @@ def transform_mastercard(
         .cast(StringType())
         .alias("interchange_rule"),
         F.lit(report_currency).alias("reported_currency_code"),
-        # transaction_amount: IN usa amount_reconciliation; OUT usa amount_transaction
         (
             F.coalesce(F.col("xr1_rate"), F.lit(1.0))
             * F.when(
@@ -886,7 +849,6 @@ def transform_mastercard(
         )
         .cast(DoubleType())
         .alias("transaction_amount"),
-        # interchange_fees_amount: IN usa amounts_transaction_fee_7; OUT usa calculated_value (ITX)
         (
             F.coalesce(F.col("xr2_rate"), F.col("xr1_rate"), F.lit(1.0))
             * F.when(
@@ -923,14 +885,14 @@ def process_client_range(
 ) -> DataFrame | None:
     """
     Genera el DataFrame de report_transactions para un cliente en el rango
-    [start_date, end_date]. Une BASEII + SMS + MC_1240 + MC_1442.
+    [start_date, end_date]. Une BASEII + MC_1240 + MC_1442.
+    SMS comentado — pendiente resolver customer_code/file_id en lmbd-vi-store.
     """
     rep_cur = client_cfg["report_currency"]
-    dup_vi = client_cfg["dup_on_us_visa"]
-    dup_mc = client_cfg["dup_on_us_mc"]
+    dup_vi = client_cfg["dup_on_us_visa"] and SCHEME_FEE
+    dup_mc = client_cfg["dup_on_us_mc"] and SCHEME_FEE
     frames = []
 
-    # -- Visa BASE II --
     df_baseii = read_operational(
         client_id, "VISA", "baseii_drafts", start_date, end_date
     )
@@ -944,19 +906,18 @@ def process_client_range(
         except Exception as e:
             log_error(f"[BASEII] {client_id}/{start_date}_{end_date}: {e}")
 
-    # -- Visa SMS --
-    df_sms = read_operational(client_id, "VISA", "sms_messages", start_date, end_date)
-    if df_sms is not None:
-        try:
-            frames.append(
-                transform_visa_sms(
-                    df_sms, country_df, xrate_vi_df, vi_bin_products_df, rep_cur, dup_vi
-                )
-            )
-        except Exception as e:
-            log_error(f"[SMS] {client_id}/{start_date}_{end_date}: {e}")
+    # -- Visa SMS -- (pendiente: ver TODO en módulo)
+    # df_sms = read_operational(client_id, "VISA", "sms_messages", start_date, end_date)
+    # if df_sms is not None:
+    #     try:
+    #         frames.append(
+    #             transform_visa_sms(
+    #                 df_sms, country_df, xrate_vi_df, vi_bin_products_df, rep_cur, dup_vi
+    #             )
+    #         )
+    #     except Exception as e:
+    #         log_error(f"[SMS] {client_id}/{start_date}_{end_date}: {e}")
 
-    # -- MC MTI 1240 --
     df_mc1240 = read_operational(client_id, "MC", "IPM_1240", start_date, end_date)
     if df_mc1240 is not None:
         try:
@@ -968,7 +929,6 @@ def process_client_range(
         except Exception as e:
             log_error(f"[MC 1240] {client_id}/{start_date}_{end_date}: {e}")
 
-    # -- MC MTI 1442 --
     df_mc1442 = read_operational(client_id, "MC", "IPM_1442", start_date, end_date)
     if df_mc1442 is not None:
         try:
@@ -1030,12 +990,9 @@ def main():
     log_info(f"  scheme_fee    : {SCHEME_FEE}")
     log_info("=" * 70)
 
-    # Tablas de referencia (cache, se reutilizan en cada transform)
-    # -- Visa --
     country_df = load_country().cache()
     xrate_vi_df = load_exchange_rates(START_DATE, END_DATE, brand_path="Visa").cache()
     vi_bin_products_df = load_visa_bin_products().cache()
-    # -- Mastercard --
     currency_df = load_currency().cache()
     xrate_mc_df = load_exchange_rates(START_DATE, END_DATE, brand_path="MasterCard").cache()
     mc_bin_products_df = load_mastercard_bin_products().cache()

@@ -4,6 +4,39 @@ Problemas encontrados durante el desarrollo, con su causa raíz y solución reco
 
 ---
 
+## glue-mc-interchange: monotonically_increasing_id() inestable entre shuffles — fees incorrectos con count/amount OK — RESUELTO Y VALIDADO
+
+**Archivo:** `glue/scripts/mastercard/interchange/interchange.py` (función `assign_rules_simple`)
+**Detectado:** 2026-06-25 (comparativo SBSA MC fees vs legacy). Fix desplegado por equipo 2026-06-26.
+
+**Causa raíz:** `assign_rules_simple()` usaba `monotonically_increasing_id()` como llave de join entre transacciones (`work`) y reglas rankeadas (`ranked_rules`). Este ID no es estable entre shuffles Spark — tras el cross-join + `Window.partitionBy(work_id)`, los IDs en `ranked_rules` no correspondían a los de `work` → reglas asignadas a transacciones incorrectas → fees incorrectos.
+
+**Síntoma característico:** conteos y montos de transacciones correctos (diff=0), solo fees difieren. No hay error visible — el job termina SUCCEEDED.
+
+**Fix:** `Window.partitionBy(file_id, file_idn, ref_id)` + join final por esas 3 llaves de negocio estables. Mismo patrón que el merge CLN+CAL+ITX en `lmbd-mc-store`.
+
+**Si vuelve a aparecer:** verificar que `assign_rules_simple()` en S3 NO use `monotonically_increasing_id()`. El síntoma (fees incorrectos, count/amount OK) es idéntico.
+
+**Estado:** RESUELTO. Reprocesso SBSA MC enero 2026: 104/104 SUCCEEDED interchange + 104/104 SUCCESS store. Validación fees pendiente con `glue-test-1` v6.
+
+---
+
+## reprocess_mc_store: read timeout botocore ≠ Lambda timeout — falso negativo — CONOCIDO
+
+**Detectado:** 2026-06-28 en reprocesso SBSA MC enero 2026 (2 archivos: Jan 3 IN y Jan 27 OUT).
+
+**Síntoma:** `reprocess_mc_store.py` reporta `EXCEPTION: Read timeout` con `elapsed_s ≈ 910` (el `read_timeout` configurado en botocore). El script marca el archivo como fallido. Sin embargo, el Lambda realmente **terminó con éxito** — la conexión HTTP del cliente expiró antes de recibir la respuesta, pero la ejecución en AWS continuó y completó.
+
+**Verificación:** `aws logs get-log-events` en el stream más reciente de `lmbd-mc-store` muestra `=== Done: N outputs, M records ===` + `REPORT ... Duration: Xs`. Jan 3 IN: 349s, 2,445,146 records. Jan 27 OUT: 356s, 2,535,679 records.
+
+**Causa:** `botocore read_timeout=910s` < tiempo de ejecución del Lambda para archivos grandes (~900s max). La respuesta HTTP llega después del timeout del cliente.
+
+**Solución:** aumentar `read_timeout` en botocore a >900s (ej. `read_timeout=960`) Y/O verificar CloudWatch antes de concluir que falló. El Lambda sí terminó y los datos están escritos en S3.
+
+**Regla:** siempre verificar CloudWatch ante un `Read timeout` en `reprocess_mc_store.py` — no asumir que el Lambda falló.
+
+---
+
 ## lmbd-mc-store: OOM en bloques CLN grandes (archivos >500 MB) — RESUELTO Y VALIDADO
 
 **Archivo:** `lambdas/mastercard/store/src/handler.py` (función `_store_output`)

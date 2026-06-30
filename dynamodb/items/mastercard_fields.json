@@ -686,24 +686,24 @@
                                     }
                   },
                   {
-                      "type_record":  {
-                                          "S":  "DE"
-                                      },
                       "length":  {
                                      "N":  "10"
                                  },
+                      "type_record":  {
+                                          "S":  "DE"
+                                      },
                       "subfield":  {
                                        "S":  "4"
                                    },
                       "type_mti":  {
                                        "S":  "1240, 1442"
                                    },
-                      "subfield_name":  {
-                                            "S":  "Card Acceptor Postal (ZIP) Code"
-                                        },
                       "tlv_name":  {
                                        "S":  "card acceptor postal (zip) code"
                                    },
+                      "subfield_name":  {
+                                            "S":  "Card Acceptor Postal (ZIP) Code"
+                                        },
                       "tag":  {
                                   "N":  "43"
                               },

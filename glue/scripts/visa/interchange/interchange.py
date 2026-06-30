@@ -611,10 +611,13 @@ def calculate_fee_amounts(df: DataFrame, rates_pd: pd.DataFrame) -> DataFrame:
         rates_pd[["currency_from", "currency_to", "exchange_value"]]
     )
 
+    # Join direction: (from=fee_ccy, to=source_ccy) → exchange_value = rate(fee_ccy → source_ccy)
+    # Converts fee_fixed/fee_min/fee_cap from fee_ccy to source_ccy.
+    # fee = fee_variable × source_amount_src_ccy + fee_fixed_fee_ccy × rate(fee_ccy→src_ccy)
     df = df.join(
         F.broadcast(rates_spark),
-        (df["source_currency_code_alphabetic"] == rates_spark["currency_from"]) &
-        (df["interchange_fee_currency"] == rates_spark["currency_to"]),
+        (df["interchange_fee_currency"] == rates_spark["currency_from"]) &
+        (df["source_currency_code_alphabetic"] == rates_spark["currency_to"]),
         how="left"
     ).withColumn(
         "exchange_value",
@@ -687,6 +690,14 @@ def process_output(
     cal_df = load_parquet(cal_path)
 
     log_info("  Joining CLN + CAL...")
+    # CAL columns (ARDEF-derived computed fields) take precedence over CLN raw Visa fields.
+    # Rename overlapping CLN columns with _cln suffix so no data is lost and CAL version is used.
+    key_cols = {"record", "content_hash"}
+    overlap = {c for c in cln_df.columns if c in set(cal_df.columns) - key_cols}
+    if overlap:
+        for col in overlap:
+            cln_df = cln_df.withColumnRenamed(col, col + "_cln")
+        log_info(f"  Renamed {len(overlap)} CLN columns with _cln suffix: {sorted(overlap)[:10]}...")
     cal_cols_to_add = [c for c in cal_df.columns if c not in cln_df.columns or c == "record"]
     merged = cln_df.join(cal_df.select(cal_cols_to_add), on="record", how="left")
     log_info(f"  Merged: {merged.count():,} records, {len(merged.columns)} columns")
@@ -695,8 +706,11 @@ def process_output(
 
     result = calculate_fee_amounts(result, rates_pd)
 
+    # source_amount y source_currency_code_alphabetic se usaron en calculate_fee_amounts
+    # pero no forman parte del output ITX — ya existen en el CLN y el store los toma de ahí.
+    # Alineado con el prototipo local: stage.drop(["source_currency_code_alphabetic", "source_amount"])
     interchange_cols = [
-        "content_hash", "record", "source_currency_code_alphabetic", "source_amount",
+        "content_hash", "record",
         "interchange_intelica_id", "interchange_fee_descriptor", "interchange_fee_currency",
         "interchange_fee_variable", "interchange_fee_fixed", "interchange_fee_min",
         "interchange_fee_cap", "interchange_fee_amount",

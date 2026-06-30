@@ -20,8 +20,8 @@
             "ReadCapacityUnits": 1,
             "WriteCapacityUnits": 1
         },
-        "TableSizeBytes": 953010,
-        "ItemCount": 390,
+        "TableSizeBytes": 1707659,
+        "ItemCount": 598,
         "TableArn": "arn:aws:dynamodb:eu-south-2:861276092327:table/itl-0004-itx-dev-dynamo-file_control-02",
         "TableId": "0af398e3-217f-4474-b04d-7723aa9b3512",
         "SSEDescription": {
