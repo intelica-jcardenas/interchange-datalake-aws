@@ -224,7 +224,9 @@ Detalle de implementación (`_mc_unblock_full`) → `.claude/memory/decisions_ar
 
 **Decisión (2026-06-11):** `product_program_id` (antes `NULL` fijo, TODO documentado) se calcula ahora con un join: `product_id` (ya calculado en `glue-vi-calculate` via cruce ARDEF) → `bin_product_id` en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_bin_products/data.parquet` (58 filas, export 1:1 de `m_visa_bin_products` legacy) → `range_program_id`.
 
-**Implementación:** nueva función `load_visa_bin_products()`; `transform_visa_baseii()`/`transform_visa_sms()` reciben `vi_bin_products_df`, join `product_ref` (análogo a `merchant_country_ref`/`issuer_country_ref`). MC (`transform_mastercard`) queda como TODO separado — requiere `m_mastercard_bin_products`, no provista aún.
+**Implementación:** nueva función `load_visa_bin_products()`; `transform_visa_baseii()`/`transform_visa_sms()` reciben `vi_bin_products_df`, join `product_ref` (análogo a `merchant_country_ref`/`issuer_country_ref`).
+
+**MC ya no es TODO (verificado 2026-07-01, esta nota estaba desactualizada):** `mastercard_bin_products/data.parquet` existe en s3-reference y `get_transaction.py` ya tiene `load_mastercard_bin_products()` (línea ~235) usado en `transform_mastercard()` con el mismo patrón (`gcms_product_identifier`/`licensed_product_identifier_pds_3` → `bin_product_id` → `range_program_id`). Confirmado también en el comparativo MC de EBGR/SBSA del 2026-06-30.
 
 **Nota (2026-06-12):** refactor de nombres en `get_transaction.py` — variables legacy `m1/m2/m3/m5` renombradas a `merchant_country_ref`/`issuer_country_ref`/`product_ref`/`currency_alpha_ref`; sin cambios de lógica/resultados.
 

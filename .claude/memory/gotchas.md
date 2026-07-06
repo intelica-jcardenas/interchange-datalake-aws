@@ -4,6 +4,23 @@ Problemas encontrados durante el desarrollo, con su causa raíz y solución reco
 
 ---
 
+## business_mode: MAYÚSCULA en Visa, minúscula en Mastercard — inconsistencia real entre calculate.py de ambas marcas
+
+**Archivos:** `glue/scripts/visa/calculate/calculate.py` (línea ~454, `calc_business_mode_draft`/`calc_business_mode_sms`) vs `glue/scripts/mastercard/calculate/calculate.py` (línea ~730)
+**Detectado:** 2026-07-03, durante el comparativo de `scheme_fee.py` contra legacy (SBSA enero 2026).
+
+**El campo `business_mode` no usa la misma convención de mayúsculas entre marcas:**
+- Visa: `F.lit("ACQUIRING")` / `F.lit("ISSUING")` (mayúscula).
+- Mastercard: `F.lit("acquiring")` / `F.lit("issuing")` (minúscula).
+
+**Impacto real detectado:** `scheme_fee.py` copió el patrón de Visa (comparación case-sensitive contra `"ACQUIRING"`/`"ISSUING"`) y lo aplicó tal cual a los 3 transforms (Visa BASEII, Visa SMS, Mastercard) sin normalizar el case — para MC, cualquier comparación exacta contra esos literales en mayúscula NUNCA matchea. En este caso concreto rompió (a) el duplicado on-us (nunca disparaba para MC) y (b) el mapeo a códigos legacy en el CSV final (100% de las filas de MC caían en el sentinel de "no matcheó"). Detalle completo → memoria de usuario `scheme_fee_job_design.md`.
+
+**Cómo `get_transaction.py` evita el problema:** no usa la columna `business_mode` de MC directamente — deriva `business_mode_code` desde `file_type` (IN→"I", OUT→"A") en vez de comparar contra el valor de `business_mode`. Por eso el reporting job (ya validado) nunca se topó con esta inconsistencia.
+
+**Si vuelve a aparecer (código nuevo que compare `business_mode` de MC contra literales en mayúscula, o viceversa con Visa en minúscula):** normalizar con `F.upper(F.col("business_mode"))` (o `.lower()`, pero mayúscula es lo que ya usa Visa) ANTES de cualquier comparación/mapeo, en vez de asumir que ambas marcas comparten convención. No se tocó `calculate.py` de ninguna marca — normalizar en el consumidor, no en la fuente, para no romper otros consumidores ya validados que dependan de la convención actual de cada uno.
+
+---
+
 ## glue-mc-interchange: monotonically_increasing_id() inestable entre shuffles — fees incorrectos con count/amount OK — RESUELTO Y VALIDADO
 
 **Archivo:** `glue/scripts/mastercard/interchange/interchange.py` (función `assign_rules_simple`)
@@ -17,7 +34,7 @@ Problemas encontrados durante el desarrollo, con su causa raíz y solución reco
 
 **Si vuelve a aparecer:** verificar que `assign_rules_simple()` en S3 NO use `monotonically_increasing_id()`. El síntoma (fees incorrectos, count/amount OK) es idéntico.
 
-**Estado:** RESUELTO. Reprocesso SBSA MC enero 2026: 104/104 SUCCEEDED interchange + 104/104 SUCCESS store. Validación fees pendiente con `glue-test-1` v6.
+**Estado (actualizado 2026-07-01):** RESUELTO Y VALIDADO. Reprocesso SBSA MC enero 2026: 104/104 SUCCEEDED interchange + 104/104 SUCCESS store. Validación de fees ya completada: comparativo `get_transaction.py` del 2026-06-30 da SBSA MC (excl. Jan 16) count=0, fees=+10,001 ZAR (+0.0045%) — residual mínimo, consistente con el fix funcionando. (Nota: esto es independiente del rewrite local sin commitear de la moneda del fee en `calculate_mastercard_fee_pyspark`, ver `mc_interchange_fee_currency_rewrite.md` — ese cambio no está desplegado y no se tocó acá.)
 
 ---
 
@@ -75,7 +92,7 @@ Implementado con un único `LEFT JOIN` contra `rollup_group_df` (distinct de `ro
 
 **Si vuelve a aparecer (`vss_aggregation_level` no tiene valores `0`, o tiene `2` donde debería haber `0`):** verificar que el script en S3 (`s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/visa/calculate.py`) tenga la versión join-based, no la recursiva de 3 iteraciones.
 
-**Estado:** RESUELTO Y VALIDADO 2026-06-18. Reproceso masivo EBGR enero 2026: 105/105 `glue-vi-calculate` SUCCEEDED + 105/105 `lmbd-vi-store` VSS-only SUCCESS + crawler `itl_0004_itx_dev_02_glue_crawler_operational_ebgr_visa` SUCCEEDED. Pendiente: revisar si `get_transaction.py` o `glue-vi-interchange` asumían el valor incorrecto `2` para hojas cuando se usen datos VSS en reportes.
+**Estado:** RESUELTO Y VALIDADO 2026-06-18. Reproceso masivo EBGR enero 2026: 105/105 `glue-vi-calculate` SUCCEEDED + 105/105 `lmbd-vi-store` VSS-only SUCCESS + crawler `itl_0004_itx_dev_02_glue_crawler_operational_ebgr_visa` SUCCEEDED. **Pendiente verificado y descartado (2026-07-01):** `vss_aggregation_level` no aparece referenciado en ningún lado de `get_transaction.py` ni de `interchange.py` (`grep` sin resultados) — ninguno de los dos asumía el valor incorrecto, no había nada que corregir ahí.
 
 ---
 
@@ -104,20 +121,22 @@ Implementado con un único `LEFT JOIN` contra `rollup_group_df` (distinct de `ro
 
 ---
 
-## glue-test-1 (glue-vi-mc-reporting): operational MC (IPM_1240/1442) — TIMESTAMP(NANOS) y tipos inconsistentes entre archivos rompen spark.read.parquet(); fallback PyArrow causa OOM — PENDIENTE
+## glue-test-1 (glue-vi-mc-reporting): operational MC (IPM_1240/1442) — TIMESTAMP(NANOS) y tipos inconsistentes entre archivos rompen spark.read.parquet(); fallback PyArrow causa OOM — RESUELTO (entrada corregida 2026-07-01, estaba desactualizada)
 
-**Archivo:** `glue/scripts/reports/get_transaction/get_transaction.py` (función `read_operational`, helpers `_read_operational_via_pyarrow`/`_widest_arrow_type`/`_align_table_to_schema`, SparkSession config)
-**Detectado:** 2026-06-13
+**Archivo:** `glue/scripts/reports/get_transaction/get_transaction.py` (función `read_operational`)
+**Detectado:** 2026-06-13. **Resuelto:** mismo día, por un fix distinto al propuesto originalmente abajo.
 
-**Síntoma:** `spark.read.parquet("s3://.../EBGR/MC/IPM_1240/")` (138 archivos) falla en la etapa de scan (no en inferencia de schema) con `AnalysisException: Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))` pese a tener `spark.sql.legacy.parquet.nanosAsLong=true` configurado. El `except` de `read_operational()` detecta el mensaje y entra al fallback `_read_operational_via_pyarrow` (lee todos los archivos con PyArrow, unifica schema, concatena, `to_pandas()`, `spark.createDataFrame()`) — pero ~2 min después el job termina con `User application exited with 137` (OOM kill): cargar 138 archivos completos en memoria del driver no escala.
+**Síntoma:** `spark.read.parquet("s3://.../EBGR/MC/IPM_1240/")` fallaba en la etapa de scan con `AnalysisException: Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))` — la causa física era que `lmbd-mc-store` escribía `date_and_time_local_transaction_de_12` (y otras columnas timestamp) sin schema explícito, dejando que PyArrow infiriera `TIMESTAMP(NANOS)` en vez de microsegundos.
 
-**Causa raíz:** `spark.sql.legacy.parquet.nanosAsLong=true` solo aplica al lector Parquet **no vectorizado**. El lector **vectorizado** (default, `spark.sql.parquet.enableVectorizedReader=true`) ignora el flag y lanza la misma excepción para columnas `TIMESTAMP(NANOS)` (`date_and_time_local_transaction_de_12`). El lector vectorizado es también el que lanza `SchemaColumnConvertNotSupportedException` cuando una columna tiene tipo físico distinto entre archivos (decimal con distinta precisión, int32 vs decimal, etc. — ~25 columnas en IPM_1240/1442). El lector no vectorizado convierte ambos casos genéricamente via `Cast`.
+**Fix real aplicado (no el propuesto originalmente — ver nota abajo):** se corrigió en el origen, no en el lector. `lmbd-mc-store` (`_store_output`) ahora restaura el schema Arrow del CLN antes de escribir operational (`_restore_schema()`, forzando `pa.timestamp("us")` en todas las columnas timestamp, tanto heredadas del CLN como nuevas de CAL/ITX) — ver decisión "Por qué lmbd-mc-store restaura el schema Arrow del CLN antes de escribir operational" en `decisions.md`. Con los archivos operational ya escritos con timestamps en microsegundos, `spark.read.parquet()` los lee sin problema — no hizo falta tocar `enableVectorizedReader` ni el resto del workaround propuesto originalmente.
 
-**Fix propuesto, NO probado:** agregar `.config("spark.sql.parquet.enableVectorizedReader", "false")` a la SparkSession (junto a `nanosAsLong`). Si funciona, `spark.read.parquet()` leería IPM_1240/1442 directo sin pasar por el fallback PyArrow (eliminando el OOM), y dejaría `_read_operational_via_pyarrow`/`_widest_arrow_type`/`_align_table_to_schema` como código removible tras validar.
+**Limpieza consecuente en get_transaction.py (2026-06-13):** una vez confirmado que el dato físico ya no tenía el problema, se eliminó el código del intento de workaround (`_NANOS_AS_LONG_COLS`, `_widest_arrow_type`, `_align_table_to_schema`, `_read_operational_via_pyarrow`, `spark.sql.legacy.parquet.nanosAsLong` + imports asociados) — `read_operational()` quedó como el `spark.read.parquet()` simple que tiene hoy. Re-validado con `report_suffix=20260102_0105_mc_v3`.
 
-**Alternativa de corto plazo (discutida, no aplicada):** comentar temporalmente la lectura/transform MC en `get_transaction.py` para generar un reporte VI-only y desbloquear la comparación VI vs CSV legacy mientras se valida el fix de Spark conf.
+**Validación:** `reprocess_mc_store.py` IN (120/120) + OUT (18/18) SUCCESS sobre EBGR; `scan_mc_operational_schema_variance.py` → 0 inconsistencias en IPM_1240 (138 archivos) e IPM_1442 (5 archivos); comparativos EBGR+SBSA MC de `get_transaction.py` (2026-06-30, ver `project_status.md`) confirman que la lectura MC funciona en producción semanas después del fix.
 
-**Estado:** Pendiente — VI funciona (309,436 filas EBGR `baseii_drafts`). Detalle completo (logs, ids de run, próximos pasos) en memoria de usuario `mc_operational_nanos_reader_issue.md`.
+**Nota sobre datos MUY viejos sin reprocesar:** el fix corrige archivos escritos por `lmbd-mc-store` desde 2026-06-13 en adelante (o reprocesados después de esa fecha). Si algún cliente tiene operational MC de una fecha anterior que nunca fue reprocesado, en teoría podría seguir en NANOS — de aparecer el mismo `AnalysisException`, es la primera sospecha, y el fix es reprocesar ese archivo con `lmbd-mc-store` actual, no tocar el lector.
+
+**Relevante para `glue/scripts/reports/scheme_fee/scheme_fee.py` (2026-07-01):** ese script copia `read_operational()` tal cual desde `get_transaction.py` — al estar el problema resuelto en el origen, no necesita ningún workaround adicional. Se había flaggeado por error como riesgo pendiente en una revisión previa; corregido tras verificar `decisions.md` y el código actual de `lmbd-mc-store`.
 
 ---
 
@@ -141,7 +160,7 @@ Si `store_result.outputs[]` no incluye `output_type=BASEII`, ese output falló.
 
 **Distinción `file_id` vs `content_hash`:** DynamoDB `file_control-02` usa `file_id` como PK (no `content_hash`). Si se tiene solo el `content_hash`, usar `scan` con `filter-expression "content_hash = :h"` para obtener el `file_id` real. En el caso de Jan 20: `file_id=0A8221C3293EF535621FB1E35D709ACC` (PK) pero `content_hash=F308708F2709F2F83AF7C692B33BA292` (distinto).
 
-**Pendiente:** verificar el mismo problema en `SBSA`/`BTRLRO` y otros `output_type` (VSS_110/120/130/140) si sus reportes fallan con la misma excepción.
+**Pendiente (actualizado 2026-07-01):** SBSA verificado indirectamente — el comparativo `get_transaction.py` del 2026-06-30 dio SBSA VI count=0/amount=0 (sin el patrón de "~13% de filas esperadas" que delataba `PARTIAL_SUCCESS` en EBGR), consistente con que SBSA no tiene archivos con este problema. `BTRLRO` sigue sin verificar (no forma parte de los comparativos validados hasta ahora) — chequear si/cuando se necesite generar un reporte para ese cliente.
 
 **Si vuelve a aparecer:** usar `tst_files/debug_scripts/scan_nulltype_columns.py` para listar archivos/columnas afectadas, mapear via `file_control` (scan por rango de fechas + `control_status=PARTIAL_SUCCESS`) y reprocesar con `lmbd-vi-store`.
 
@@ -149,7 +168,7 @@ Si `store_result.outputs[]` no incluye `output_type=BASEII`, ese output falló.
 
 ---
 
-## glue-vi-interchange: fillna(0.0) en fee_min/fee_cap zeroeaba fees positivos — RESUELTO (pendiente validar re-run)
+## glue-vi-interchange: fillna(0.0) en fee_min/fee_cap zeroeaba fees positivos — RESUELTO Y VALIDADO
 
 **Archivo:** `glue/scripts/visa/interchange/interchange.py` (función `process_pandas_partitions`)
 **Detectado:** 2026-06-09
@@ -160,7 +179,7 @@ Si `store_result.outputs[]` no incluye `output_type=BASEII`, ese output falló.
 
 **Si vuelve a aparecer:** verificar que no haya `fillna(0.0)` sobre esas dos columnas antes del yield — solo `.astype(float)`.
 
-**Estado:** código corregido y subido a S3 (2026-06-09). Pendiente re-ejecutar `glue-vi-interchange` + `lmbd-vi-store` y re-validar la comparación por jurisdiction/source_currency (ver también las entradas siguientes de _apply_default y content_hash — mismas pendientes de re-run, se pueden validar juntas en una sola corrida). Detalle completo → `.claude/memory/gotchas_archive.md`.
+**Estado (corregido 2026-07-01, esta entrada estaba desactualizada):** RESUELTO Y VALIDADO. Confirmado presente en la versión de `interchange.py` del commit `28df878` (2026-06-30). Evidencia de re-ejecución vía `aws s3api list-objects-v2`: `EBGR/VISA/500_baseii_itx_drafts/` y `EBGR/VISA/baseii_drafts/` (operational) tienen `LastModified=2026-06-29` en prácticamente todos los `file_id` de enero 2026 (58/59 grupos; 1 archivo residual de `date=2026-01-30` quedó en 2026-06-10/12, sin impacto visible). El comparativo `get_transaction.py` del 2026-06-30 (EBGR VI: fees=-1.30 EUR, -0.0003%) confirma el fix funcionando en producción. Detalle completo → `.claude/memory/gotchas_archive.md`.
 
 ---
 
@@ -192,24 +211,23 @@ Nota: los fee_amounts están en **monedas distintas** (USD vs JPY) — no son co
 
 ---
 
-## glue-vi-interchange: dirección del exchange_value — pendiente validar convención
+## glue-vi-interchange: dirección del exchange_value — RESUELTO Y VALIDADO (entrada corregida 2026-07-01, estaba desactualizada)
 
 **Archivo:** `glue/scripts/visa/interchange/interchange.py` (función `calculate_fee_amounts`)
-**Detectado:** 2026-06-09
+**Detectado:** 2026-06-09. **Resuelto:** 2026-06-30 (commit `28df878`).
 
-**Contexto:** Existen dos fórmulas posibles para `interchange_fee_amount`, con resultados distintos en transacciones cross-currency:
+**Contexto (histórico):** Existían dos fórmulas posibles para `interchange_fee_amount`, con resultados distintos en transacciones cross-currency:
 
 | Sistema | Fórmula | Moneda del resultado |
 |---|---|---|
 | Legacy PostgreSQL | `fee_variable × (source_amount × exchange_value) + fee_fixed` | fee_currency |
 | Prototipo local | `fee_variable × source_amount + fee_fixed × exchange_value` | source_currency (si exchange_value = source_ccy/fee_ccy) |
-| Glue actual | `fee_variable × source_amount + fee_fixed × exchange_value` | depende de convención |
 
-El usuario prefiere que el fee se exprese en **source_currency** ("la regla se adapta a la moneda de la transacción"). La fórmula del prototipo es consistente con eso SI `exchange_value` en la tabla S3 almacena `source_ccy/fee_ccy` (convención inversa a la del legacy).
+El usuario prefería que el fee se exprese en **source_currency** ("la regla se adapta a la moneda de la transacción").
 
-**Para validar:** Leer `s3://itl-0004-itx-dev-intchg-02-s3-reference/exchange_rate/data.parquet`, filtrar `currency_from=EUR, currency_to=USD`, ver si `exchange_value ≈ 1.08` (fee_ccy/source_ccy, convención legacy) o `≈ 0.926` (source_ccy/fee_ccy, convención prototipo).
+**Fix aplicado:** el join contra `exchange_rate` en `calculate_fee_amounts` ahora es explícito `(from=fee_ccy, to=source_ccy)` — `exchange_value = rate(fee_ccy → source_ccy)`, usado para convertir `fee_fixed`/`fee_min`/`fee_cap` de `fee_ccy` a `source_ccy` antes de aplicar `fee = fee_variable × source_amount + fee_fixed_convertido`. Queda comentado explícitamente en el código (`# Join direction: (from=fee_ccy, to=source_ccy)...`), resolviendo la ambigüedad — el resultado queda en `source_currency`, como prefería el usuario.
 
-**Estado:** Pendiente — validar convención del exchange_value antes de decidir si la fórmula actual de `calculate_fee_amounts` es correcta.
+**Estado:** RESUELTO Y VALIDADO. Confirmado en el código actual (mismo commit `28df878` del 2026-06-30 usado en el comparativo EBGR/SBSA de esa fecha: EBGR fees=-1.30 EUR/-0.0003%, SBSA fees=+68,285 ZAR/+0.038% con residual ya explicado por ATM NO AF). Detalle completo → `.claude/memory/gotchas_archive.md`.
 
 ---
 
@@ -224,7 +242,7 @@ El usuario prefiere que el fee se exprese en **source_currency** ("la regla se a
 
 **Si vuelve a aparecer:** la discrepancia (timeliness 1 de menos que legacy) aparece solo cuando `(total_days - 1) % 7 == (8 - start_dow) % 7` — cualquier lógica `remaining >= days_to_next_sunday` tiene este off-by-one.
 
-**Estado:** Resuelto en código local (2026-06-09), incluido en el `calculate.py` usado en el reproceso masivo EBGR enero 2026 (sesión 2026-06-11), pero no se validó específicamente `timeliness` contra legacy tras ese reproceso. Detalle completo (derivación, ejemplo numérico) → `.claude/memory/gotchas_archive.md`.
+**Estado (actualizado 2026-07-01):** Resuelto en código, incluido en el `calculate.py` desplegado — CAL de EBGR enero 2026 tiene `LastModified=2026-06-18` (posterior al fix), y el interchange/operational reprocesado el 2026-06-29 usa ese CAL. No hay una validación numérica DIRECTA de la columna `timeliness` contra legacy, pero el comparativo de fees EBGR del 2026-06-30 (-0.0003%) es evidencia indirecta fuerte: `timeliness` alimenta la clasificación de reglas de interchange sensibles al tiempo, así que un error ahí produciría discrepancias de fee mucho mayores a las observadas. Si se quiere confirmar directamente, comparar la columna `timeliness` de `calculate.parquet` contra el valor legacy fila a fila. Detalle completo (derivación, ejemplo numérico) → `.claude/memory/gotchas_archive.md`.
 
 ---
 
@@ -239,11 +257,11 @@ El usuario prefiere que el fee se exprese en **source_currency** ("la regla se a
 
 **Si vuelve a aparecer:** verificar que toda normalización de condiciones use `fillna("").astype(str).str.strip()`, nunca `astype(str)` directo sobre columnas con nulls.
 
-**Estado:** Resuelto en código local (2026-06-09). Pendiente subir a S3 y re-ejecutar `glue-vi-interchange` (ver nota de re-run consolidada en la entrada de fillna(0.0) arriba). Detalle completo → `.claude/memory/gotchas_archive.md`.
+**Estado (corregido 2026-07-01, esta entrada estaba desactualizada):** RESUELTO Y VALIDADO. Confirmado presente en `interchange.py` (commit `28df878`, 2026-06-30) — `_apply_default` usa `batch[condition_name].fillna("").astype(str).str.strip()`. Misma evidencia de re-ejecución que la entrada de fillna(0.0) arriba (S3 `LastModified=2026-06-29` en interchange/operational EBGR + comparativo 2026-06-30 con residuos mínimos). Detalle completo → `.claude/memory/gotchas_archive.md`.
 
 ---
 
-## glue-vi-interchange: content_hash se perdía en el Parquet ITX por mapInPandas — RESUELTO (pendiente validar tras re-run)
+## glue-vi-interchange: content_hash se perdía en el Parquet ITX por mapInPandas — RESUELTO Y VALIDADO
 
 **Archivo:** `glue/scripts/visa/interchange/interchange.py` (función `evaluate_interchange_fees`)
 **Detectado:** 2026-06-08
@@ -254,11 +272,11 @@ El usuario prefiere que el fee se exprese en **source_currency** ("la regla se a
 
 **Si vuelve a aparecer (columna ausente pese a estar en la lista de columnas finales):** sospechar de un `mapInPandas`/`applyInPandas` intermedio que reemplaza el schema — la columna debe declararse tanto en la salida del iterador como en el `StructType`.
 
-**Estado:** código corregido y subido a S3 (2026-06-08). Pendiente re-ejecutar `glue-vi-interchange` y validar que `content_hash` es la primera columna del `itx.parquet` (ver nota de re-run consolidada en la entrada de fillna(0.0) arriba). Detalle completo → `.claude/memory/gotchas_archive.md`.
+**Estado (corregido 2026-07-01, esta entrada estaba desactualizada):** RESUELTO Y VALIDADO. Confirmado presente en `interchange.py` (commit `28df878`, 2026-06-30) — `content_hash` es primer elemento de `OUTPUT_COLS` y del `output_schema`. Misma evidencia de re-ejecución que la entrada de fillna(0.0) arriba. Detalle completo → `.claude/memory/gotchas_archive.md`.
 
 ---
 
-## glue-vi-interchange: _apply_default() destruía el token "Space" (espacio literal) — transacciones GR caían en regla fallback — RESUELTO (pendiente validar tras re-run)
+## glue-vi-interchange: _apply_default() destruía el token "Space" (espacio literal) — transacciones GR caían en regla fallback — RESUELTO Y VALIDADO
 
 **Archivo:** `glue/scripts/visa/interchange/interchange.py` (función `_apply_default`)
 **Detectado:** 2026-06-08
@@ -269,7 +287,7 @@ El usuario prefiere que el fee se exprese en **source_currency** ("la regla se a
 
 **Si vuelve a aparecer:** verificar que ningún `.strip()`/normalización adicional se aplique a `value_list` después de `replace("SPACE", " ")` — el espacio literal debe sobrevivir hasta el `isin()`.
 
-**Estado:** código corregido y subido a S3 (2026-06-08). Pendiente re-ejecutar `glue-vi-interchange` y confirmar que esas 524 transacciones obtienen `intelica_id=39` (ver nota de re-run consolidada en la entrada de fillna(0.0) arriba). Detalle completo → `.claude/memory/gotchas_archive.md`.
+**Estado (corregido 2026-07-01, esta entrada estaba desactualizada):** RESUELTO Y VALIDADO. Confirmado presente en `interchange.py` (commit `28df878`, 2026-06-30) — el loop de `value_list` en `_apply_default` ya no tiene el `.strip()` extra. Misma evidencia de re-ejecución que la entrada de fillna(0.0) arriba; no se re-contaron específicamente las 524 transacciones GR, pero el fee residual EBGR global (-0.0003%) es consistente con el fix funcionando. Detalle completo → `.claude/memory/gotchas_archive.md`.
 
 ---
 
@@ -296,7 +314,7 @@ El usuario prefiere que el fee se exprese en **source_currency** ("la regla se a
 
 **Si vuelve a aparecer (lectura se detiene antes del final / `KeyError`/`ValueError` no controlado):** revisar log `WARNING ... Mensaje corrupto descartado ... RESYNC exitoso/fallido`; si el resync falla repetidamente cerca del mismo offset, sospechar corrupción real del archivo fuente.
 
-**Estado:** Resuelto en código local (2026-06-10). Pendiente subir el handler al Lambda `lmbd-mc-interpreter` y validar end-to-end con `itl-0004-itx-dev-intchg-02-sfn-mc`. Detalle completo → `.claude/memory/gotchas_archive.md`.
+**Estado (corregido 2026-07-01, esta entrada estaba desactualizada):** RESUELTO Y VALIDADO. `aws lambda get-function-configuration` confirma `LastModified=2026-06-13` para `lmbd-mc-interpreter` (posterior al fix del 2026-06-10) — el handler con resync está desplegado. `project_status.md` (memoria de usuario) marca `lmbd-mc-interpreter` como "✓ Funcional (fix resync stream corrupto)", consistente con los comparativos MC end-to-end de EBGR/SBSA del 2026-06-30 (que dependen de que el interpreter haya funcionado correctamente como primer paso del pipeline). Detalle completo → `.claude/memory/gotchas_archive.md`.
 
 ---
 

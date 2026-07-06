@@ -37,8 +37,10 @@ $AllJobs = [ordered]@{
     "mc-interchange" = @{ Group="mc";      Dir="glue\scripts\mastercard\interchange" }
     # Reportes y Data Quality
     "test-1"         = @{ Group="reports"; Dir="glue\scripts\reports\get_transaction" }
+    "test-2"         = @{ Group="reports"; Dir="glue\scripts\reports\exchange_rates" }
     "test-3"         = @{ Group="reports"; Dir="glue\scripts\reports\vi_data_quality" }
     "test-4"         = @{ Group="reports"; Dir="glue\scripts\reports\mc_data_quality" }
+    "scheme-fee"     = @{ Group="reports"; Dir="glue\scripts\reports\scheme_fee" }
 }
 
 # Invoca AWS CLI capturando stdout como UTF-8 via System.Diagnostics.Process.

@@ -785,27 +785,21 @@ def calculate_mastercard_fee_pyspark(
 
     Proceso:
 
-    1. Convertir el monto de la transacción a la moneda de la regla utilizando el tipo de cambio del día de la transacción.
-    2. Calcular el fee preliminar:
-       fee = (amount * rate_variable) + rate_fixed
-    3. Aplicar restricciones de la regla:
-       fee_final = min(rate_cap, max(rate_min, fee))
-    4. Convertir el fee calculado desde la moneda de la regla
-    hacia la moneda de settlement.
+    1. Obtener fx(rate_ccy -> trx_ccy). Si rate_ccy es NONE/vacio o igual
+       a trx_ccy, fx_to_trx = 1.0 (sin conversion).
+    2. Escalar rate_fixed, rate_min, rate_cap a trx_ccy multiplicando por fx_to_trx.
+    3. Calcular fee en trx_ccy:
+       fee = rate_variable * amount_trx + rate_fixed * fx_to_trx
+    4. Aplicar restricciones (en trx_ccy):
+       fee_final = min(rate_cap_trx, max(rate_min_trx, fee))
 
     Resultado:
 
     - calculated_fee
-      Fee en moneda de regla.
-    - calculated_fee_settlement
-      Fee en moneda settlement.
-    - fx_multiplier
-      Tipo de cambio utilizado para convertir
-      transaction currency -> rule currency.
-    - fx_rule_to_settlement
-        Tipo de cambio utilizado para convertir
-        rule currency -> settlement currency.
-        
+      Fee en moneda de transaccion (DE_49), listo para escribir al ITX.
+    - fx_to_trx
+      Tipo de cambio utilizado: rate_ccy -> trx_ccy.
+
     """
 
     # ============================================================================
@@ -828,9 +822,9 @@ def calculate_mastercard_fee_pyspark(
     
     # ============================================================================
     # STEP 2
-    # Cargar tipos de cambio Mastercard
+    # Cargar tipos de cambio Mastercard: rate_ccy -> trx_ccy
     # ============================================================================
-    ex = (
+    ex_settle = (
         df_exchange_rate
         .filter(F.upper(F.col("brand")) == F.upper(F.lit(brand_fx_eval)))
         .select(
@@ -839,89 +833,75 @@ def calculate_mastercard_fee_pyspark(
             F.col("exchange_value").cast("double").alias("exchange_value_num"),
         )
         .dropDuplicates(["currency_from_u", "currency_to_u"])
-    )   
+        .alias("ex_settle")
+    )
 
-    ex_rule = ex.alias("ex_rule")
-    ex_settle = ex.alias("ex_settle")
-    
     # ============================================================================
     # STEP 3
-    # Obtener tipos de cambio necesarios
-    #
-    # ex_rule:
-    #   Convierte monto de transacción hacia moneda de regla.
-    #   transaction currency -> rule currency
-    #
-    # ex_settle:
-    #   Convierte fee calculado hacia moneda de settlement.
-    #   rule currency -> settlement currency
+    # Join para obtener fx(rate_ccy -> trx_ccy).
+    # Convierte rate_fixed, rate_min, rate_cap a la moneda de transacción (DE_49).
     # ============================================================================
-
-   
     joined = (
         a.alias("a")
         .join(
-            F.broadcast(ex_rule),(
-                F.upper(F.trim(F.col("ex_rule.currency_from_u").cast("string")))== F.col("a.trx_currency_u")
-            )
-            & (
-                F.col("ex_rule.currency_to_u") == F.col("a.rate_currency_u")
-            ),
-            "left",
-        )
-        .join(
             F.broadcast(ex_settle),
-            (
-                F.upper(F.trim(F.col("ex_settle.currency_from_u").cast("string"))) == F.col("a.rate_currency_u")
-            )
-            & (
-                F.col("ex_settle.currency_to_u") == F.col("a.settlement_currency_u")
-            ),
+            (F.col("ex_settle.currency_from_u") == F.col("a.rate_currency_u"))
+            & (F.col("ex_settle.currency_to_u") == F.col("a.trx_currency_u")),
             "left",
         )
     )
 
     # ============================================================================
     # STEP 4
-    # Calcular FX para convertir el monto de la transacción
-    # hacia la moneda de la regla
+    # FX rate_ccy -> trx_ccy.
+    # 1.0 cuando rate_ccy es NONE, vacío o igual a trx_ccy.
     # ============================================================================
-    
-    fx_multiplier = (
+    fx_to_trx = (
         F.when(
             F.col("a.rate_currency_u").isNull()
             | (F.col("a.rate_currency_u") == "")
             | (F.col("a.rate_currency_u") == F.col("a.trx_currency_u")),
             F.lit(1.0),
         )
-        .otherwise(F.col("ex_rule.exchange_value_num"))
+        .otherwise(F.col("ex_settle.exchange_value_num"))
     )
- 
-    amount_converted = F.col("a.amount_transaction_num") * fx_multiplier
 
     # ============================================================================
     # STEP 5
-    # Calcular fee preliminar
+    # Convertir componentes fijos a trx_ccy y calcular fee preliminar.
     #
-    # fee = (amount * variable_rate) + fixed_rate
+    # fee = rate_variable * amount_trx + rate_fixed * fx(rate_ccy -> trx_ccy)
+    #
+    # rate_fixed, rate_min, rate_cap se escalan con fx_to_trx para quedar
+    # en la misma moneda que el monto de la transacción.
     # ============================================================================
-    
+    rate_fixed_trx = F.when(
+        F.col("a.rate_fixed_num").isNull(), F.lit(0.0)
+    ).otherwise(F.col("a.rate_fixed_num") * fx_to_trx)
+
+    rate_min_trx = F.when(
+        F.col("a.rate_min_num").isNull(), F.lit(-1e18)
+    ).otherwise(F.col("a.rate_min_num") * fx_to_trx)
+
+    rate_cap_trx = F.when(
+        F.col("a.rate_cap_num").isNull(), F.lit(1e18)
+    ).otherwise(F.col("a.rate_cap_num") * fx_to_trx)
+
     fee_preliminary = (
-        F.coalesce(F.col("a.rate_variable_num"), F.lit(0.0)) * amount_converted
-        + F.coalesce(F.col("a.rate_fixed_num"), F.lit(0.0))
+        F.coalesce(F.col("a.rate_variable_num"), F.lit(0.0)) * F.col("a.amount_transaction_num")
+        + rate_fixed_trx
     )
 
     # ============================================================================
     # STEP 6
-    # Aplicar restricciones de la regla
+    # Aplicar restricciones de la regla (todas en trx_ccy).
     #
-    # fee_final = min(rate_cap, max(rate_min, fee))
+    # fee_final = min(rate_cap_trx, max(rate_min_trx, fee))
     # ============================================================================
-    
     calculated_fee = (
         F.when(
             F.col("a.rate_variable").isNull(),
-            F.coalesce(F.col("a.rate_fixed_num"), F.lit(0.0)),
+            rate_fixed_trx,
         )
         .when(F.col("a.rate_variable_num").isNull(), F.lit(None).cast("double"))
         .when(F.col("a.amount_transaction_num").isNull(), F.lit(None).cast("double"))
@@ -929,83 +909,36 @@ def calculate_mastercard_fee_pyspark(
             (F.col("a.rate_currency_u").isNotNull())
             & (F.col("a.rate_currency_u") != "")
             & (F.col("a.rate_currency_u") != F.col("a.trx_currency_u"))
-            & F.col("ex_rule.exchange_value_num").isNull(),
+            & F.col("ex_settle.exchange_value_num").isNull(),
             F.lit(None).cast("double"),
         )
         .otherwise(
             F.least(
-                F.coalesce(F.col("a.rate_cap_num"), F.lit(1e18)),
+                rate_cap_trx,
                 F.greatest(
-                    F.coalesce(F.col("a.rate_min_num"), F.lit(-1e18)),
+                    rate_min_trx,
                     fee_preliminary,
                 ),
             )
         )
     )
 
-
-     # ============================================================================
+    # ============================================================================
     # STEP 7
-    # Obtener FX para convertir fee desde
-    # rule currency -> settlement currency
-    # ============================================================================
-    
-    fx_rule_to_settlement = (
-        F.when(
-            F.col("a.settlement_currency_u").isNull()
-            | (F.col("a.settlement_currency_u") == "")
-            | F.col("a.rate_currency_u").isNull()
-            | (F.col("a.rate_currency_u") == "")
-            | (F.col("a.rate_currency_u") == F.col("a.settlement_currency_u")),
-            F.lit(1.0),
-        )
-        .otherwise(F.col("ex_settle.exchange_value_num"))
-    )
-
-    # ============================================================================
-    # STEP 8
-    # Convertir fee final a settlement currency
-    # ============================================================================
- 
-    calculated_fee_settlement = (
-        F.when(calculated_fee.isNull(), F.lit(None).cast("double"))
-        .when(
-            (
-                F.col("a.settlement_currency_u").isNotNull()
-                & (F.col("a.settlement_currency_u") != "")
-                & F.col("a.rate_currency_u").isNotNull()
-                & (F.col("a.rate_currency_u") != "")
-                & (F.col("a.rate_currency_u") != F.col("a.settlement_currency_u"))
-                & F.col("ex_settle.exchange_value_num").isNull()
-            ),
-            F.lit(None).cast("double"),
-        )
-        .otherwise(calculated_fee * fx_rule_to_settlement)
-    )
-
-    # ============================================================================
-    # STEP 9
     # Construcción del resultado final
     # ============================================================================
-    
     base_cols = [F.col(f"a.{c}").alias(c) for c in df_assign.columns]
- 
+
     return (
         joined
-        .withColumn("fx_multiplier", fx_multiplier)
-        .withColumn("amount_converted", amount_converted)
+        .withColumn("fx_to_trx", fx_to_trx)
         .withColumn("fee_preliminary", fee_preliminary)
         .withColumn("calculated_fee", calculated_fee)
-        .withColumn("fx_rule_to_settlement", fx_rule_to_settlement)
-        .withColumn("calculated_fee_settlement", calculated_fee_settlement)
         .select(
             *base_cols,
-            "fx_multiplier",
-            "amount_converted",
+            "fx_to_trx",
             "fee_preliminary",
             "calculated_fee",
-            "fx_rule_to_settlement",
-            "calculated_fee_settlement",
         )
     )
     
