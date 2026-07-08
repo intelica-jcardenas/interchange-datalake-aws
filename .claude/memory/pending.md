@@ -29,7 +29,9 @@ Checklist vivo — solo tareas activas. Lo resuelto se documenta en `decisions.m
 
 `--mode generate` **validado end-to-end** (2026-07-08): auditoría campo por campo completa contra el legacy (`getquery.py`/`managment.py`), residuales explicados y aceptados (VISA: INNER JOIN de ARDEF en legacy que nuestro LEFT JOIN no replica, +0.03%; MC: swap DE_4/DE_5 en transacciones cross-currency, decisión de mantenerlo — ver `decisions.md`). Historia completa de diseño, bugs encontrados/corregidos y validaciones en memoria de usuario `scheme_fee_job_design.md`.
 
-- [ ] **Probar el ciclo completo `--mode read`** con un CSV de vuelta simulado (rellenar `txn_sfc`/`est_sch_fee_amt` a mano) para validar el join por `app_id` y la propagación al detalle.
+`--mode read` — primera corrida real (2026-07-08, SBSA/202601, CSV de vuelta simulado) encontró un **bug real**: el join final `detail_df.join(cost_by_group, on=GROUP_DIMS, how="left")` en `update_report_and_propagate()` usaba igualdad estándar de Spark (`NULL == NULL` → false), dejando 3.2% de las filas de detalle (3,895,101 de 121,072,180) sin costo propagado — cualquier grupo con NULL en alguna de las 20 `GROUP_DIMS` (mayormente `business_transaction_type_id`) nunca matcheaba de vuelta, pese a que sí se agrupó bien en `aggregate_to_report()`. Fix aplicado (join con `eqNullSafe` columna por columna) y **desplegado al script real en S3** — detalle completo en memoria de usuario `scheme_fee_job_design.md`.
+
+- [ ] **Re-ejecutar `--mode read`** (SBSA/202601, mismo CSV simulado) con el fix desplegado y confirmar que los grupos que antes daban NULL ahora propagan el costo correctamente — recién ahí dar `--mode read` por completamente validado.
 
 ---
 

@@ -1581,10 +1581,25 @@ def update_report_and_propagate():
         "transaction_scheme_fee_cost", "unitary_scheme_fee_cost",
         "estimated_scheme_fee_cost", "unitary_estimated_scheme_fee_cost",
     )
-    final_detail_df = detail_df.drop(
+    # join null-safe: un join estándar (on=GROUP_DIMS) trata NULL == NULL como
+    # false (semántica SQL), a diferencia del groupBy de aggregate_to_report()
+    # que sí agrupa nulls sin problema — cualquier transacción cuyo grupo
+    # tenga un NULL en alguna dimensión (product_id, jurisdiction,
+    # business_transaction_type_id, etc.) nunca matchearía y se quedaría sin
+    # costo propagado en el detalle final.
+    d = detail_df.drop(
         "transaction_scheme_fee_cost", "unitary_scheme_fee_cost",
         "estimated_scheme_fee_cost", "unitary_estimated_scheme_fee_cost",
-    ).join(cost_by_group, on=GROUP_DIMS, how="left")
+    ).alias("d")
+    r = cost_by_group.alias("r")
+    join_cond = [F.col(f"d.{c}").eqNullSafe(F.col(f"r.{c}")) for c in GROUP_DIMS]
+    final_detail_df = d.join(r, join_cond, how="left").select(
+        "d.*",
+        F.col("r.transaction_scheme_fee_cost").alias("transaction_scheme_fee_cost"),
+        F.col("r.unitary_scheme_fee_cost").alias("unitary_scheme_fee_cost"),
+        F.col("r.estimated_scheme_fee_cost").alias("estimated_scheme_fee_cost"),
+        F.col("r.unitary_estimated_scheme_fee_cost").alias("unitary_estimated_scheme_fee_cost"),
+    )
 
     final_rows = final_detail_df.count()
     if final_rows != summary["number_of_inserted_rows"]:
