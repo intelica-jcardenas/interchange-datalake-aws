@@ -23,7 +23,7 @@ $env:AWS_PROFILE = "itx-dev"   # opcional, evita pasar --profile en cada comando
 | `reprocessing/` | Scripts de reproceso masivo (`reprocess_vi_*.py`) + sus logs `.jsonl` |
 | `debug_scripts/` | Scripts de debug/validación reutilizables (escanear schemas, comparar outputs) |
 | `reference_data/` | Parquets/CSVs de tablas de referencia de `s3-reference` para inspección local |
-| `reports/` | Outputs de `glue-test-1` y comparativos contra legacy |
+| `reports/` | Outputs de `glue-get-transaction` y comparativos contra legacy |
 | `payloads/` | Payloads de Lambda para reprocesos manuales (mc-store, vi-store) |
 
 Cuando un gotcha pasa a **RESUELTO Y VALIDADO**, borrar los archivos de `tst_files/` que sirvieron solo para esa investigación. Mantener: scripts genéricos reutilizables (`generate_glue_args.py`, `scan_nulltype_columns.py`, `compare_get_transaction.py`) y datos de referencia activos (`reference_data/`).
@@ -82,8 +82,11 @@ aws glue get-job-run `
 | vi-interchange | `itl-0004-itx-dev-intchg-02-glue-vi-interchange` |
 | mc-calculate | `itl-0004-itx-dev-intchg-02-glue-mc-calculate` |
 | mc-interchange | `itl-0004-itx-dev-intchg-02-glue-mc-interchange` |
-| reporting | `itl-0004-itx-dev-intchg-02-glue-test-1` |
-| vi-data-quality | `itl-0004-itx-dev-intchg-02-glue-test-3` |
+| reporting | `itl-0004-itx-dev-intchg-02-glue-get-transaction` |
+| vi-data-quality | `itl-0004-itx-dev-intchg-02-glue-vi-data-quality` |
+| mc-data-quality | `itl-0004-itx-dev-intchg-02-glue-mc-data-quality` |
+| exchange-rates | `itl-0004-itx-dev-intchg-02-glue-exchange-rates` |
+| scheme-fee | `itl-0004-itx-dev-intchg-02-glue-scheme-fee` |
 
 ---
 
@@ -107,7 +110,7 @@ Rutas S3 reales por job:
 | vi-interchange | `glue/scripts/visa/interchange.py` |
 | mc-calculate | `glue/scripts/mastercard/calculate.py` |
 | mc-interchange | `glue/scripts/mastercard/interchange.py` |
-| reporting (glue-test-1) | `glue/scripts/report/get_transaction.py` |
+| reporting (glue-get-transaction) | `glue/scripts/report/get_transaction.py` |
 
 Todos bajo `s3://itl-0004-itx-dev-intchg-02-s3-reference/`.
 

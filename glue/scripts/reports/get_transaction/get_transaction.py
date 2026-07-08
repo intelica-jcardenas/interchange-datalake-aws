@@ -9,7 +9,7 @@ Fuentes de datos
 ----------------
   S3 operational  : Visa BASEII, Visa SMS, MC IPM_1240, MC IPM_1442
   S3 reference    : country/data.parquet, currency/data.parquet,
-                    exchange_rate/rate_date=*/, visa_bin_products/data.parquet,
+                    exchange-rates-glue/brand=*/exchange_date=*/, visa_bin_products/data.parquet,
                     mastercard_bin_products/data.parquet
   DynamoDB        : tabla client (report_currency_code, duplicate_on_us_flag_*)
 
@@ -248,14 +248,17 @@ def load_mastercard_bin_products() -> DataFrame:
 def load_exchange_rates(start_date: str, end_date: str, brand_path: str) -> DataFrame:
     """
     Carga los tipos de cambio desde S3 reference para el rango de fechas
-    [start_date, end_date]. Path: exchange_rate/rate_date=YYYY-MM-DD/
+    [start_date, end_date]. Path: exchange-rates-glue/brand={brand}/exchange_date=YYYY-MM-DD/
 
-    La tabla cubre ambas marcas en una sola ubicación, distinguidas por la
-    columna `brand` ('VISA' / 'MasterCard'). La partición rate_date es
-    añadida automáticamente por Spark.
+    Fuente: exchange-rates-glue (enriquecido con codigos numericos por
+    glue-exchange-rates, cobertura viva y actualizada) — reemplaza a
+    exchange_rate/, fuente manual congelada al 2026-04-30. Particionada por
+    brand + exchange_date (a diferencia de exchange_rate/, que solo
+    particionaba por rate_date y traía ambas marcas en una columna).
     Columnas resultantes: exchange_date, from_currency, to_currency, fx_rate
     """
-    path = f"s3://{BUCKET_REF}/exchange_rate/"
+    brand_partition = brand_path.capitalize()
+    path = f"s3://{BUCKET_REF}/exchange-rates-glue/brand={brand_partition}/"
     try:
         df = spark.read.parquet(path)
     except Exception as e:
@@ -265,11 +268,11 @@ def load_exchange_rates(start_date: str, end_date: str, brand_path: str) -> Data
             schema="exchange_date string, from_currency string, to_currency string, fx_rate double",
         )
 
-    df = df.filter(F.upper(F.col("brand")) == brand_path.upper()).select(
-        F.col("rate_date").alias("exchange_date"),
-        F.col("currency_from").alias("from_currency"),
-        F.col("currency_to").alias("to_currency"),
-        F.col("exchange_value").alias("fx_rate"),
+    df = df.select(
+        F.col("exchange_date"),
+        F.col("from_currency"),
+        F.col("to_currency"),
+        F.col("fx_rate"),
     )
 
     return df.filter(F.col("exchange_date").between(start_date, end_date))

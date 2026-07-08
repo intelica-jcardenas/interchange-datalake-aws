@@ -36,10 +36,10 @@ $AllJobs = [ordered]@{
     "mc-calculate"   = @{ Group="mc";      Dir="glue\scripts\mastercard\calculate" }
     "mc-interchange" = @{ Group="mc";      Dir="glue\scripts\mastercard\interchange" }
     # Reportes y Data Quality
-    "test-1"         = @{ Group="reports"; Dir="glue\scripts\reports\get_transaction" }
-    "test-2"         = @{ Group="reports"; Dir="glue\scripts\reports\exchange_rates" }
-    "test-3"         = @{ Group="reports"; Dir="glue\scripts\reports\vi_data_quality" }
-    "test-4"         = @{ Group="reports"; Dir="glue\scripts\reports\mc_data_quality" }
+    "get-transaction" = @{ Group="reports"; Dir="glue\scripts\reports\get_transaction" }
+    "exchange-rates"   = @{ Group="reports"; Dir="glue\scripts\reports\exchange_rates" }
+    "vi-data-quality"  = @{ Group="reports"; Dir="glue\scripts\reports\vi_data_quality" }
+    "mc-data-quality"  = @{ Group="reports"; Dir="glue\scripts\reports\mc_data_quality" }
     "scheme-fee"     = @{ Group="reports"; Dir="glue\scripts\reports\scheme_fee" }
 }
 

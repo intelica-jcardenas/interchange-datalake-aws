@@ -88,13 +88,32 @@ def load_visa_rules(reference_bucket: str, file_date: date) -> pd.DataFrame:
 
 
 def load_exchange_rates(reference_bucket: str, file_date: date, brand: str) -> pd.DataFrame:
+    """
+    Fuente: exchange-rates-glue/brand={brand}/exchange_date={date}/ (enriquecido
+    con codigos numericos por glue-exchange-rates, cobertura viva y actualizada
+    — reemplaza a exchange_rate/, fuente manual congelada al 2026-04-30).
+    Columnas renombradas a los nombres legacy (currency_from/currency_to/
+    exchange_value) para no tocar el resto del script.
+    """
     date_str = file_date.strftime("%Y-%m-%d")
-    path = f"s3://{reference_bucket}/exchange_rate/"
-    log_info(f"Loading exchange_rates from: {path} for date: {date_str}")
+    brand_partition = brand.capitalize()
+    path = f"s3://{reference_bucket}/exchange-rates-glue/brand={brand_partition}/exchange_date={date_str}/"
+    log_info(f"Loading exchange_rates from: {path}")
 
-    df_spark = spark.read.parquet(path) \
-        .filter(F.col("rate_date") == date_str) \
-        .filter(F.upper(F.col("brand")) == brand.upper())
+    try:
+        df_spark = spark.read.parquet(path)
+    except Exception as ex:
+        log_info(f"  Partition not found ({ex}). Fallback: reading full exchange-rates-glue and filtering.")
+        base_path = f"s3://{reference_bucket}/exchange-rates-glue/"
+        df_spark = spark.read.parquet(base_path) \
+            .filter(F.col("brand") == brand_partition) \
+            .filter(F.col("exchange_date") == date_str)
+
+    df_spark = df_spark.select(
+        F.col("from_currency").alias("currency_from"),
+        F.col("to_currency").alias("currency_to"),
+        F.col("fx_rate").alias("exchange_value"),
+    )
 
     df = df_spark.toPandas()
 

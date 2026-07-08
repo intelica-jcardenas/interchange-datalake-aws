@@ -59,7 +59,7 @@ Fuentes de datos
 ----------------
   S3 operational  : Visa baseii_drafts, MC IPM_1240, MC IPM_1442
   S3 reference    : country/data.parquet, currency/data.parquet,
-                    exchange_rate/rate_date=*/, visa_bin_products/data.parquet,
+                    exchange-rates-glue/brand=*/exchange_date=*/, visa_bin_products/data.parquet,
                     mastercard_bin_products/data.parquet
                     + 2 tablas NUEVAS que no existen aún en s3-reference
                     (ver REFERENCIA NUEVA REQUERIDA más abajo)
@@ -93,20 +93,16 @@ load_size_ticket() y load_scheme_fee_bin_products() más abajo):
      cols: product_code (string), range_program_id (int), legacy_product_id (int),
            brand (string, 'VISA'/'MC' — OJO, distinto de size_ticket que usa 'MasterCard')
      Equivalente legacy: operational.m_scheme_fee_bin_products
-     IMPORTANTE (corregido 2026-07-02): NO reusar visa_bin_products/
-     mastercard_bin_products (las que ya usa get_transaction.py) para esto —
-     se verificó que están desalineadas de m_scheme_fee_bin_products (2
-     product_code de VISA y 17 de Mastercard con range_program_id distinto,
-     más cobertura de filas distinta). El legacy de scheme fee siempre usó
-     m_scheme_fee_bin_products específicamente.
+     IMPORTANTE: NO reusar visa_bin_products/mastercard_bin_products (las que
+     ya usa get_transaction.py) para esto — están desalineadas de
+     m_scheme_fee_bin_products (2 product_code de VISA y 17 de Mastercard con
+     range_program_id distinto, más cobertura de filas distinta). El legacy
+     de scheme fee siempre usó m_scheme_fee_bin_products específicamente.
+
+Requiere además el argumento de job --dynamodb_table_file_control (tabla
+file_control, usada por switch_code — ver get_local_switch_content_hashes).
 
 SIMPLIFICACIONES CONOCIDAS respecto al legacy (documentadas, no bloqueantes):
-  - switch_code: siempre 0. El legacy sólo lo resolvía para switch_flag=true
-    (SBSA) cruzando control.t_control_file por patrón de nombre de archivo
-    ('Local_VISA_%'/'Local_MasterCard%') contra operational.m_local_switch —
-    ese metadato (nombre de archivo original + flag por cliente) no existe en
-    esta arquitectura. Bajo impacto esperado (switch_code es sólo 1 de 20
-    dimensiones de agrupación, no afecta el monto).
   - Visa SMS: implementado pero deshabilitado por defecto (ENABLE_SMS=False),
     mismo estado "pendiente validación end-to-end" que transform_visa_sms en
     glue-vi-mc-reporting.
@@ -131,6 +127,7 @@ Parámetros del job
 """
 
 import sys
+import re
 import json
 from datetime import datetime
 from calendar import monthrange
@@ -192,6 +189,7 @@ args = getResolvedOptions(
         "reference_bucket",
         "analytics_bucket",
         "dynamodb_table_client",
+        "dynamodb_table_file_control",
         "force",
         "in_file_key",
     ],
@@ -205,10 +203,11 @@ OPERATIONAL_BUCKET = args["operational_bucket"]
 BUCKET_REF = args["reference_bucket"]
 ANALYTICS_BUCKET = args["analytics_bucket"]
 DDB_CLIENT_TABLE = args["dynamodb_table_client"]
+DDB_FILE_CONTROL_TABLE = args["dynamodb_table_file_control"]
 FORCE = args["force"].strip().lower() == "true"
 IN_FILE_KEY = args["in_file_key"].strip()
 
-ENABLE_SMS = False  # ver docstring — pendiente de validación, igual que get_transaction.py
+ENABLE_SMS = True
 
 s3 = boto3.client("s3")
 
@@ -249,7 +248,7 @@ MC_TRAVEL_MCC_LIST = [4511, 4411, 4131, 4582, 4722, 5962, 6513, 7012, 7032,
 # get_insert_into_report_table del legacy). Orden preservado por legibilidad,
 # no es funcionalmente relevante para el group by.
 GROUP_DIMS = [
-    "report_currency", "customer_code", "bank_country", "business_mode_id",
+    "report_currency", "app_customer_code", "bank_country", "business_mode_id",
     "transaction_brand", "size_ticket", "product_id", "range_program_id",
     "account_funding_source", "business_transaction_type_id", "jurisdiction",
     "reversal_indicator", "currency_local_indicator", "motoec_indicator",
@@ -264,15 +263,14 @@ GROUP_DIMS = [
 
 
 def get_client_config(client_code: str) -> dict:
-    """Lee configuración del cliente desde DynamoDB.
+    """
+    Lee configuración del cliente desde DynamoDB.
 
-    Nota: a diferencia de get_client_config() en get_transaction.py (que hace
+    A diferencia de get_client_config() en get_transaction.py (que hace
     bool(item.get(...)) — con boto3.resource los valores llegan como string,
     y bool("FALSE") es True en Python, lo cual castea cualquier flag no vacío
-    a True sin importar su contenido real. Acá se parsea explícitamente
-    comparando contra "TRUE" para evitar ese bug. Ver memoria de usuario
-    scheme_fee_job_design.md para más detalle — no se tocó get_transaction.py
-    porque está fuera del alcance de esta tarea.
+    a True sin importar su contenido real), acá se parsea explícitamente
+    comparando contra "TRUE".
     """
     dynamodb = boto3.resource("dynamodb")
     table = dynamodb.Table(DDB_CLIENT_TABLE)
@@ -291,10 +289,114 @@ def get_client_config(client_code: str) -> dict:
     }
 
 
+_LOCAL_FILE_PATTERN = re.compile(r"local_visa|local_mastercard", re.IGNORECASE)
+
+
+def get_local_switch_content_hashes(client_code: str) -> set:
+    """
+    Replica update_switch_codes() del legacy (getquery.py lineas 1198-1244):
+    switch_code solo se aplica a archivos cuyo process_file_name matcheaba
+    'Local_VISA_%'/'Local_MasterCard_%' -- ese dato (nombre original del
+    archivo) NO existe en operational, solo en DynamoDB file_control
+    (campo landing_file_name).
+
+    Se resuelve con un scan filtrado por client_id (barato, el total de la
+    tabla es ~600 items) en vez de una consulta por fila. Devuelve el set de
+    content_hash (NO file_id) de los archivos que matchean el patron -- el
+    join debe ser por content_hash porque el nombre del Parquet operational
+    (lo que read_operational() usa) es el content_hash, y content_hash/file_id
+    pueden diferir tras un reproceso (ver gotcha en gotchas.md).
+    """
+    dynamodb = boto3.resource("dynamodb")
+    table = dynamodb.Table(DDB_FILE_CONTROL_TABLE)
+
+    hashes = set()
+    scan_kwargs = {
+        "FilterExpression": "client_id = :c",
+        "ExpressionAttributeValues": {":c": client_code},
+        "ProjectionExpression": "content_hash, landing_file_name",
+    }
+    while True:
+        resp = table.scan(**scan_kwargs)
+        for item in resp.get("Items", []):
+            name = item.get("landing_file_name") or ""
+            content_hash = item.get("content_hash")
+            if content_hash and _LOCAL_FILE_PATTERN.search(name):
+                hashes.add(content_hash)
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    log_info(f"[get_local_switch_content_hashes] {client_code}: {len(hashes)} archivos 'Local_' encontrados")
+    return hashes
+
+
+def load_local_switch() -> DataFrame:
+    """
+    NUEVA tabla de referencia -- equivalente legacy operational.m_local_switch.
+    Legacy: update_switch_codes() (getquery.py linea 1235), join por
+    brand_code = transaction_brand AND customer_code = app_customer_code.
+
+    cols esperadas: customer_code (str), brand_code (str, 'VISA'/'MasterCard'
+    -- coincide con transaction_brand), switch_id (int), switch_code (str),
+    switch_desc (str).
+    """
+    path = f"s3://{BUCKET_REF}/local_switch/data.parquet"
+    try:
+        return spark.read.parquet(path).select(
+            "customer_code",
+            "brand_code",
+            F.col("switch_id").cast(IntegerType()),
+        )
+    except Exception as e:
+        log_error(f"[load_local_switch] No encontrada en {path}: {e} — switch_code saldra siempre en 0")
+        return spark.createDataFrame([], schema="customer_code string, brand_code string, switch_id int")
+
+
+def _resolve_switch_code(
+    df: DataFrame, local_switch_df: DataFrame, local_hashes: set, customer_code: str, brand_literal: str
+) -> DataFrame:
+    """
+    Aplica switch_code = switch_id solo a filas cuyo content_hash está en
+    local_hashes (archivos 'Local_VISA_'/'Local_MasterCard_', resuelto via
+    get_local_switch_content_hashes) Y cuyo (customer_code, brand) matchea en
+    local_switch_df. local_switch es una tabla chica (2 filas hoy, solo
+    SBSA) -- se resuelve el switch_id de (customer_code, brand_literal) una
+    sola vez con collect(), en vez de un join Spark completo.
+    """
+    switch_id = 0
+    row = (
+        local_switch_df.filter(
+            (F.col("customer_code") == customer_code) & (F.col("brand_code") == brand_literal)
+        )
+        .select("switch_id")
+        .limit(1)
+        .collect()
+    )
+    if row:
+        switch_id = row[0]["switch_id"] or 0
+
+    is_local = F.col("content_hash").isin(*local_hashes) if local_hashes else F.lit(False)
+    return df.withColumn("switch_code", F.when(is_local, F.lit(switch_id)).otherwise(F.lit(0)))
+
+
 def read_operational(
     client_id: str, brand: str, data_type: str, start_date: str, end_date: str
 ) -> DataFrame | None:
-    """Copia literal de read_operational() en get_transaction.py."""
+    """
+    Basado en read_operational() de get_transaction.py, con una corrección:
+    esa versión derivaba una columna "file_id" con
+    regexp_extract(input_file_name(), ...) — pero el nombre del Parquet
+    operational es literalmente el content_hash (ver lmbd-vi-store/
+    lmbd-mc-store, escriben "{content_hash}.parquet"), así que esa columna
+    quedaba con el MISMO valor que la columna real "content_hash" ya presente
+    en el Parquet, bajo un nombre ambiguo que sugiere ser el file_id de
+    DynamoDB (que puede ser distinto tras un reproceso — ver gotcha
+    file_id-vs-content_hash en gotchas.md). Acá se usa directamente la
+    columna "content_hash" original, sin derivar un duplicado — es la llave
+    que se necesitará más adelante para cruzar contra get_transaction.py y
+    devolver el costo de scheme fee calculado a nivel transacción.
+    """
     base_path = f"s3://{OPERATIONAL_BUCKET}/{client_id}/{brand}/{data_type}/"
     try:
         df = spark.read.parquet(base_path)
@@ -307,12 +409,7 @@ def read_operational(
         log_info(f"[read_operational] No rows for {client_id}/{brand}/{data_type} in [{start_date}, {end_date}]")
         return None
 
-    df = (
-        df.withColumn("_path", F.input_file_name())
-        .withColumn("file_id", F.regexp_extract("_path", r"/([^/]+)\.parquet$", 1))
-        .withColumn("customer_code", F.lit(client_id))
-        .drop("_path")
-    )
+    df = df.withColumn("customer_code", F.lit(client_id))
     log_info(f"[read_operational] Loaded {client_id}/{brand}/{data_type}: {df.count()} rows")
     return df
 
@@ -336,13 +433,10 @@ def load_scheme_fee_bin_products() -> DataFrame:
 
     NO reusar visa_bin_products/mastercard_bin_products (las que usa
     get_transaction.py): aunque mapean el mismo product_code -> range_program_id,
-    están desalineadas de m_scheme_fee_bin_products — verificado 2026-07-02
-    comparando los 3 CSV/Parquet reales: 2 product_code de VISA y 17 de
-    Mastercard tienen range_program_id DISTINTO entre ambas fuentes, y
-    mastercard_bin_products tiene 316 filas vs 224 de la versión scheme-fee
-    (cobertura distinta). El legacy de scheme fee siempre usó
-    m_scheme_fee_bin_products, nunca las otras dos tablas — con esas se
-    hubiera calculado prg_id/prd_id incorrecto para esos ~19 product_code.
+    están desalineadas de m_scheme_fee_bin_products (2 product_code de VISA y
+    17 de Mastercard con range_program_id distinto entre ambas fuentes, y
+    cobertura de filas distinta). El legacy de scheme fee siempre usó
+    m_scheme_fee_bin_products, nunca las otras dos tablas.
 
     cols esperadas: product_code (str), range_program_id (int),
     legacy_product_id (int), brand (str — valores reales 'VISA'/'MC', NO
@@ -393,11 +487,58 @@ def load_bin_funding_source() -> DataFrame:
         )
 
 
+def load_visa_business_transaction_type() -> DataFrame:
+    """
+    NUEVA tabla de referencia -- equivalente legacy operational.m_visa_business_transaction_type.
+    Legacy: left join ... on cast(business_transaction_type_id as integer) = cf.business_transaction_type
+    (getquery.py get_issuers_visa/get_acquirer_visa/get_sms_visa, lineas 354/456/566/659/762).
+
+    cols esperadas: business_transaction_type_id (int, PK -- mismo valor que
+    cf.business_transaction_type calculado en calc_business_transaction_type_draft/_sms,
+    glue-vi-calculate), transaction_type_id (string 'PUR'/'CRD'/'CSH'/'UNK').
+
+    IMPORTANTE: no asumir el mapeo por el significado aparente del código (ej.
+    "códigos de cash -> CSH") -- en la tabla real, 19/25 son CRD (no CSH) y
+    255 es UNK (no un sentinel genérico de "sin match", aunque el efecto de
+    exclusión es el mismo). Siempre usar el join, nunca un case hardcodeado.
+    """
+    path = f"s3://{BUCKET_REF}/visa_business_transaction_type/data.parquet"
+    try:
+        return spark.read.parquet(path).select(
+            F.col("business_transaction_type_id").cast(IntegerType()).alias("_btt_id"),
+            F.col("transaction_type_id"),
+        )
+    except Exception as e:
+        log_error(f"[load_visa_business_transaction_type] No encontrada en {path}: {e} — business_transaction_type_id saldra null (excluido por el filtro PUR/CRD/CSH)")
+        return spark.createDataFrame([], schema="_btt_id int, transaction_type_id string")
+
+
+def load_mastercard_business_transaction_type() -> DataFrame:
+    """
+    NUEVA tabla de referencia -- equivalente legacy operational.m_mastercard_business_transaction_type.
+    Legacy: left join ... on business_transaction_type_id = left(processing_code,2)
+    (getquery.py get_transactions_mastercard/get_on_us_mastercard, lineas 879/999).
+    Sin filtro WHERE asociado (a diferencia de Visa) -- confirmado en ambas
+    queries legacy, solo filtran por app_message_type in ('1240','1442').
+
+    cols esperadas: business_transaction_type_id (string, 2 chars),
+    transaction_type_id (string 'PUR'/'CRD'/'CSH'/'UNK').
+    """
+    path = f"s3://{BUCKET_REF}/mastercard_business_transaction_type/data.parquet"
+    try:
+        return spark.read.parquet(path).select(
+            F.col("business_transaction_type_id").alias("_btt_id"),
+            F.col("transaction_type_id"),
+        )
+    except Exception as e:
+        log_error(f"[load_mastercard_business_transaction_type] No encontrada en {path}: {e} — business_transaction_type_id saldra null")
+        return spark.createDataFrame([], schema="_btt_id string, transaction_type_id string")
+
+
 def load_size_ticket() -> DataFrame:
     """
-    NUEVA tabla de referencia (ver docstring del módulo). Columna real del
-    id de bucket es `app_id` (no `size_ticket_id` — corregido 2026-07-02 tras
-    revisar el CSV real que subió el usuario), acá se renombra a
+    NUEVA tabla de referencia (ver docstring del módulo). Columna real del id
+    de bucket es `app_id` (no `size_ticket_id`), acá se renombra a
     size_ticket_id para el resto del script. brand real: 'MasterCard'/'VISA'
     (coincide con transaction_brand, a diferencia de scheme_fee_bin_products
     que usa 'MC'/'VISA').
@@ -421,8 +562,14 @@ def load_size_ticket() -> DataFrame:
 
 def load_exchange_rates(start_date: str, end_date: str) -> DataFrame:
     """Copia de load_exchange_rates() en get_transaction.py, sin filtrar por brand
-    (acá se filtra por brand en el momento de usarla, según haga falta)."""
-    path = f"s3://{BUCKET_REF}/exchange_rate/"
+    (acá se filtra por brand en el momento de usarla, según haga falta).
+
+    Fuente: exchange-rates-glue (enriquecido con codigos numericos por
+    glue-exchange-rates, cobertura viva y actualizada) — reemplaza a
+    exchange_rate/, fuente manual congelada al 2026-04-30. Particionada por
+    brand + exchange_date; se lee al nivel base para que Spark descubra
+    ambas columnas de particion (brand='Visa'/'Mastercard')."""
+    path = f"s3://{BUCKET_REF}/exchange-rates-glue/"
     try:
         df = spark.read.parquet(path)
     except Exception as e:
@@ -431,11 +578,11 @@ def load_exchange_rates(start_date: str, end_date: str) -> DataFrame:
             [], schema="exchange_date string, brand string, from_currency string, to_currency string, fx_rate double"
         )
     df = df.select(
-        F.col("rate_date").alias("exchange_date"),
+        F.col("exchange_date"),
         F.col("brand"),
-        F.col("currency_from").alias("from_currency"),
-        F.col("currency_to").alias("to_currency"),
-        F.col("exchange_value").alias("fx_rate"),
+        F.col("from_currency"),
+        F.col("to_currency"),
+        F.col("fx_rate"),
     )
     return df.filter(F.col("exchange_date").between(start_date, end_date))
 
@@ -510,11 +657,30 @@ def transform_visa_baseii_scheme_fee(
     xrate_df: DataFrame,
     terminal_counts_df: DataFrame,
     scheme_fee_bin_products_df: DataFrame,
+    visa_btt_df: DataFrame,
+    local_switch_df: DataFrame,
+    local_hashes: set,
 ) -> DataFrame:
     """
     Equivalente a get_issuers_visa() + get_acquirer_visa() del legacy (nuestro
     operational ya trae ISS+ACQ unificados en un solo Parquet, distinguidos
     por business_mode — no hace falta leerlos por separado).
+
+    Notas de fidelidad al legacy:
+    - business_transaction_type_id sale de un JOIN contra
+      m_visa_business_transaction_type (visa_btt_df) usando el entero
+      business_transaction_type calculado en glue-vi-calculate — no de un
+      case sobre draft_code, que perdería la nuance de
+      MCC/usage_code/special_condition_indicator que esa tabla codifica. El
+      filtro posterior exige además que draft_code esté en
+      (05,06,07,25,26,27), excluyendo códigos de reversal
+      (15/16/17/35/36/37) aunque compartan la misma clasificación.
+    - settlement_amount no existe como columna real en el operational BASEII
+      (solo existe para VSS) — se deja NULL explícito, campo no usado aguas
+      abajo.
+    - business_mode_id se normaliza a mayúscula porque calc_business_mode usa
+      minúscula en Mastercard y mayúscula en Visa (inconsistencia real entre
+      los dos calculate.py).
     """
     report_currency = client_cfg["report_currency"]
     local_currency_code = client_cfg["local_currency_code"]
@@ -527,13 +693,16 @@ def transform_visa_baseii_scheme_fee(
         .otherwise(F.lit(None).cast(StringType())),
     )
 
-    df = df.withColumn(
-        "business_transaction_type_id",
-        F.when(F.col("draft_code").isin("05", "25"), F.lit("PUR"))
-        .when(F.col("draft_code").isin("06", "26"), F.lit("CRD"))
-        .when(F.col("draft_code").isin("07", "27"), F.lit("CSH"))
-        .otherwise(F.lit("OTH")),
+    df = df.join(
+        visa_btt_df, df["business_transaction_type"] == visa_btt_df["_btt_id"], how="left"
+    ).drop("_btt_id").withColumnRenamed("transaction_type_id", "business_transaction_type_id")
+
+    df = df.filter(
+        F.col("business_transaction_type_id").isin("PUR", "CRD", "CSH")
+        & F.col("draft_code").isin("05", "06", "07", "25", "26", "27")
     )
+
+    df = _resolve_switch_code(df, local_switch_df, local_hashes, CLIENT_CODE, "VISA")
 
     df = df.withColumn(
         "motoec_indicator",
@@ -594,12 +763,12 @@ def transform_visa_baseii_scheme_fee(
     df = df.join(product_ref, df["product_id"] == product_ref["_pc"], how="left").drop("_pc")
 
     df = df.select(
-        F.col("customer_code"),
-        F.col("file_id"),
-        F.col("record").cast(LongType()).alias("source_row_id"),
-        F.lit("VISA").alias("transaction_source"),
-        F.col("file_type"),
-        F.col("date"),
+        F.col("file_type").alias("app_type_file"),
+        F.col("customer_code").alias("app_customer_code"),
+        F.col("content_hash").alias("app_hash_file"),
+        F.col("record").cast(LongType()).alias("app_id"),
+        F.lit("VISA").alias("table_description"),
+        F.col("date").alias("app_processing_date"),
         F.col("account_number").cast(StringType()).alias("account_number"),
         F.col("card_acceptor_id").cast(StringType()),
         F.col("account_funding_source"),
@@ -612,27 +781,21 @@ def transform_visa_baseii_scheme_fee(
         F.col("reversal_indicator").cast(IntegerType()),
         F.col("currency_local_indicator").cast(IntegerType()),
         F.col("motoec_indicator").cast(IntegerType()),
-        # Visa BASEII no tiene un monto de liquidacion materializado (a
-        # diferencia de MC, que calcula settlement_report_amount en
-        # calculate.py) -- "settlement_amount" no existe como columna real
-        # en el operational (confirmado 2026-07-03, AnalysisException en
-        # SBSA). Campo no usado aguas abajo (no esta en GROUP_DIMS ni en el
-        # CSV final, igual que en el legacy), se deja en null explicito.
         F.lit(None).cast(DoubleType()).alias("settlement_amount"),
-        F.col("settlement_report_currency_code").alias("settlement_currency"),
         F.lit("VISA").alias("transaction_brand"),
         F.col("merchant_country_code"),
-        F.lit(0).alias("switch_code"),
+        F.col("switch_code").cast(IntegerType()),
         F.col("travel_program_indicator").cast(IntegerType()),
         F.col("greece_micropayment_indicator").cast(IntegerType()),
         F.lit(0).alias("key_entered_tpe"),
+        F.col("settlement_report_currency_code").alias("settlement_currency"),
         F.lit(customer_country).alias("bank_country"),
-        F.upper(F.col("business_mode")).alias("business_mode_id"),  # normalizado: MC usa minuscula, Visa mayuscula (calculate.py de cada marca) — bug encontrado 2026-07-03 en el comparativo SBSA
+        F.upper(F.col("business_mode")).alias("business_mode_id"),
+        F.lit(0).cast(IntegerType()).alias("size_ticket"),
         F.col("purchase_date").cast(DateType()).alias("transaction_purchase_date"),
         F.col("exchange_rate").cast(DoubleType()),
         F.col("report_amount").cast(DoubleType()),
         F.lit(report_currency).alias("report_currency"),
-        F.lit(0).cast(IntegerType()).alias("size_ticket"),
     )
     return _apply_duplicate_on_us(df) if client_cfg["dup_on_us_visa"] else df
 
@@ -644,15 +807,59 @@ def transform_visa_baseii_scheme_fee(
 
 def transform_visa_sms_scheme_fee(
     df: DataFrame, client_cfg: dict, xrate_df: DataFrame, scheme_fee_bin_products_df: DataFrame,
+    visa_btt_df: DataFrame, local_switch_df: DataFrame, local_hashes: set, currency_df: DataFrame,
 ) -> DataFrame:
     """
-    Equivalente a get_sms_visa() del legacy. # VERIFY — mismo estado pendiente
-    de validación que transform_visa_sms en get_transaction.py. Nombres de
-    columna raw (product_id_sms, pan_extended_country_code,
+    Equivalente a get_sms_visa() del legacy. Estado pendiente de validación
+    (mismo que transform_visa_sms en get_transaction.py) — nombres de columna
+    raw (product_id_sms, pan_extended_country_code,
     mail_telephone_or_electronic_commerce_indicator, account_funding_source,
-    dcc_indicator_sms, card_acceptor_terminal_id, settlement_amount) tomados
-    de dynamodb/items/visa_fields.json — no validados end-to-end contra un
-    Parquet SMS real.
+    dcc_indicator_sms, card_acceptor_terminal_id) tomados de
+    dynamodb/items/visa_fields.json, no validados end-to-end contra un
+    Parquet SMS real hasta la activación de ENABLE_SMS (2026-07-07).
+
+    settlement_amount: a diferencia de BASEII (donde genuinamente no existe),
+    SÍ existe como columna real (double) en el operational SMS — confirmado
+    con Athena. La asunción original de "mismo motivo que BASEII" era
+    incorrecta (nunca se verificó independientemente para SMS); corregido
+    para usar la columna real.
+
+    travel_program_indicator: usa `product_id` (calculado vía ARDEF,
+    calc_product_id_ardef en glue-vi-calculate) — NO `product_id_sms` (crudo,
+    que sí se usa para el join de range_program_id y la columna exportada
+    "product_id"). Legacy distingue exactamente así (cf.product_id vs
+    sms.product_id_sms) — nuestro código usaba product_id_sms para las 3
+    cosas hasta este fix.
+
+    settlement_currency: `settlement_currency_code_sms` es numérico
+    (confirmado "710" para SBSA, no alfabético) — se convierte vía join
+    contra currency_df, igual que legacy (join contra m_currency).
+
+    currency_local_indicator: no existe una columna "transaction_currency_code"
+    alfabética en el SMS real (confirmado con AnalysisException al activar
+    ENABLE_SMS por primera vez) — el campo real es `draft_currency_code`
+    (numérico), igual que usa `calc_source_currency_code_alphabetic_sms` ya
+    validado en glue-vi-calculate. Se resuelve acá con el mismo join contra
+    currency_df en vez de asumir una columna alfabética directa.
+
+    report_amount/exchange_rate: legacy tiene una doble condición según
+    `sms.transaction_amount = 0` (get_sms_visa, getquery.py ~651-652) — si es
+    0, usa `cryptogram_currency_code`/(`cryptogram_amount` +
+    `surcharge_amount_sms`) en vez de `transaction_currency_code`
+    (`draft_currency_code` acá)/`transaction_amount` (`source_amount` acá).
+    Confirmado con Athena (SBSA): 300,886 de 1,472,615 transacciones SMS
+    (20.4%) tienen `source_amount=0` — sin este fix quedaban con
+    `report_amount=0` en vez del monto real. Implementado con
+    `_effective_currency_alpha`/`_effective_amount` antes del único
+    `_join_fx()`.
+
+    business_transaction_type_id usa el mismo JOIN y la misma tabla que
+    transform_visa_baseii_scheme_fee (m_visa_business_transaction_type,
+    llave = business_transaction_type calculado por
+    calc_business_transaction_type_sms) — no se deriva de transaction_code_sms
+    aunque ese campo también salga de business_transaction_type, para ser
+    consistente con la fuente que usa BASEII. El filtro exige además
+    transaction_code_sms en (05,06,07,25,26,27), igual que legacy.
     """
     report_currency = client_cfg["report_currency"]
     local_currency_code = client_cfg["local_currency_code"]
@@ -660,13 +867,17 @@ def transform_visa_sms_scheme_fee(
 
     df = df.filter(F.col("local_draft_date").isNotNull())
 
-    df = df.withColumn(
-        "business_transaction_type_id",
-        F.when(F.col("transaction_code_sms").isin("05", "25"), F.lit("PUR"))
-        .when(F.col("transaction_code_sms").isin("06", "26"), F.lit("CRD"))
-        .when(F.col("transaction_code_sms").isin("07", "27"), F.lit("CSH"))
-        .otherwise(F.lit("OTH")),
+    df = df.join(
+        visa_btt_df, df["business_transaction_type"] == visa_btt_df["_btt_id"], how="left"
+    ).drop("_btt_id").withColumnRenamed("transaction_type_id", "business_transaction_type_id")
+
+    df = df.filter(
+        F.col("business_transaction_type_id").isin("PUR", "CRD", "CSH")
+        & F.col("transaction_code_sms").isin("05", "06", "07", "25", "26", "27")
     )
+
+    df = _resolve_switch_code(df, local_switch_df, local_hashes, CLIENT_CODE, "VISA")
+
     df = df.withColumn(
         "motoec_indicator",
         F.when(
@@ -675,10 +886,18 @@ def transform_visa_sms_scheme_fee(
             F.lit(0),
         ).otherwise(F.lit(1)),
     )
+    currency_alpha_ref = currency_df.select(
+        F.col("currency_numeric_code").alias("_currency_numeric"),
+        F.col("currency_alphabetic_code").alias("_draft_currency_alpha"),
+    )
+    df = df.join(
+        currency_alpha_ref, df["draft_currency_code"] == currency_alpha_ref["_currency_numeric"], how="left"
+    ).drop("_currency_numeric")
+
     df = df.withColumn(
         "currency_local_indicator",
         F.when(
-            (F.col("transaction_currency_code") == F.lit(local_currency_code))
+            (F.col("_draft_currency_alpha") == F.lit(local_currency_code))
             | ((F.col("dcc_indicator_sms") != "1") | F.col("dcc_indicator_sms").isNull()),
             F.lit(1),
         ).otherwise(F.lit(0)),
@@ -689,25 +908,68 @@ def transform_visa_sms_scheme_fee(
         .when(F.col("account_funding_source").isin("D", "P"), F.lit("D"))
         .otherwise(F.lit(None).cast(StringType())),
     )
+    # Legacy usa cf.product_id (calculado via ARDEF, calc_product_id_ardef en
+    # glue-vi-calculate) para este indicador especificamente -- distinto de
+    # sms.product_id_sms (crudo), que sigue usandose para el join de
+    # range_program_id y la columna exportada "product_id".
     df = df.withColumn(
         "travel_program_indicator",
-        F.when(F.col("product_id_sms").isin("X", "X1"), F.lit(1)).otherwise(F.lit(0)),
+        F.when(F.col("product_id").isin("X", "X1"), F.lit(1)).otherwise(F.lit(0)),
     )
 
-    df = _join_fx(df, xrate_df, "VISA", "date", "settlement_currency_code_sms", "exchange_rate", to_literal=report_currency)
+    # Legacy (get_sms_visa, getquery.py ~651-652): doble condicion cuando
+    # transaction_amount=0 -- usa cryptogram_currency_code/(cryptogram_amount
+    # + surcharge_amount_sms) en vez de transaction_currency_code/
+    # transaction_amount. Sin esto, el 20.4% de las transacciones SMS de SBSA
+    # (source_amount=0) quedaban con report_amount=0 en vez del monto real.
+    crypto_currency_ref = currency_df.select(
+        F.col("currency_numeric_code").alias("_currency_numeric_crypto"),
+        F.col("currency_alphabetic_code").alias("_cryptogram_currency_alpha"),
+    )
+    df = df.join(
+        crypto_currency_ref, df["cryptogram_currency_code"] == crypto_currency_ref["_currency_numeric_crypto"], how="left"
+    ).drop("_currency_numeric_crypto")
+
+    # settlement_currency_code_sms es numerico (confirmado "710" para SBSA,
+    # no alfabetico) -- legacy lo convierte via join contra m_currency
+    # (c.currency_alphabetic_code); acá igual, para la columna "settlement_currency".
+    settlement_currency_ref = currency_df.select(
+        F.col("currency_numeric_code").alias("_currency_numeric_settlement"),
+        F.col("currency_alphabetic_code").alias("_settlement_currency_alpha"),
+    )
+    df = df.join(
+        settlement_currency_ref,
+        df["settlement_currency_code_sms"] == settlement_currency_ref["_currency_numeric_settlement"],
+        how="left",
+    ).drop("_currency_numeric_settlement")
+
+    df = df.withColumn(
+        "_effective_currency_alpha",
+        F.when(F.col("source_amount") == 0, F.col("_cryptogram_currency_alpha")).otherwise(F.col("_draft_currency_alpha")),
+    ).withColumn(
+        "_effective_amount",
+        F.when(
+            F.col("source_amount") == 0,
+            F.coalesce(F.col("cryptogram_amount"), F.lit(0.0)) + F.coalesce(F.col("surcharge_amount_sms"), F.lit(0.0)),
+        ).otherwise(F.col("source_amount")),
+    ).drop("_draft_currency_alpha", "_cryptogram_currency_alpha")
+
+    df = _join_fx(df, xrate_df, "VISA", "date", "_effective_currency_alpha", "exchange_rate", to_literal=report_currency)
     df = df.withColumn("exchange_rate", F.coalesce(F.col("exchange_rate"), F.lit(1.0)))
-    df = df.withColumn("report_amount", F.col("exchange_rate") * F.col("transaction_amount"))
+    df = df.withColumn("report_amount", F.col("exchange_rate") * F.col("_effective_amount")).drop(
+        "_effective_currency_alpha", "_effective_amount"
+    )
 
     product_ref = _product_ref_for_brand(scheme_fee_bin_products_df, "VISA")
     df = df.join(product_ref, df["product_id_sms"] == product_ref["_pc"], how="left").drop("_pc")
 
     df = df.select(
-        F.col("customer_code"),
-        F.col("file_id"),
-        F.col("record").cast(LongType()).alias("source_row_id"),
-        F.lit("VISA SMS").alias("transaction_source"),
-        F.col("file_type"),
-        F.col("date"),
+        F.col("file_type").alias("app_type_file"),
+        F.col("customer_code").alias("app_customer_code"),
+        F.col("content_hash").alias("app_hash_file"),
+        F.col("record").cast(LongType()).alias("app_id"),
+        F.lit("VISA SMS").alias("table_description"),
+        F.col("date").alias("app_processing_date"),
         F.col("card_number").cast(StringType()).alias("account_number"),
         F.col("card_acceptor_terminal_id").cast(StringType()).alias("card_acceptor_id"),
         F.col("account_funding_source"),
@@ -720,25 +982,21 @@ def transform_visa_sms_scheme_fee(
         F.col("reversal_indicator").cast(IntegerType()),
         F.col("currency_local_indicator").cast(IntegerType()),
         F.col("motoec_indicator").cast(IntegerType()),
-        # ver nota en transform_visa_baseii_scheme_fee -- settlement_amount
-        # no existe como columna real en el operational (confirmado 2026-07-03
-        # para BASEII, no probado para SMS ya que ENABLE_SMS=False, pero se
-        # aplica el mismo fix preventivamente). Campo no usado aguas abajo.
-        F.lit(None).cast(DoubleType()).alias("settlement_amount"),
-        F.col("settlement_currency_code_sms").alias("settlement_currency"),
+        F.col("settlement_amount").cast(DoubleType()),
         F.lit("VISA").alias("transaction_brand"),
         F.col("card_acceptor_country").alias("merchant_country_code"),
-        F.lit(0).alias("switch_code"),
+        F.col("switch_code").cast(IntegerType()),
         F.col("travel_program_indicator").cast(IntegerType()),
         F.lit(0).alias("greece_micropayment_indicator"),
         F.lit(0).alias("key_entered_tpe"),
+        F.col("_settlement_currency_alpha").alias("settlement_currency"),
         F.lit(customer_country).alias("bank_country"),
-        F.upper(F.col("business_mode")).alias("business_mode_id"),  # normalizado: MC usa minuscula, Visa mayuscula (calculate.py de cada marca) — bug encontrado 2026-07-03 en el comparativo SBSA
+        F.upper(F.col("business_mode")).alias("business_mode_id"),
+        F.lit(0).cast(IntegerType()).alias("size_ticket"),
         F.col("local_draft_date").cast(DateType()).alias("transaction_purchase_date"),
         F.col("exchange_rate").cast(DoubleType()),
         F.col("report_amount").cast(DoubleType()),
         F.lit(report_currency).alias("report_currency"),
-        F.lit(0).cast(IntegerType()).alias("size_ticket"),
     )
     return _apply_duplicate_on_us(df) if client_cfg["dup_on_us_visa"] else df
 
@@ -754,50 +1012,56 @@ def transform_mastercard_scheme_fee(
     currency_df: DataFrame,
     xrate_df: DataFrame,
     scheme_fee_bin_products_df: DataFrame,
+    mc_btt_df: DataFrame,
+    local_switch_df: DataFrame,
+    local_hashes: set,
 ) -> DataFrame:
     """
     Equivalente a get_transactions_mastercard() del legacy. Reutiliza el mismo
     patrón de swap IN/OUT + MTI 1240/1442 ya validado en
     transform_mastercard() de get_transaction.py (merchant/issuer country,
-    monto/moneda de transacción, product_code coalesce, reversal indicator) —
-    ver decisions.md "glue-vi-mc-reporting" y el comentario en cada bloque
-    abajo señalando de qué función se copió.
+    monto/moneda de transacción, swap account_range_country/merchant_country_code).
+
+    Puntos donde se aparta deliberadamente de get_transaction.py, por
+    fidelidad al legacy de scheme fee:
+    - _effective_product_id usa gcms_product_identifier directo (legacy:
+      getquery.py ~877), sin el coalesce(licensed_product_identifier_pds_3,
+      gcms_product_identifier) que sí usa get_transaction.py para
+      product_program_id — acá cambiaría legacy_product_id/range_program_id.
+    - account_funding_source usa funding_source crudo, sin el colapso
+      C/H/R->C y D/P->D que sí aplican transform_visa_baseii_scheme_fee/
+      transform_visa_sms_scheme_fee (legacy: getquery.py ~826/936, Mastercard
+      nunca colapsa este campo).
+    - reversal_indicator reutiliza la expresión ya validada de
+      get_transaction.py en vez de la fórmula original del legacy de scheme
+      fee (ver docstring del módulo).
+
+    business_transaction_type_id sale de un JOIN contra
+    m_mastercard_business_transaction_type (mc_btt_df), llave =
+    left(processing_code, 2) — igual que Visa, no un case hardcodeado (legacy:
+    getquery.py ~879). A diferencia de Visa, no hay filtro WHERE asociado.
+
+    La moneda de la transacción (_src_currency_numeric) hace el mismo swap
+    IN/OUT + lpad(3,'0') que get_transaction.py, aunque el legacy original de
+    scheme fee no lo hacía (usaba currency_code_transaction siempre) — sin el
+    swap, el fee y currency_local_indicator de los archivos IN saldrían con
+    la moneda equivocada sobre este operational.
     """
     report_currency = client_cfg["report_currency"]
     customer_country = client_cfg["customer_country"]
     local_currency_code = client_cfg["local_currency_code"]
     is_1442 = F.col("type_mti") == "1442"
 
-    # product_code: legacy usa cf.gcms_product_identifier DIRECTO para el join
-    # contra m_scheme_fee_bin_products (getquery.py linea ~877), sin coalesce
-    # con ningun campo PDS crudo -- a diferencia de get_transaction.py, que sí
-    # usa coalesce(licensed_product_identifier_pds_3, gcms_product_identifier)
-    # pero para un campo distinto (product_program_id, insensible a cual de
-    # los dos gana). Bug encontrado 2026-07-06 en el comparativo SBSA: copiar
-    # ese coalesce acá causaba que transacciones que el legacy clasificaba
-    # como "MDS" (prd_id=1006) salieran como "MDU" (prd_id=1054, inexistente
-    # en legacy) cuando el PDS crudo traía un valor distinto al calculado.
     df = df.withColumn(
         "_effective_product_id",
         F.col("gcms_product_identifier"),
     )
 
-    # A diferencia de Visa/SMS (que sí colapsan C/H/R->C y D/P->D, ver
-    # transform_visa_baseii_scheme_fee/transform_visa_sms_scheme_fee), el
-    # legacy para Mastercard usa cf.funding_source CRUDO como
-    # account_funding_source (getquery.py lineas ~826/831 y ~936/941, tanto en
-    # el insert principal como en el de duplicado on-us) -- sin colapso. Bug
-    # encontrado 2026-07-06: aplicar el mismo colapso de Visa acá eliminaba
-    # los valores 'H'/'P'/'R' (nunca sobrevivian para mapear a
-    # fnd_src_id=108/116/118 en bin_funding_source), dejando fnd_src_id=116
-    # ausente al 100% en el CSV final.
     df = df.withColumn(
         "account_funding_source",
         F.col("funding_source"),
     )
 
-    # account_range_country / merchant_country_code: mismo swap MTI que
-    # get_transaction.py (transform_mastercard, líneas ~745-756 y ~786-789)
     df = df.withColumn(
         "account_range_country",
         F.when(~is_1442, F.col("iar_country")).when(is_1442, F.col("card_acceptor_country_code_de_43_6")),
@@ -806,17 +1070,13 @@ def transform_mastercard_scheme_fee(
         F.when(~is_1442, F.col("card_acceptor_country_code_de_43_6")).when(is_1442, F.col("iar_country")),
     )
 
-    df = df.withColumn(
-        "business_transaction_type_id",
-        F.when(F.col("processing_code_de_3").substr(1, 2).isin("00", "09", "18"), F.lit("PUR"))
-        .when(F.col("processing_code_de_3").substr(1, 2) == "20", F.lit("CRD"))
-        .when(F.col("processing_code_de_3").substr(1, 2).isin("01", "12", "17", "28", "50"), F.lit("CSH"))
-        .otherwise(F.lit("OTH")),
-    )
+    df = df.withColumn("_btt_key", F.col("processing_code_de_3").substr(1, 2))
+    df = df.join(
+        mc_btt_df, df["_btt_key"] == mc_btt_df["_btt_id"], how="left"
+    ).drop("_btt_key", "_btt_id").withColumnRenamed("transaction_type_id", "business_transaction_type_id")
 
-    # is_reversal_or_chargeback: misma expresión ya validada en
-    # get_transaction.py (difiere del legacy scheme fee original — ver
-    # docstring del módulo, se prefirió reusar la versión validada)
+    df = _resolve_switch_code(df, local_switch_df, local_hashes, CLIENT_CODE, "MasterCard")
+
     df = df.withColumn(
         "reversal_indicator",
         F.when(
@@ -833,11 +1093,6 @@ def transform_mastercard_scheme_fee(
         .otherwise(F.lit(0)),
     )
 
-    # currency de la transacción: mismo swap IN/OUT + lpad(3,'0') que
-    # get_transaction.py (transform_mastercard, líneas ~706-717) — el legacy
-    # scheme fee original no lo hacía (usaba currency_code_transaction
-    # siempre), pero sin el swap el fee y el currency_local_indicator de los
-    # archivos IN saldrían con la moneda equivocada sobre este operational.
     df = df.withColumn(
         "_src_currency_numeric",
         F.lpad(
@@ -894,8 +1149,6 @@ def transform_mastercard_scheme_fee(
         ).otherwise(F.lit(0)),
     )
 
-    # exchange_rate / report_amount: mismo swap IN/OUT + xr1 que
-    # get_transaction.py (transform_mastercard, líneas ~706-717 y ~844-851)
     df = df.withColumn(
         "_amount_num",
         F.when(F.col("file_type") == "IN", F.col("amount_reconciliation_de_5"))
@@ -909,12 +1162,12 @@ def transform_mastercard_scheme_fee(
     df = df.join(product_ref, df["_effective_product_id"] == product_ref["_pc"], how="left").drop("_pc")
 
     df = df.select(
-        F.col("customer_code"),
-        F.col("file_id"),
-        F.monotonically_increasing_id().cast(LongType()).alias("source_row_id"),
-        F.lit("MasterCard").alias("transaction_source"),
-        F.col("file_type"),
-        F.col("date"),
+        F.col("file_type").alias("app_type_file"),
+        F.col("customer_code").alias("app_customer_code"),
+        F.col("content_hash").alias("app_hash_file"),
+        F.monotonically_increasing_id().cast(LongType()).alias("app_id"),
+        F.lit("MasterCard").alias("table_description"),
+        F.col("date").alias("app_processing_date"),
         F.col("pan_de_2").cast(StringType()).substr(1, 16).alias("account_number"),
         F.col("card_acceptor_id_code_de_42").cast(StringType()).alias("card_acceptor_id"),
         F.col("account_funding_source"),
@@ -928,20 +1181,20 @@ def transform_mastercard_scheme_fee(
         F.col("currency_local_indicator").cast(IntegerType()),
         F.col("motoec_indicator").cast(IntegerType()),
         F.col("settlement_report_amount").cast(DoubleType()).alias("settlement_amount"),
-        F.col("settlement_report_currency_code").alias("settlement_currency"),
         F.lit("MasterCard").alias("transaction_brand"),
         F.col("merchant_country_code"),
-        F.lit(0).alias("switch_code"),
+        F.col("switch_code").cast(IntegerType()),
         F.col("travel_program_indicator").cast(IntegerType()),
         F.lit(0).alias("greece_micropayment_indicator"),
         F.col("key_entered_tpe").cast(IntegerType()),
+        F.col("settlement_report_currency_code").alias("settlement_currency"),
         F.lit(customer_country).alias("bank_country"),
-        F.upper(F.col("business_mode")).alias("business_mode_id"),  # normalizado: MC usa minuscula, Visa mayuscula (calculate.py de cada marca) — bug encontrado 2026-07-03 en el comparativo SBSA
+        F.upper(F.col("business_mode")).alias("business_mode_id"),
+        F.lit(0).cast(IntegerType()).alias("size_ticket"),
         F.col("date_and_time_local_transaction_de_12").cast(DateType()).alias("transaction_purchase_date"),
         F.col("exchange_rate").cast(DoubleType()),
         F.col("report_amount").cast(DoubleType()),
         F.lit(report_currency).alias("report_currency"),
-        F.lit(0).cast(IntegerType()).alias("size_ticket"),
     )
     return _apply_duplicate_on_us(df) if client_cfg["dup_on_us_mc"] else df
 
@@ -970,8 +1223,8 @@ def resolve_size_ticket(df: DataFrame, size_ticket_df: DataFrame, xrate_df: Data
         how="left",
     ).drop("country_code_list")
 
-    df = _join_fx(df, xrate_df, "VISA", "date", "report_currency", "_fx_to_ticket_visa", to_col="ticket_currency")
-    df = _join_fx(df, xrate_df, "MasterCard", "date", "report_currency", "_fx_to_ticket_mc", to_col="ticket_currency")
+    df = _join_fx(df, xrate_df, "VISA", "app_processing_date", "report_currency", "_fx_to_ticket_visa", to_col="ticket_currency")
+    df = _join_fx(df, xrate_df, "MasterCard", "app_processing_date", "report_currency", "_fx_to_ticket_mc", to_col="ticket_currency")
     df = df.withColumn(
         "_fx_to_ticket",
         F.when(F.col("transaction_brand") == "VISA", F.col("_fx_to_ticket_visa")).otherwise(F.col("_fx_to_ticket_mc")),
@@ -1039,6 +1292,12 @@ def build_legacy_export(
     columnas de conteo/monto, '9999999999999999' para columnas de texto) —
     mismo comportamiento que managment.py:generate_table() al final, justo
     antes del to_csv().
+
+    mct_cd hace fillna ANTES de astype(str): un account_number nulo se
+    convertiría a la cadena literal "nan"/"None" con astype(str) directo, que
+    el fillna genérico de más abajo no detecta (solo atrapa NaN real) — mismo
+    patrón de bug ya documentado en glue-vi-interchange (_apply_default,
+    gotchas.md).
     """
     df = report_pdf.copy()
     df["app_id"] = range(1, len(df) + 1)
@@ -1064,10 +1323,6 @@ def build_legacy_export(
     df["txn_rvsl_flg_id"] = df["reversal_indicator"]
     df["txn_crncy_lcl_flg_id"] = df["currency_local_indicator"]
     df["txn_crd_prs_flg_id"] = df["motoec_indicator"]
-    # fillna ANTES de astype(str): account_number nulo se convertiria a la
-    # cadena literal "nan"/"None" (no detectable por el fillna generico de
-    # mas abajo, que solo atrapa NaN real) — mismo patron de bug ya
-    # documentado en glue-vi-interchange (_apply_default, gotchas.md).
     df["mct_cd"] = df["account_number"].fillna("9999999999999999").astype(str).str.slice(0, 16)
     df["txn_cnt"] = df["transaction_count"]
     df["txn_amt"] = df["transaction_amount"]
@@ -1149,6 +1404,12 @@ def _read_json_from_s3(bucket: str, key: str) -> dict:
 
 
 def run_generate():
+    """
+    Orquesta el paso --mode generate (ver docstring del módulo). El app_id
+    que build_legacy_export() asigna al CSV de export se copia también al
+    report_pdf que se persiste como estado interno, porque --mode read
+    necesita matchear por ese mismo app_id.
+    """
     year = int(REPORT_MONTH[0:4])
     month = int(REPORT_MONTH[4:6])
     last_day = monthrange(year, month)[1]
@@ -1171,6 +1432,10 @@ def run_generate():
     bin_funding_df = load_bin_funding_source()
     size_ticket_df = load_size_ticket()
     xrate_df = load_exchange_rates(start_date, end_date)
+    visa_btt_df = load_visa_business_transaction_type()
+    mc_btt_df = load_mastercard_business_transaction_type()
+    local_switch_df = load_local_switch()
+    local_hashes = get_local_switch_content_hashes(CLIENT_CODE)
 
     detail_frames = []
 
@@ -1178,19 +1443,19 @@ def run_generate():
     if vi_raw is not None:
         terminal_counts_df = compute_visa_terminal_counts(vi_raw)
         detail_frames.append(
-            transform_visa_baseii_scheme_fee(vi_raw, client_cfg, xrate_df, terminal_counts_df, scheme_fee_bin_products_df)
+            transform_visa_baseii_scheme_fee(vi_raw, client_cfg, xrate_df, terminal_counts_df, scheme_fee_bin_products_df, visa_btt_df, local_switch_df, local_hashes)
         )
 
     if ENABLE_SMS:
         sms_raw = read_operational(CLIENT_CODE, "VISA", "sms_messages", start_date, end_date)
         if sms_raw is not None:
-            detail_frames.append(transform_visa_sms_scheme_fee(sms_raw, client_cfg, xrate_df, scheme_fee_bin_products_df))
+            detail_frames.append(transform_visa_sms_scheme_fee(sms_raw, client_cfg, xrate_df, scheme_fee_bin_products_df, visa_btt_df, local_switch_df, local_hashes, currency_df))
 
     for mti in ("IPM_1240", "IPM_1442"):
         mc_raw = read_operational(CLIENT_CODE, "MC", mti, start_date, end_date)
         if mc_raw is not None:
             detail_frames.append(
-                transform_mastercard_scheme_fee(mc_raw, client_cfg, currency_df, xrate_df, scheme_fee_bin_products_df)
+                transform_mastercard_scheme_fee(mc_raw, client_cfg, currency_df, xrate_df, scheme_fee_bin_products_df, mc_btt_df, local_switch_df, local_hashes)
             )
 
     if not detail_frames:
@@ -1221,8 +1486,6 @@ def run_generate():
     out_key = f"OUT/{CLIENT_CODE}/{filename}"
     write_csv_to_s3(export_pdf, SCHEME_FEE_BUCKET, out_key)
 
-    # app_id asignado en build_legacy_export debe viajar también en el estado
-    # interno del reporte, para poder matchear por app_id en --mode read.
     report_pdf["app_id"] = export_pdf["app_id"].values
 
     detail_df.write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/detail/")

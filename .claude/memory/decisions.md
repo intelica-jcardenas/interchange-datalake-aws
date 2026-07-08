@@ -238,19 +238,31 @@ Detalle completo → `.claude/memory/decisions_archive.md`.
 
 ---
 
-## Por qué glue-vi-mc-reporting (glue-test-1) lee `exchange_rate/rate_date=YYYY-MM-DD/` y no `exchange-rates/brand={brand}/exchange_date=YYYY-MM-DD/`
+## Por qué glue-vi-mc-reporting (glue-test-1) lee `exchange_rate/rate_date=YYYY-MM-DD/` y no `exchange-rates/brand={brand}/exchange_date=YYYY-MM-DD/` (SUPERADA — ver decisión "Migración oficial a exchange-rates-glue" más abajo)
 
-**Decisión:** `load_exchange_rates()` en `glue/scripts/reports/get_transaction/get_transaction.py` lee `s3://itl-0004-itx-dev-intchg-02-s3-reference/exchange_rate/rate_date=YYYY-MM-DD/`, filtra por columna `brand` (`'VISA'` / `'MasterCard'`, comparación case-insensitive) y renombra columnas a `exchange_date, from_currency, to_currency, fx_rate`.
+**Decisión (histórica, 2026-06-10, ya no vigente):** `load_exchange_rates()` en `glue/scripts/reports/get_transaction/get_transaction.py` lee `s3://itl-0004-itx-dev-intchg-02-s3-reference/exchange_rate/rate_date=YYYY-MM-DD/`, filtra por columna `brand` (`'VISA'` / `'MasterCard'`, comparación case-insensitive) y renombra columnas a `exchange_date, from_currency, to_currency, fx_rate`.
 
-**Razón:** Existen dos ubicaciones de tipo de cambio en `s3-reference`:
-- `exchange-rates/brand={Visa,MasterCard}/exchange_date=YYYY-MM-DD/` — cobertura incompleta (no tiene todos los pares de moneda/fechas necesarios, ej. Visa EUR→USD para algunas fechas) y además sus columnas reales (`currency_from, currency_to, currency_from_code, currency_to_code, exchange_value`) no coinciden con las que el código asumía (`from_currency, to_currency, fx_rate`).
-- `exchange_rate/rate_date=YYYY-MM-DD/` — cubre 2025-12-01..2026-04-30, ambas marcas en una sola tabla distinguidas por la columna `brand`. Es la fuente que ya usan otros procesos (interchange) y que sí tiene los pares de moneda necesarios.
+**Razón (histórica):** Existían dos ubicaciones de tipo de cambio en `s3-reference`:
+- `exchange-rates/brand={Visa,MasterCard}/exchange_date=YYYY-MM-DD/` — cobertura incompleta en ese momento (no tenía todos los pares de moneda/fechas necesarios) y columnas sin códigos numéricos.
+- `exchange_rate/rate_date=YYYY-MM-DD/` — cubre 2025-12-01..2026-04-30, ambas marcas en una sola tabla distinguidas por la columna `brand`. Tenía los pares de moneda necesarios en ese momento.
 
 El bug original (`Column 'to_currency' does not exist`) solo se manifestó el 2026-06-10 porque hasta entonces el job fallaba ANTES (por el `SchemaColumnConvertNotSupportedException` de columnas NullType en `lmbd-vi-store`, ya resuelto) — nunca había llegado a ejecutar `_join_exchange_rates()`.
 
-**Pendiente:** hay un nuevo método de extracción de tipo de cambio Visa en desarrollo (mencionado por el usuario 2026-06-10). Cuando esté disponible, revisar si `load_exchange_rates()` debe apuntar a esa nueva fuente en vez de (o además de) `exchange_rate/`.
+**Por qué quedó superada:** `exchange_rate/` era una fuente manual, congelada al 2026-04-30 (no crecía). Entretanto, `exchange-rates-glue/` (generada por el job `glue-exchange-rates`, que enriquece `exchange-rates/` con códigos numéricos del maestro `m_currency`) se convirtió en la fuente viva, oficial y con cobertura completa — ver decisión siguiente.
 
-**Alternativa descartada:** mantener `exchange-rates/brand={brand}/` y solo corregir los nombres de columna — descartado porque esa tabla no tiene cobertura completa de pares de moneda/fechas (`exchange-rates/brand=Visa/` no tenía EUR→USD para `exchange_date=2026-01-01`, mientras que `exchange_rate/rate_date=2026-01-05/` sí).
+---
+
+## Por qué se migró la fuente de tipo de cambio de `exchange_rate/` a `exchange-rates-glue/` en todo el pipeline (2026-07-08)
+
+**Decisión:** Los 7 scripts que leían `exchange_rate/rate_date=YYYY-MM-DD/` (`glue-vi-interchange`, `glue-mc-interchange`, `glue-mc-calculate`, `glue-get-transaction`, `glue-scheme-fee`, `glue-vi-data-quality`, `glue-mc-data-quality`) fueron migrados a leer `exchange-rates-glue/brand={Visa,Mastercard}/exchange_date=YYYY-MM-DD/`. `exchange_rate/` ya no se lee en ningún script del pipeline.
+
+**Razón:** `exchange_rate/` es una fuente manual, creada en algún momento como snapshot y nunca vuelta a alimentar — cobertura fija 2025-12-01..2026-04-30. `exchange-rates-glue/` es el producto oficial de un pipeline vivo: `lmbd-vi-exchange-rates`/`lmbd-mc-exchange-rates` scrapean tasas crudas (solo alfa) a `exchange-rates/`, y el job `glue-exchange-rates` (`format_exchange_rates.py`, antes `glue-test-2`) las enriquece con códigos numéricos del maestro `m_currency` y escribe a `exchange-rates-glue/` — cobertura 2025-06-01 en adelante, sigue creciendo. El usuario identificó esta relación entre las 3 fuentes y pidió oficializar `exchange-rates-glue/` como la única fuente del pipeline.
+
+**Verificación de seguridad antes de migrar:** se comparó `exchange_rate/` vs `exchange-rates-glue/` para múltiples fechas de enero 2026 (ambas marcas, ~50K pares de moneda) — **0% de diferencia, valores bit-idénticos**. Esto redujo el riesgo de que el cambio moviera algún fee ya validado contra legacy.
+
+**Validación tras el cambio:** `glue-vi-interchange`, `glue-mc-interchange` y `glue-mc-calculate` — cada uno re-ejecutado contra un archivo real ya procesado (EBGR, 2026-01-03) y comparado byte a byte contra el resultado anterior: **diff=0 exacto** en las 3. `glue-get-transaction` — no se pudo comparar directo contra un reporte baseline antiguo (`report_transactions_EBGR_202601_v2.parquet`) porque esa comparación dio un residual de +4,510 en `interchange_fees_amount` de VISA; investigado y confirmado que el residual era por el baseline desactualizado (operational reprocesado después de generarse ese reporte por razones no relacionadas), no por el cambio — se hizo una prueba A/B controlada (versión vieja vs nueva del script, mismo snapshot operational, back to back) que dio **diff=0 exacto** en `transaction_amount` e `interchange_fees_amount`, ambas marcas. `glue-scheme-fee` corrido con la fuente nueva sin error (EBGR, `--mode generate`, 202601). `glue-vi-data-quality` corrido como smoke test (nunca antes ejecutado con datos reales) — SUCCEEDED. `glue-mc-data-quality` no se validó (nunca se había ejecutado antes, sin baseline con el que comparar — detenido a pedido del usuario, sin impacto porque no está en producción).
+
+**Alternativa descartada:** mantener `exchange_rate/` y solo ampliar su cobertura manualmente — descartado porque perpetúa un proceso manual cuando ya existe un pipeline automático (`glue-exchange-rates`) que resuelve lo mismo sin intervención.
 
 ---
 

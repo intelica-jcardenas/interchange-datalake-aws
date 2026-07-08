@@ -83,14 +83,18 @@ Athena (*)                                        Consultas SQL sobre datos fina
 | `itl-0004-itx-dev-intchg-02-glue-vi-interchange` | Visa | G.2X × 4 |
 | `itl-0004-itx-dev-intchg-02-glue-mc-calculate` | MC | G.1X × 2 |
 | `itl-0004-itx-dev-intchg-02-glue-mc-interchange` | MC | G.1X × 2 |
-| `itl-0004-itx-dev-intchg-02-glue-test-1` (reporting, pendiente renombrar) | Visa/MC | G.1X × 2 |
+| `itl-0004-itx-dev-intchg-02-glue-get-transaction` (reporte de transacciones) | Visa/MC | G.1X × 2 |
+| `itl-0004-itx-dev-intchg-02-glue-exchange-rates` (enriquece tipos de cambio) | — | G.1X × 2 |
+| `itl-0004-itx-dev-intchg-02-glue-vi-data-quality` | Visa | G.1X × 2 |
+| `itl-0004-itx-dev-intchg-02-glue-mc-data-quality` | MC | G.1X × 2 |
+| `itl-0004-itx-dev-intchg-02-glue-scheme-fee` (cuotas) | Visa/MC | G.1X × 2 |
 
 ### Step Functions
 
 | Nombre | Marca | Estado |
 |--------|-------|--------|
-| `itl-0004-itx-dev-intchg-02-sfn-vi` | Visa | Funcional |
-| `itl-0004-itx-dev-intchg-02-sfn-mc` | Mastercard | En validación end-to-end |
+| `itl-0004-itx-dev-intchg-02-sfn-vi` | Visa | Funcional, validado |
+| `itl-0004-itx-dev-intchg-02-sfn-mc` | Mastercard | Funcional, validado (comparativos EBGR + SBSA enero 2026) |
 
 ### S3 Buckets
 
@@ -184,7 +188,9 @@ terraform init && terraform plan && terraform apply
 | Componente | Estado |
 |------------|--------|
 | Pipeline Visa completo | Implementado y validado |
-| Pipeline Mastercard completo | Implementado — en validacion end-to-end con itl-0004-itx-dev-intchg-02-sfn-mc |
+| Pipeline Mastercard completo | Implementado y validado end-to-end (comparativos EBGR + SBSA enero 2026) |
+| Reporting (`get_transaction.py`) | Validado para ambas marcas |
+| Scheme Fee (cuotas) | `--mode generate` validado end-to-end; `--mode read` pendiente |
 | Athena (crawlers, workgroups, tablas) | Pendiente de configuracion y validacion |
 
 Ver `CLAUDE.md` para documentacion tecnica detallada.

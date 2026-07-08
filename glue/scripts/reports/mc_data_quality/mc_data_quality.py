@@ -222,6 +222,27 @@ def read_parquet(spark, path: str, name: str) -> DataFrame:
     return spark.read.option("mergeSchema", "false").parquet(path)
 
 
+def read_exchange_rates_glue(spark, s3_reference: str, query_date: str) -> DataFrame:
+    """
+    Fuente: exchange-rates-glue/brand=Mastercard/exchange_date={query_date}/
+    (enriquecido con codigos numericos por glue-exchange-rates, cobertura viva
+    y actualizada) — reemplaza a exchange_rate/, fuente manual congelada al
+    2026-04-30. Renombra columnas a los nombres legacy (brand/currency_from/
+    currency_to/currency_from_code/exchange_value) que ya espera el resto
+    del script.
+    """
+    path = f"{s3_reference}/exchange-rates-glue/brand=Mastercard/exchange_date={query_date}/"
+    print(f"[READ] exchange-rates-glue: {path}", flush=True)
+    df = spark.read.option("mergeSchema", "false").parquet(path)
+    return df.select(
+        F.lit("MasterCard").alias("brand"),
+        F.col("from_currency").alias("currency_from"),
+        F.col("to_currency").alias("currency_to"),
+        F.col("from_currency_numeric_code").alias("currency_from_code"),
+        F.col("fx_rate").alias("exchange_value"),
+    )
+
+
 def safe_col(df: DataFrame, col_name: str, default=""):
     if col_name in df.columns:
         return F.col(col_name)
@@ -421,14 +442,13 @@ def get_mastercard_validation_results_settlement(
         f"file_type=IN/date={query_date}/"
     )
 
-    exchange_path = f"{S3_REFERENCE}/exchange_rate/rate_date={query_date}/"
     btt_path = f"{S3_REFERENCE}/mastercard_business_transaction_type/"
     currency_path = f"{S3_REFERENCE}/currency/"
     validation_path = f"{S3_REFERENCE}/validation_conditions/"
 
     df_raw = read_ipm_1644_operational(spark, data_path)
 
-    df_exchange = read_parquet(spark, exchange_path, "exchange_rate")
+    df_exchange = read_exchange_rates_glue(spark, S3_REFERENCE, query_date)
     df_btt = read_parquet(spark, btt_path, "mastercard_business_transaction_type")
     df_currency = read_parquet(spark, currency_path, "currency")
     df_validation = read_parquet(spark, validation_path, "validation_conditions")
@@ -638,7 +658,6 @@ def get_mastercard_validation_results_transactional(
         f"file_type={file_type}/date={query_date}/"
     )
 
-    exchange_path = f"{S3_REFERENCE}/exchange_rate/rate_date={query_date}/"
     btt_path = f"{S3_REFERENCE}/mastercard_business_transaction_type/"
     currency_path = f"{S3_REFERENCE}/currency/"
     validation_path = f"{S3_REFERENCE}/validation_conditions/"
@@ -659,7 +678,7 @@ def get_mastercard_validation_results_transactional(
             )
         )
 
-    df_exchange = read_parquet(spark, exchange_path, "exchange_rate")
+    df_exchange = read_exchange_rates_glue(spark, S3_REFERENCE, query_date)
     df_btt = read_parquet(spark, btt_path, "mastercard_business_transaction_type")
     df_currency = read_parquet(spark, currency_path, "currency")
     df_validation = read_parquet(spark, validation_path, "validation_conditions")

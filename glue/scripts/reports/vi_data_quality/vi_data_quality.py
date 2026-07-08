@@ -25,7 +25,7 @@
 #   M3.fee_descriptor (m_interchange_rules) → interchange_fee_descriptor (pre-calculado)
 #   m_visa_business_transaction_type (M1)   → reference/visa_business_transaction_type/
 #   m_visa_business_transaction_cycle (M2)  → reference/visa_business_transaction_cycle/
-#   dh_exchange_rate (X1, X2)              → reference/exchange_rate/ (Hive: rate_date=)
+#   dh_exchange_rate (X1, X2)              → reference/exchange-rates-glue/ (Hive: brand=/exchange_date=)
 #   t_customer                              → DynamoDB: itl-0004-itx-dev-dynamo-client-02
 #   t_control_file (SBSA hash filter)       → DynamoDB: itl-0004-itx-dev-dynamo-file_control-02
 #   validation.validation_conditions        → reference/validation_conditions/data.parquet
@@ -549,28 +549,29 @@ def load_exchange_rate(reference_bucket: str, start_date: str, end_date: str) ->
     Carga las tasas de cambio VISA para el rango de fechas indicado.
     En Standard 1.0: operational.dh_exchange_rate_{partition_date} (alias X1 y X2)
 
-    Estructura S3 (Hive particionado):
-      reference/exchange_rate/rate_date=YYYY-MM-DD/xxx.parquet
-    Spark detecta 'rate_date' como columna de partición automáticamente.
+    Fuente: exchange-rates-glue/brand=Visa/exchange_date=YYYY-MM-DD/xxx.parquet
+    (enriquecido con codigos numericos por glue-exchange-rates, cobertura viva
+    y actualizada) — reemplaza a exchange_rate/, fuente manual congelada al
+    2026-04-30. Se lee al nivel brand=Visa/ para que Spark descubra
+    exchange_date como columna de particion; se renombra a rate_date para no
+    tocar el resto del script.
 
     Esta misma tabla se usa DOS VECES en el join (como X1 y X2 de Standard 1.0):
       · X1: convierte source_currency_code (numérico) → report_currency_code  [para trx_amt]
       · X2: convierte interchange_fee_currency (alfabético) → report_currency_code [para itx_amt]
     Los alias con prefijos x1_ / x2_ se aplican en join_with_exchange_rates() para
     evitar conflictos de columnas en el DataFrame combinado.
-
-    Nota: se filtra por brand='VISA' si la columna existe en el parquet (el parquet
-    de exchange_rate puede contener tasas de múltiples marcas en la misma tabla).
     """
-    path = f"s3://{reference_bucket}/exchange_rate/"
-    log_info(f"Loading exchange_rate from: {path} | range: {start_date} → {end_date}")
+    path = f"s3://{reference_bucket}/exchange-rates-glue/brand=Visa/"
+    log_info(f"Loading exchange rates from: {path} | range: {start_date} → {end_date}")
 
-    df = spark.read.parquet(path) \
-        .filter(F.col("rate_date").between(start_date, end_date))
-
-    # Filtrar por marca VISA si la columna está disponible en el parquet
-    if "brand" in df.columns:
-        df = df.filter(F.upper(F.col("brand")) == "VISA")
+    df = spark.read.parquet(path).select(
+        F.col("exchange_date").alias("rate_date"),
+        F.col("from_currency").alias("currency_from"),
+        F.col("to_currency").alias("currency_to"),
+        F.col("from_currency_numeric_code").alias("currency_from_code"),
+        F.col("fx_rate").alias("exchange_value"),
+    ).filter(F.col("rate_date").between(start_date, end_date))
 
     count = df.count()
     log_info(f"  Loaded {count:,} exchange rate rows for VISA")

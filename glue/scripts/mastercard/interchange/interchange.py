@@ -201,7 +201,38 @@ def build_schema_from_layout(items: Iterable[Dict[str, Any]]) -> StructType:
 def read_parquet(spark: SparkSession, path: str, name: str) -> DataFrame:
     log(f"[READ] {name}: {path}")
     return spark.read.option("mergeSchema", "false").parquet(path)
- 
+
+
+def read_exchange_rates_glue(spark: SparkSession, s3_reference: str, brand: str, file_date: str) -> DataFrame:
+    """
+    Fuente: exchange-rates-glue/brand={brand}/exchange_date={file_date}/ (enriquecido
+    con codigos numericos por glue-exchange-rates, cobertura viva y actualizada
+    — reemplaza a exchange_rate/, fuente manual congelada al 2026-04-30).
+    Renombra columnas a los nombres legacy (brand/currency_from/currency_to/
+    currency_from_code/exchange_value) que ya espera el resto del script.
+    """
+    brand_partition = brand.capitalize()
+    path = f"{s3_reference}/exchange-rates-glue/brand={brand_partition}/exchange_date={file_date}/"
+    log(f"[READ] REF exchange-rates-glue: {path}")
+    try:
+        df = spark.read.option("mergeSchema", "false").parquet(path)
+    except Exception as ex:
+        log(f"[READ] Partition not found ({ex}). Fallback: reading full exchange-rates-glue and filtering.")
+        base_path = f"{s3_reference}/exchange-rates-glue/"
+        df = (
+            spark.read.option("mergeSchema", "false").parquet(base_path)
+            .filter(F.col("brand") == brand_partition)
+            .filter(F.col("exchange_date") == file_date)
+        )
+    return df.select(
+        F.lit(brand_partition).alias("brand"),
+        F.col("from_currency").alias("currency_from"),
+        F.col("to_currency").alias("currency_to"),
+        F.col("from_currency_numeric_code").alias("currency_from_code"),
+        F.col("to_currency_numeric_code").alias("currency_to_code"),
+        F.col("fx_rate").alias("exchange_value"),
+    )
+
  
 def read_txn_with_layout(spark: SparkSession, path: str, schema: StructType) -> DataFrame:
     log(f"[READ] TXN 1240 CLN with Dynamo schema: {path}")
@@ -1089,8 +1120,6 @@ def run_interchange_mti(
     calc_prefix = (f"{s3_staging}/{client_id}/MC/500_IPM_{mti}_CAL/"f"file_type={file_type}/date={file_date}/")
  
     currency_path = f"{s3_reference}/currency/"
-    #exchange_rate_path = f"{s3_reference}/exchange_rate/"
-    exchange_rate_path = (f"{s3_reference}/exchange_rate/"f"rate_date={file_date}/")
     rules_path = f"{s3_reference}/mc_rules/"
  
     # Salida final en STAGING, no en carpeta local.
@@ -1137,7 +1166,7 @@ def run_interchange_mti(
     txn_schema = build_schema_from_layout(layout_items)
  
     df_currency = read_parquet(spark, currency_path, "REF currency").cache()
-    df_exchange_rate = read_parquet(spark, exchange_rate_path, "REF exchange_rate").cache()
+    df_exchange_rate = read_exchange_rates_glue(spark, s3_reference, "MasterCard", file_date).cache()
     df_rules = read_parquet(spark, rules_path, "REF mc_rules").cache()
 
     calc_by_key: Dict[str, str] = {

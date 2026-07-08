@@ -35,7 +35,7 @@
 #   [S3_REFERENCE]/currency/data.parquet
 #   [S3_REFERENCE]/mastercard_brand_product/data.parquet
 #   [S3_REFERENCE]/mastercard_iar/historic_data.parquet   ← PROVISIONAL
-#   [S3_REFERENCE]/exchange_rate/rate_date=YYYY-MM-DD/*.parquet
+#   [S3_REFERENCE]/exchange-rates-glue/brand=Mastercard/exchange_date=YYYY-MM-DD/*.parquet
 #
 #   [S3_STAGING]/{s3_key_input}/…_1240.parquet            ← CLN input
 #   [S3_STAGING]/{s3_key_output}/…_1240.parquet           ← CAL output
@@ -340,30 +340,38 @@ def load_currency(s3_reference_url: str) -> DataFrame:
  
 def load_exchange_rate(s3_reference_url: str, rate_date: str) -> DataFrame:
     """
-    Carga tasas de cambio desde la partición Hive correspondiente a rate_date.
-    Estructura S3: exchange_rate/rate_date=YYYY-MM-DD/<hash>.parquet
-    Inyecta la columna 'rate_date' (Date) si no la detecta Spark automáticamente.
- 
-    Fallback: lee todas las particiones y filtra por fecha.
+    Fuente: exchange-rates-glue/brand=Mastercard/exchange_date={rate_date}/
+    (enriquecido con codigos numericos por glue-exchange-rates, cobertura viva
+    y actualizada — reemplaza a exchange_rate/, fuente manual congelada al
+    2026-04-30). Renombra columnas a los nombres legacy (brand/rate_date/
+    currency_to/currency_from_code/exchange_value) que ya espera el resto
+    del script.
+
+    Fallback: lee toda la tabla y filtra por brand + exchange_date.
     """
-    partition_path = _s3_url(s3_reference_url, "exchange_rate", f"rate_date={rate_date}")
+    brand_partition = "Mastercard"
+    partition_path = _s3_url(
+        s3_reference_url, "exchange-rates-glue",
+        f"brand={brand_partition}", f"exchange_date={rate_date}",
+    )
     log_info(f"  Loading exchange rate partition: {partition_path}")
     try:
         df = spark.read.parquet(partition_path)
-        if "rate_date" not in df.columns:
-            df = df.withColumn("rate_date", F.lit(rate_date).cast(DateType()))
-        else:
-            df = df.withColumn("rate_date", F.col("rate_date").cast(DateType()))
-        return df
     except Exception as ex:
-        log_warn(f"  Partition not found ({ex}). Fallback: reading all exchange_rate partitions.")
-        base_path = _s3_url(s3_reference_url, "exchange_rate")
-        df = spark.read.parquet(base_path)
-        if "rate_date" not in df.columns:
-            raise RuntimeError(
-                f"[load_exchange_rate] 'rate_date' column missing after fallback read from {base_path}"
-            )
-        return df.filter(F.col("rate_date").cast(StringType()) == rate_date)
+        log_warn(f"  Partition not found ({ex}). Fallback: reading full exchange-rates-glue and filtering.")
+        base_path = _s3_url(s3_reference_url, "exchange-rates-glue")
+        df = (
+            spark.read.parquet(base_path)
+            .filter(F.col("brand") == brand_partition)
+            .filter(F.col("exchange_date") == rate_date)
+        )
+    return df.select(
+        F.lit(brand_partition).alias("brand"),
+        F.lit(rate_date).cast(DateType()).alias("rate_date"),
+        F.col("to_currency").alias("currency_to"),
+        F.col("from_currency_numeric_code").alias("currency_from_code"),
+        F.col("fx_rate").alias("exchange_value"),
+    )
  
  
 def _load_iar_raw(s3_reference_url: str) -> DataFrame:
