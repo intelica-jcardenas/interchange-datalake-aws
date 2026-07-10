@@ -47,8 +47,6 @@ Pendientes (TODO)
 -----------------
   - scheme_fees_amount : join con Parquet de scheme fees cuando el flujo esté
                          disponible — actualmente retorna 0.0
-  - SMS activación     : bloque comentado en generate_report() — pendiente validación
-                         end-to-end con datos reales antes de activar
 """
 
 import sys
@@ -153,9 +151,15 @@ def read_operational(
     Lee todos los Parquets del bucket operational para un cliente, marca y
     tipo de dato, filtrando por el rango de fechas [start_date, end_date].
 
-    Añade columnas de metadata derivadas del path:
+    Añade columna de metadata:
       - customer_code : literal del client_id
-      - file_id       : nombre del archivo Parquet (= content_hash)
+
+    "content_hash" ya viene como columna real en el Parquet (VISA y MC) — se
+    deja tal cual acá; cada transform la alias a "file_id" en su .select()
+    final (no derivar "file_id" del nombre del archivo: para VISA el archivo
+    se llama "{content_hash}.parquet", coincide por casualidad, pero para MC
+    se llama "{file_id_dynamo}_{bloque}_{mti}.parquet" — el nombre completo
+    del archivo NO es el content_hash ahí).
 
     Las particiones Hive (file_type, date) son añadidas automáticamente
     por Spark como columnas del DataFrame.
@@ -177,12 +181,7 @@ def read_operational(
         )
         return None
 
-    df = (
-        df.withColumn("_path", F.input_file_name())
-        .withColumn("file_id", F.regexp_extract("_path", r"/([^/]+)\.parquet$", 1))
-        .withColumn("customer_code", F.lit(client_id))
-        .drop("_path")
-    )
+    df = df.withColumn("customer_code", F.lit(client_id))
 
     log_info(
         f"[read_operational] Loaded {client_id}/{brand}/{data_type}: {df.count()} rows"
@@ -446,7 +445,7 @@ def transform_visa_baseii(
 
     df = df.select(
         F.col("customer_code").cast(StringType()),
-        F.col("file_id").cast(StringType()),
+        F.col("content_hash").cast(StringType()).alias("file_id"),
         F.col("record").cast(IntegerType()).alias("row_id"),
         F.when(F.col("business_mode") == "ISSUING", F.col("issuer_country_alt"))
         .when(F.col("business_mode") == "ACQUIRING", F.col("merchant_country_alt"))
@@ -534,8 +533,6 @@ def transform_visa_sms(
 ) -> DataFrame:
     """
     Equivalente a analytics.get_visa_sms_transactions().
-
-    PENDIENTE: validación end-to-end con datos reales antes de activar.
     """
     df = df.filter(F.col("local_draft_date").isNotNull())
 
@@ -574,14 +571,25 @@ def transform_visa_sms(
         report_currency=report_currency,
     )
 
+    # xr3: tasa USD -> report_currency (fija). Legacy usa un tercer join (X3)
+    # hardcodeado a USD ('840') para el caso source_amount=0 -- cryptogram_amount
+    # y surcharge_amount_sms siempre vienen en USD segun la especificacion de
+    # Visa, sin importar la moneda real de la transaccion. Un intento anterior
+    # de esta funcion reemplazo el hardcode por la moneda real reportada en
+    # cryptogram_currency_code, pero eso diverge del legacy y producia montos
+    # ~16x menores para business_transaction_type=247 (ATM balance inquiry,
+    # MCC 6011) en la validacion contra SBSA enero 2026 -- revertido.
     xr3 = xrate_df.filter(
-        (F.col("from_currency") == "USD") & (F.col("to_currency") == report_currency)
-    ).select(F.col("exchange_date").alias("_xr3_date"), F.col("fx_rate").alias("xr3_rate"))
+        (F.col("to_currency") == report_currency) & (F.col("from_currency") == "USD")
+    ).select(
+        F.col("exchange_date").alias("_xr3_date"),
+        F.col("fx_rate").alias("xr3_rate"),
+    )
     df = df.join(xr3, df["date"] == xr3["_xr3_date"], how="left").drop("_xr3_date")
 
     df = df.select(
         F.col("customer_code").cast(StringType()),
-        F.col("file_id").cast(StringType()),
+        F.col("content_hash").cast(StringType()).alias("file_id"),
         F.col("record").cast(IntegerType()).alias("row_id"),
         F.when(F.col("business_mode") == "ISSUING", F.col("issuer_country_alt"))
         .when(F.col("business_mode") == "ACQUIRING", F.col("merchant_country_alt"))
@@ -632,11 +640,12 @@ def transform_visa_sms(
         F.when(
             F.col("source_amount") == 0,
             F.coalesce(F.col("xr3_rate"), F.lit(1.0))
-            * (F.col("cryptogram_amount") + F.col("surcharge_amount_sms")),
+            * (
+                F.coalesce(F.col("cryptogram_amount"), F.lit(0.0))
+                + F.coalesce(F.col("surcharge_amount_sms"), F.lit(0.0))
+            ),
         )
-        .otherwise(
-            F.coalesce(F.col("xr1_rate"), F.lit(1.0)) * F.col("source_amount")
-        )
+        .otherwise(F.coalesce(F.col("xr1_rate"), F.lit(1.0)) * F.col("source_amount"))
         .cast(DoubleType())
         .alias("transaction_amount"),
         (
@@ -743,7 +752,7 @@ def transform_mastercard(
 
     df = df.select(
         F.col("customer_code").cast(StringType()),
-        F.col("file_id").cast(StringType()),
+        F.col("content_hash").cast(StringType()).alias("file_id"),
         F.col("ref_id").cast(IntegerType()).alias("row_id"),
         F.when((F.col("file_type") == "IN") & ~is_1442, F.col("iar_country"))
         .when(
@@ -888,8 +897,7 @@ def process_client_range(
 ) -> DataFrame | None:
     """
     Genera el DataFrame de report_transactions para un cliente en el rango
-    [start_date, end_date]. Une BASEII + MC_1240 + MC_1442.
-    SMS comentado — pendiente resolver customer_code/file_id en lmbd-vi-store.
+    [start_date, end_date]. Une BASEII + SMS + MC_1240 + MC_1442.
     """
     rep_cur = client_cfg["report_currency"]
     dup_vi = client_cfg["dup_on_us_visa"] and SCHEME_FEE
@@ -909,7 +917,11 @@ def process_client_range(
         except Exception as e:
             log_error(f"[BASEII] {client_id}/{start_date}_{end_date}: {e}")
 
-    # -- Visa SMS -- (pendiente: ver TODO en módulo)
+    # TEMP: SMS deshabilitado a pedido del usuario mientras se prepara la
+    # unificacion con scheme_fee -- transaction_amount/count ya validados
+    # end-to-end (ver gotchas.md), pendiente solo el residual de
+    # interchange_fees_amount en glue-vi-interchange. REACTIVAR cuando se
+    # retome ese trabajo.
     # df_sms = read_operational(client_id, "VISA", "sms_messages", start_date, end_date)
     # if df_sms is not None:
     #     try:

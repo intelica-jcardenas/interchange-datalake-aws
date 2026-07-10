@@ -146,17 +146,24 @@ def _read_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
     return pd.read_parquet(_download_to_bytesio(bucket, key))
 
 
+def _read_parquet_arrow_s3(bucket: str, key: str) -> pa.Table:
+    """Lee un único Parquet desde S3 como pa.Table -- preserva el schema real
+    antes de que el round-trip por pandas lo degrade."""
+    return pq.read_table(_download_to_bytesio(bucket, key))
+
+
 def _restore_schema(
     table: pa.Table,
-    cln_dtype_map: dict[str, pa.DataType],
+    dtype_map: dict[str, pa.DataType],
     output_schema: Optional[pa.Schema] = None,
 ) -> pa.Table:
     """
     Restaura tipos Arrow degradados por el round-trip pandas/pyarrow.
 
-    - Columnas en cln_dtype_map (schema autoritativo del CLN): castea al tipo
-      original, excepto timestamps que siempre se fuerzan a "us".
-    - Columnas CAL/ITX (no en cln_dtype_map): NullType→string,
+    - Columnas en dtype_map (schema autoritativo de CLN+CAL+ITX, capturado
+      antes de convertir a pandas): castea al tipo original, excepto
+      timestamps que siempre se fuerzan a "us".
+    - Columnas sin dtype conocido (no en dtype_map): NullType→string,
       decimal128(p≠18,s)→decimal128(18,s), timestamp→"us".
     - Si se pasa output_schema (de un batch anterior): fuerza ese schema exacto
       para garantizar consistencia entre batches al escribir al ParquetWriter.
@@ -183,13 +190,13 @@ def _restore_schema(
                 )
         return table
 
-    # Modo primer batch: derivar schema desde cln_dtype_map
+    # Modo primer batch: derivar schema desde dtype_map
     for i, field in enumerate(table.schema):
         current_type = field.type
         target_type: Optional[pa.DataType] = None
 
-        if field.name in cln_dtype_map:
-            target_type = cln_dtype_map[field.name]
+        if field.name in dtype_map:
+            target_type = dtype_map[field.name]
             if pa.types.is_timestamp(target_type):
                 target_type = pa.timestamp("us")
         elif pa.types.is_null(current_type):
@@ -275,8 +282,13 @@ def _store_output(
     # ── 2. Cargar CAL completo (pequeño) ──────────────────────────────────────
     df_cal: Optional[pd.DataFrame] = None
     new_cols_cal: list[str] = []
+    cal_dtype_map: dict[str, pa.DataType] = {}
     try:
-        df_cal_raw = _read_parquet_s3(staging_bucket, cal_s3_key)
+        # Arrow primero para capturar los tipos originales de cada columna --
+        # el round-trip por pandas degrada INT64+nulls a float64 (numpy no
+        # tiene int nullable). Se restaura más abajo junto con cln_dtype_map.
+        cal_arrow = _read_parquet_arrow_s3(staging_bucket, cal_s3_key)
+        df_cal_raw = cal_arrow.to_pandas()
         _normalize_merge_keys(df_cal_raw, KEYS)
         missing = [k for k in KEYS if k not in df_cal_raw.columns]
         if missing:
@@ -285,8 +297,9 @@ def _store_output(
         if dup_cal > 0:
             raise ValueError(f"CAL tiene {dup_cal} duplicados por {KEYS}: {cal_s3_key}")
         new_cols_cal = [c for c in df_cal_raw.columns if c not in cln_col_names]
+        cal_dtype_map = {f.name: f.type for f in cal_arrow.schema if f.name in new_cols_cal}
         df_cal = df_cal_raw[KEYS + new_cols_cal].copy() if new_cols_cal else None
-        del df_cal_raw
+        del df_cal_raw, cal_arrow
         gc.collect()
         log.info("_store_output: CAL loaded | mti=%s | new_cols=%d", mti, len(new_cols_cal))
     except S3.exceptions.NoSuchKey:
@@ -299,10 +312,12 @@ def _store_output(
     # ── 3. Cargar ITX completo (pequeño, si aplica) ───────────────────────────
     df_itx: Optional[pd.DataFrame] = None
     new_cols_itx: list[str] = []
+    itx_dtype_map: dict[str, pa.DataType] = {}
     itx_s3_key_used: Optional[str] = None
     if itx_s3_key_candidate:
         try:
-            df_itx_raw = _read_parquet_s3(staging_bucket, itx_s3_key_candidate)
+            itx_arrow = _read_parquet_arrow_s3(staging_bucket, itx_s3_key_candidate)
+            df_itx_raw = itx_arrow.to_pandas()
             _normalize_merge_keys(df_itx_raw, KEYS)
             missing = [k for k in KEYS if k not in df_itx_raw.columns]
             if missing:
@@ -312,8 +327,9 @@ def _store_output(
                 raise ValueError(f"ITX tiene {dup_itx} duplicados por {KEYS}: {itx_s3_key_candidate}")
             already_cols = cln_col_names | set(new_cols_cal)
             new_cols_itx = [c for c in df_itx_raw.columns if c not in already_cols]
+            itx_dtype_map = {f.name: f.type for f in itx_arrow.schema if f.name in new_cols_itx}
             df_itx = df_itx_raw[KEYS + new_cols_itx].copy() if new_cols_itx else None
-            del df_itx_raw
+            del df_itx_raw, itx_arrow
             gc.collect()
             itx_s3_key_used = itx_s3_key_candidate
             log.info("_store_output: ITX loaded | mti=%s | new_cols=%d", mti, len(new_cols_itx))
@@ -323,6 +339,11 @@ def _store_output(
             log.warning("_store_output: ITX load error (skipping) | %s | %s", itx_s3_key_candidate, exc)
             df_itx = None
             new_cols_itx = []
+
+    # cln_dtype_map queda al final para que gane en caso de colisión de
+    # nombres (no debería ocurrir: new_cols_cal/new_cols_itx ya excluyen
+    # columnas presentes en CLN).
+    dtype_map = {**cal_dtype_map, **itx_dtype_map, **cln_dtype_map}
 
     # ── 4. Streaming: iterar CLN por batches, merge, escribir ────────────────
     output_buf = io.BytesIO()
@@ -356,7 +377,7 @@ def _store_output(
         gc.collect()
 
         # Primer batch: derivar schema de salida; siguientes: forzarlo
-        batch_table = _restore_schema(batch_table, cln_dtype_map, output_schema)
+        batch_table = _restore_schema(batch_table, dtype_map, output_schema)
 
         if writer is None:
             output_schema = batch_table.schema

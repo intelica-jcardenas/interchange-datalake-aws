@@ -1337,33 +1337,39 @@ def load_parquet_safe(path: str, schema=None) -> DataFrame:
 def save_parquet(df: DataFrame, path: str) -> None:
     """
     Guarda DataFrame como un único archivo Parquet con el path exacto indicado.
- 
+
     Estrategia: convierte a pandas → escribe con pyarrow directamente al path.
     Esto preserva el nombre de archivo original (ej: 074b0b73..._idn_1240.parquet)
     en vez de generar un part-00000-xxx.parquet.
- 
+
     Aplica para archivos pequeños (un file_idn por vez), por lo que toPandas()
     es seguro — no hay riesgo de OOM.
+
+    Schema Arrow forzado desde df.schema (Spark) en vez de inferido desde
+    pandas, para que columnas 100% NULL en un batch no degraden su tipo
+    (ej. LongType→double).
     """
     import os
     import pyarrow as pa
     import pyarrow.parquet as pq
- 
+    from pyspark.sql.pandas.types import to_arrow_schema
+
     # Crear carpeta destino si no existe (relevante en local; en S3 no aplica
     # porque S3 no tiene directorios reales, pero no rompe nada)
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
- 
+
+    arrow_schema = to_arrow_schema(df.schema)
+    # Forzar "us" sin timezone en timestamps (mismo criterio que el resto del
+    # pipeline) -- to_arrow_schema() puede adjuntar timezone de Spark.
+    arrow_schema = pa.schema([
+        f.with_type(pa.timestamp("us")) if pa.types.is_timestamp(f.type) else f
+        for f in arrow_schema
+    ])
+
     pdf = df.toPandas()
- 
-    # Normalizar timestamps: Spark puede producir ns, pyarrow espera us
-    # Usamos dtype check directo para evitar falsos positivos de Pylance.
-    for col in pdf.columns:
-        if str(pdf[col].dtype).startswith("datetime64"):
-            pdf[col] = pdf[col].astype("datetime64[us]")
- 
-    table = pa.Table.from_pandas(pdf, preserve_index=False)
+    table = pa.Table.from_pandas(pdf, schema=arrow_schema, preserve_index=False, safe=False)
     pq.write_table(
         table,
         path,

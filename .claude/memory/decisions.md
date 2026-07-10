@@ -360,3 +360,5 @@ Mismo principio que deja a Visa en "0 inconsistencias" (`_cal_dtype_map`, ver de
 **Limpieza get_transaction.py (2026-06-13):** eliminado código Option A sin uso (`_NANOS_AS_LONG_COLS`, `_widest_arrow_type`, `_align_table_to_schema`, `_read_operational_via_pyarrow`, exclusión NullType, `spark.sql.legacy.parquet.nanosAsLong` + imports asociados). `read_operational()` quedó como `spark.read.parquet()` simple. Re-validado (`report_suffix=20260102_0105_mc_v3`).
 
 Detalle completo (tabla de las 29 columnas corregidas) → `.claude/memory/decisions_archive.md`.
+
+**Extensión 2026-07-09:** el mismo problema (int64+nulls→float64 por roundtrip pandas) también afectaba a columnas *nuevas* de CAL/ITX (ej. `jurisdiction_region`), sin captura de schema Arrow previa en `mc-store`. Fix: `_read_parquet_arrow_s3()` aplicado también a CAL/ITX. **Insuficiente por sí solo** — la causa raíz real estaba un paso antes, en `glue-mc-calculate` (`save_parquet()` escribía CAL sin schema explícito). Ver gotcha "jurisdiction_region/settlement_report_amount..." en `gotchas.md` para el fix completo y su validación.

@@ -425,7 +425,9 @@ def _cast_df(
  
         elif t == "string":
             out[col] = out[col].astype("string")
- 
+            if col == "pan_de_2":
+                out[col] = out[col].str.replace(r"\D", "0", regex=True)
+
         elif t == "timestamp":
             if timestamp_format:
                 s = (

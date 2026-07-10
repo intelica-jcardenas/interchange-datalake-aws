@@ -1165,7 +1165,7 @@ def transform_mastercard_scheme_fee(
         F.col("file_type").alias("app_type_file"),
         F.col("customer_code").alias("app_customer_code"),
         F.col("content_hash").alias("app_hash_file"),
-        F.monotonically_increasing_id().cast(LongType()).alias("app_id"),
+        F.col("ref_id").cast(LongType()).alias("app_id"),
         F.lit("MasterCard").alias("table_description"),
         F.col("date").alias("app_processing_date"),
         F.col("pan_de_2").cast(StringType()).substr(1, 16).alias("account_number"),
@@ -1487,6 +1487,11 @@ def run_generate():
     write_csv_to_s3(export_pdf, SCHEME_FEE_BUCKET, out_key)
 
     report_pdf["app_id"] = export_pdf["app_id"].values
+
+    # NaN (float64, no int nullable) != SQL NULL para eqNullSafe -- normalizar antes del roundtrip a Spark.
+    for col in report_pdf.columns:
+        if pd.api.types.is_float_dtype(report_pdf[col]):
+            report_pdf[col] = report_pdf[col].astype(object).where(report_pdf[col].notna(), None)
 
     detail_df.write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/detail/")
     spark.createDataFrame(report_pdf).write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/report/")

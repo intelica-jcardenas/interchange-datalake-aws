@@ -507,3 +507,4 @@ Archivos con contexto acumulado del proyecto — decisiones tomadas y problemas 
 - Gotchas y problemas conocidos: @.claude/memory/gotchas.md
 - Ejecución manual / debugging paso a paso: @.claude/memory/manual_execution.md
 - Pendientes activos (checklist): @.claude/memory/pending.md
+- Scheme Fee — etapas generate/read vs legacy y carpetas s3-analytics (temporal, retirar al cerrar el desarrollo): @.claude/memory/scheme_fee_generate_read_pipeline.md

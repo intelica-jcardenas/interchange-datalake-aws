@@ -1,5 +1,89 @@
 # Gotchas y problemas conocidos
 
+## SMS: interchange_fees_amount +60% de más, concentrado 100% en transaction_type_id=22 (ATM cash withdrawal) — causa en glue-vi-interchange, no en get_transaction.py — PENDIENTE
+
+**Detectado:** 2026-07-09, validando `transform_visa_sms()` (recién activada, ver gotcha de `xr3_rate` más abajo) contra `analytics.get_visa_sms_transactions()` real, SBSA enero 2026.
+
+**Estado de la validación SMS en `get_transaction.py`:** `count` y `transaction_amount` cuadran **exacto** (1,472,615=1,472,615, $1,059,497,522.78=$1,059,497,522.78, 0.0000% diff) tras el fix de `xr3_rate`. `interchange_fees_amount` da +60.55% de más (621,932.53 nuevo vs 387,370.47 legacy) — pero acotado 100% a `transaction_type_id=22` (ATM cash withdrawal, MCC 6011, processing_code=01): el resto de tipos (247, 249, NULL) y la jurisdiction `off-us` dan fee=0 en ambos sistemas, correctamente.
+
+Desglose del residual (todo en type=22):
+| jurisdiction | fees_new | fees_legacy | diff% |
+|---|---|---|---|
+| interregional | 404,111.37 | 233,773.08 | +72.86% |
+| intraregional | 217,821.16 | 153,597.40 | +41.81% |
+
+**No es un bug de `get_transaction.py`** — la fórmula de conversión de moneda para `interchange_fees_amount` (`xr1_rate * interchange_fee_amount`, igual patrón que BASEII, ya validado) es correcta. El problema está en el **cálculo del fee en sí**, hecho por `glue-vi-interchange` (asignación de regla IAR / cálculo de `interchange_fee_amount` para el `type_record` SMS) — mismo motor que BASEII (`evaluate_interchange_fees`/`calculate_fee_amounts`), que sí valida con diff≈0% para BASEII. Causa no identificada aún — candidato a revisar: si algunas transacciones type=22 (ATM) también tienen `source_amount=0` (como el caso ya conocido de `transaction_amount`/cryptogram) y el cálculo del fee en Spark usa `source_amount` crudo en vez del valor ajustado.
+
+**Estado:** Pendiente de investigar y reprocesar si aplica — no bloquea cerrar la validación de `transform_visa_sms()` en `get_transaction.py` (que ya está correcta para count/monto). Ver `.claude/memory/pending.md`.
+
+---
+
+## SMS: transform_visa_sms() reemplazaba el hardcode de USD del legacy por la moneda real del cryptograma — RESUELTO Y VALIDADO
+
+**Archivo:** `glue/scripts/reports/get_transaction/get_transaction.py` (función `transform_visa_sms`)
+**Detectado y corregido:** 2026-07-09, primera validación end-to-end de esta función (estaba comentada/nunca activada).
+
+Un intento anterior de esta función reemplazó el hardcode de moneda USD (que el legacy usa siempre, sin excepción, para el fallback de `cryptogram_amount + surcharge_amount_sms` cuando `source_amount=0`: `X3.currency_from_code = '840' -- USD; Special Case` en el SQL) por una búsqueda de la moneda real reportada en `cryptogram_currency_code`. Esto producía montos ~16x menores que el legacy para `business_transaction_type=247` (consulta de saldo en cajero, MCC 6011) en SBSA (moneda local ZAR, tasa ZAR/USD ≈16-18).
+
+**Fix:** revertido a un join fijo `xr3_rate` = USD → report_currency (por fecha, sin depender de ninguna columna de moneda de la transacción), usado solo en el branch `source_amount=0` de `transaction_amount`. `xr1_rate` (antes condicionado a la moneda "efectiva") vuelve a ser siempre `source_currency_code_alphabetic → report_currency`, igual que BASEII.
+
+**Intento fallido en el camino (revertido):** se intentó también hacer que `interchange_fees_amount` usara `xr2_rate` (moneda del fee) con la misma lógica de 3 ramas del SQL legacy (`X2`/`X3` según si `fee_currency = report_currency`) — pero esto causó una **doble conversión**: `glue-vi-interchange` ya normaliza `interchange_fee_amount` a `source_currency` internamente (decisión documentada: "el resultado queda en source_currency"), a diferencia del legacy cuyo cálculo de fee sí queda en `fee_currency` y por eso necesita el join X2/X3 en el reporte. Revertido a la fórmula simple `xr1_rate * interchange_fee_amount`, igual que BASEII (ya validado).
+
+**Validación:** SBSA enero 2026, comparado contra `analytics.get_visa_sms_transactions()` real (no la tabla de prueba legacy, que no incluye SMS) llamada día por día. `count`=1,472,615 exacto, `transaction_amount`=$1,059,497,522.78 exacto (incluye el caso `transaction_type_id=247` que antes fallaba: ahora $5,835,143.23 exacto).
+
+**Estado:** RESUELTO Y VALIDADO para `get_transaction.py`. Ver gotcha arriba para el residual de `interchange_fees_amount` (bug distinto, en `glue-vi-interchange`, aún pendiente).
+
+---
+
+## glue-mc-calculate: calculate_pre2() usa un envelope de 9 dígitos en vez del PAN real para el range-join IAR — explica solo ~11% del gap jurisdiction_code NULL-vs-off-us en MC — PARCIALMENTE INVESTIGADO
+
+**Archivo:** `glue/scripts/mastercard/calculate/calculate.py` (función `calculate_pre2`, líneas ~663-670)
+**Detectado:** 2026-07-09, durante revisión de `get_transaction.py` (comparativo agregado SBSA enero 2026, ver `tst_files/reporting/sbsa/comparativo_aggregated_sbsa.md`).
+
+**Síntoma:** agrupando el reporte por `jurisdiction_code` (brand=MC), el conteo total por fecha cuadra exacto (diff=0 en todas las fechas), pero la distribución interna difiere: `jurisdiction_code=NULL` da 249 en el nuevo sistema vs 7,326 en legacy; `jurisdiction_code=off-us` da +6,812 de más en el nuevo. Es decir, ~6,800 transacciones que legacy deja sin clasificar (sin fila en `dh_mastercard_calculated_field_*`, porque `adapters.py` arma esa tabla con **INNER JOIN contra IAR**) el nuevo sistema SÍ las clasifica (con LEFT JOIN, diseño correcto — la discusión no es LEFT vs INNER, ver `decisions.md`/conversación relacionada).
+
+**Causa raíz confirmada (parcial):** `calculate_pre2()` arma el rango de la transacción con un envelope de 9 dígitos — `num_card_low = pan_prefix9 * 10^9`, `num_card_high = pan_prefix9 * 10^9 + 999999999` — y hace un join por **overlap de intervalos** contra IAR, en vez de un punto exacto. Legacy usa el PAN real completo (`left(rpad(pan,18,'0'),18)`) y un chequeo `BETWEEN` puntual. Cuando un prefijo de 9 dígitos tiene rangos IAR angostos que no lo cubren completo (confirmado con ejemplos reales: prefijo `541432330` solo tiene 4 sub-rangos MUS de 10M cada uno dentro de un bucket de 1,000M), el envelope de nuestro sistema matchea igual aunque el PAN real caiga en el hueco — legacy correctamente no matchea (NULL), nosotros sí (asignamos país/jurisdiction real).
+
+**Cuantificado con datos reales (SBSA, 9 archivos MC OUT IPM_1240, 8 fechas distintas de enero, IAR filtrado a la fecha correcta de cada archivo):** 2,012,393 transacciones analizadas, 20 con match falso-positivo (0.0010%) → proyectado al mes completo (~76.9M txns MC) ≈ **764 transacciones, ~11% del gap de 6,812**. Metodología: comparación exacta punto-en-rango (PAN real, `rpad` a 18 dígitos) vs el resultado que produciría el envelope de 9 dígitos, usando el IAR real descargado de `s3-reference/mastercard_iar/historic_data.parquet`.
+
+**Descartado como causa:** diferencia de contenido/cobertura de la tabla IAR — confirmado que el conteo de rangos activos tras filtro+dedup (`active_inactive_code='A'`, `app_date_valid<=file_date`, dedup por `low_key_for_range`) es **idéntico** (186,454) entre nuestro `historic_data.parquet` y la tabla viva `operational.dh_mastercard_iar` en Postgres, a la misma fecha de corte.
+
+**Confirmado que NO lo resuelven los fixes recientes:** se regeneró el reporte completo de SBSA (`glue-get-transaction`, 2026-07-09) sobre datos ya reprocesados con el fix de máscara de PAN y el fix de schema Arrow (`jurisdiction_region`/`settlement_report_amount`) — el comparativo salió **byte-idéntico** al anterior. Esperado: ninguno de esos dos fixes toca la lógica de `calculate_pre2()`.
+
+**Sin explicar (~89% del gap, ~6,000 transacciones):** no se identificó la causa. Se descartó IAR desactualizado; el bug de envelope de 9 dígitos solo cubre una fracción pequeña. Candidato no confirmado: 541 pares de rangos IAR consecutivos que se solapan entre sí incluso después del dedup por `low_key_for_range` (potencial tie-break distinto entre nuestro dedup y el de legacy) — pero ese mecanismo explicaría diferencias de país **entre transacciones que ya matchean en ambos sistemas** (consistente con los residuales pequeños de `intraregional` +202 e `interregional` +63), no el salto NULL→off-us que es el grueso del gap.
+
+**Impacto en dólares:** mínimo — `interchange_fees_amount_diff` de MC es +10,001.28 ZAR sobre 221.9M (0.0045%), ya documentado como residual aceptado en `pending.md`.
+
+**Estado:** Investigación pausada por decisión del usuario — impacto bajo, no justifica seguir cavando ahora. Si se retoma: comparar el dedup IAR fila-por-fila (no solo conteo) entre nuestro sistema y legacy para cerrar el residual de intra/interregional; investigar el 89% restante del gap NULL-vs-off-us (causa aún desconocida).
+
+---
+
+## account_number/pan_de_2 con caracteres de máscara (*/?) sin limpiar — legacy los convertía a '0' — RESUELTO
+
+**Archivos:** `lambdas/visa/clean/src/handler.py`, `lambdas/mastercard/clean/src/handler.py`
+**Detectado:** 2026-07-09, comparando `mct_cd` de `scheme_fee.py` contra CSV legacy real.
+
+Visa enmascara los últimos dígitos del PAN con `*`, Mastercard con `?` (byte EBCDIC `0x6F`, decodificación correcta — no es bug de encoding). Legacy (`adapters.py`) reemplazaba esos caracteres por `'0'` al ingerir; nuestro pipeline nunca lo hacía. Fix: en `_clean_chunk()`/`_cast_df()`, reemplazo genérico de cualquier caracter no numérico (`\D`→`'0'`) en `account_number`/`pan_de_2` — no hardcodea el caracter de máscara, para cubrir otras convenciones de red/cliente.
+
+**Estado:** RESUELTO Y VALIDADO. Reprocesado SBSA/202601 completo (clean+store, VI+MC, IN+OUT) el 2026-07-09 — 0 caracteres no numéricos remanentes.
+
+---
+
+## jurisdiction_region/settlement_report_amount con tipo Arrow inconsistente entre bloques — causa raíz real en glue-mc-calculate, no en mc-store — RESUELTO Y VALIDADO
+
+**Archivos:** `glue/scripts/mastercard/calculate/calculate.py` (`save_parquet()`, causa raíz) y `lambdas/mastercard/store/src/handler.py` (`_restore_schema()`, fix complementario).
+**Detectado:** 2026-07-09, escaneo de schema-variance de SBSA operational.
+
+Primer intento (solo `mc-store`): `_restore_schema()` solo restauraba tipos degradados por el roundtrip pandas para columnas de CLN (`cln_dtype_map`, capturado con `pq.ParquetFile` antes de pandas) — las columnas nuevas de CAL/ITX se cargaban con `pd.read_parquet()` directo. Fix: nuevo helper `_read_parquet_arrow_s3()` aplicado también a CAL/ITX, combinando `cal_dtype_map`/`itx_dtype_map` con `cln_dtype_map`. Este fix por sí solo **no alcanzó** — reprocesar solo `store` no cambió nada, porque CAL ya venía mal desde el origen.
+
+**Causa raíz real:** `save_parquet()` en `calculate.py` escribe CAL con `df.toPandas()` → `pa.Table.from_pandas(pdf)` **sin schema explícito** — aunque Spark ya castea `jurisdiction_region` a `LongType()` y `settlement_report_amount` a `Decimal(18,4)`, ese cast no sobrevive el paso por pandas: si una columna es 100% NULL en un bloque, pandas la degrada a `float64`; para decimales, PyArrow infiere la precisión mínima que ajuste a los valores de CADA bloque en vez de respetar el `Decimal(18,4)` declarado. Confirmado leyendo el CAL con `pq.read_schema()` (sin pandas): ya salía mal desde `calculate.py`, antes de que `mc-store` lo tocara.
+
+**Fix real:** en `save_parquet()`, derivar el schema Arrow desde `df.schema` (Spark, ya casteado correctamente) con `pyspark.sql.pandas.types.to_arrow_schema()`, forzar timestamps a `us` sin timezone, y pasar ese schema explícito a `pa.Table.from_pandas(pdf, schema=arrow_schema, safe=False)` en vez de dejar que infiera desde los datos.
+
+**Validación:** archivo de prueba conocido (`CEA663ACCB17D5F395B5728D03FAD181`, IPM_1240 OUT 2026-01-02) confirmó `jurisdiction_region: double→int64` y `settlement_report_amount: decimal(7-11,4)→decimal(18,4)`. Reproceso completo `calculate`+`store` SBSA/202601 (104 archivos MC): 104/104 OK ambas etapas. Scan de schema-variance post-reproceso: 0 inconsistencias en IPM_1240 (390 archivos) e IPM_1442 (118 archivos). Crawler `itl_0004_itx_dev_02_glue_crawler_operational_sbsa_mc` re-corrido — catálogo confirma `jurisdiction_region=bigint`, `settlement_report_amount=decimal(18,4)` consistente.
+
+**Si vuelve a aparecer (`double` donde se esperaba `int`, o precisión decimal variable entre archivos) en cualquier columna de CAL/ITX:** sospechar primero de `save_parquet()` (o su equivalente) escribiendo sin schema explícito — mismo patrón recurrente en este proyecto (pandas no tiene int nullable, infiere decimal desde los valores).
+
 Problemas encontrados durante el desarrollo, con su causa raíz y solución recomendada. Verificar si siguen vigentes antes de actuar. Gotchas resueltos y validados con detalle completo (síntoma, debugging, validación paso a paso) fueron movidos a `.claude/memory/gotchas_archive.md` (no cargado automáticamente) — cada entrada resumida abajo tiene su pointer correspondiente.
 
 ---

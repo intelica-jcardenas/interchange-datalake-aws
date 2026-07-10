@@ -172,6 +172,8 @@ def _clean_chunk(chunk_df: pd.DataFrame, field_defs_dict: dict, file_date: str):
         if f_def:
             try:
                 cleaned = _clean_field_values(chunk_df[col], f_def, file_date)
+                if col == 'account_number':
+                    cleaned = cleaned.str.replace(r'\D', '0', regex=True)
                 cleaned.name = col
                 cleaned_fields.append(cleaned)
                 fields_cleaned += 1
