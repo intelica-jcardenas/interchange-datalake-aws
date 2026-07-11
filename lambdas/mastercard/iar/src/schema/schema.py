@@ -1,4 +1,11 @@
-# file: iar/iar_schema.py
+"""
+schema.py
+
+Módulo interno del pipeline IAR (Mastercard) — define el layout de columnas
+de salida (orden final) de la tabla IP0040T1 (rangos de BIN/reglas), usado
+por `clean.py` (`clean_ip0040t1`) para completar columnas faltantes y
+reordenar el DataFrame antes de escribirlo a S3.
+"""
 
 IP0040T1_OPERATIONAL_COLUMNS = [
     "app_customer_code",

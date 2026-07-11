@@ -1,4 +1,13 @@
-# file: iar/iar_transform.py
+"""
+transform.py
+
+Capa TRANSFORM del pipeline IAR (Mastercard) — módulo interno importado por
+`handler.py` (`pipeline_iar`, paso "TRANSFORM"). Define el layout de
+posiciones fijas de cada tabla IPM soportada (hoy solo IP0040T1, rangos de
+BIN/reglas) y expande los records de detalle de la capa RAW en columnas de
+negocio, análogo a la etapa `extract` de Visa/Mastercard en el flujo
+transaccional pero para archivos de reglas.
+"""
 
 
 from logs.logger import logger
@@ -6,11 +15,23 @@ from logs.logger import logger
 import pandas as pd
 
 def getIPMParameters()->dict:
-        """stores IPM tables parameters
-        
+        """
+        Layout de posiciones fijas (start/end en el texto del record) para
+        interpretar los distintos tipos de record de un archivo IAR: los dos
+        formatos de header ("update_header"/"replace_header", ver
+        `parse_header_raw` en `raw.py`), el catálogo IP0000T1 ("key") y las
+        columnas de cada tabla de negocio soportada bajo "tables" (hoy solo
+        "IP0040T1"). `low_range`/`gcms_product` están marcados como parte de
+        la llave de negocio (comentario `# part_of_key`, ver `BUSINESS_KEYS`
+        en `calculate.py`).
+
         Returns:
-           params (dict): Dictionary with structure for IPM tables read 
-        
+           dict con la estructura de layouts descrita arriba, usado por
+           `transform_iar_table_from_raw` para cortar cada record.
+
+        Ejemplo:
+            params = getIPMParameters()
+            params["tables"]["IP0040T1"]["low_range"]  # {"start": 11, "end": 30, "data_type": "int64"}
         """
 
         params = {
@@ -116,6 +137,38 @@ def transform_iar_table_from_raw(
     client_id,
     file_id,
 ) -> pd.DataFrame:
+    """
+    Expande los records de detalle de una tabla de negocio (ej. IP0040T1) en
+    columnas, usando el layout de posiciones fijas de `params["tables"]` y el
+    `table_sub_id` correspondiente (obtenido del catálogo IP0000T1). Agrega
+    también metadatos de trazabilidad (`app_full_data`, `app_processing_date`,
+    `app_type_file`, `app_customer_code`, `app_hash_file`, etc.) a cada fila.
+
+    Args:
+        df_records: DataFrame de records de detalle (capa RAW, todas las
+            tablas mezcladas).
+        df_catalog: DataFrame del catálogo IP0000T1 (capa RAW), usado para
+            resolver `table_sub_id` a partir de `table_to_look`.
+        df_header: DataFrame del header (capa RAW), 1 fila.
+        table_to_look: Nombre de la tabla de negocio a extraer, ej.
+            "IP0040T1".
+        params: dict de layouts, salida de `getIPMParameters()`.
+        client_id: Identificador del cliente (se agrega como
+            `app_customer_code`).
+        file_id: Identificador del archivo (se agrega como `app_hash_file`).
+
+    Returns:
+        DataFrame con una fila por record de detalle de `table_to_look`, con
+        sus columnas de negocio ya cortadas por posición más los metadatos
+        de trazabilidad.
+
+    Raises:
+        ValueError: si `table_to_look` no existe en `df_catalog`.
+
+    Ejemplo:
+        transform_iar_table_from_raw(df_records, df_catalog, df_header,
+            "IP0040T1", getIPMParameters(), "SBSA", "ABC123...")
+    """
 
     catalog_match = df_catalog[df_catalog["table_ipm_id"] == table_to_look]
 

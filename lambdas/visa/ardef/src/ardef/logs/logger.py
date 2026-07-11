@@ -1,3 +1,12 @@
+"""
+logger.py
+
+Utilitario de logging del motor de reglas ARDEF de Visa. Provee una clase
+`Logger` que envuelve `logging.getLogger` con configuración estándar
+(formato, nivel, handlers) consistente en todos los módulos de `ardef`, con
+comportamiento distinto según se ejecute en AWS Lambda o localmente.
+"""
+
 import logging
 import logging.handlers
 import os
@@ -12,7 +21,9 @@ if not running_in_lambda:
 
 class Logger:
     """
-    Provides a standardized logger object to print and store log messages.
+    Provee un logger estandarizado para imprimir y persistir mensajes de log
+    en todos los módulos de `ardef`, evitando handlers duplicados si ya se
+    instanció un `Logger` con el mismo `name`.
 
     En Lambda: solo StreamHandler -> stdout -> CloudWatch Logs automáticamente.
     En local: StreamHandler -> FileHandler -> consola -> archivo de log en disco.
@@ -35,7 +46,30 @@ class Logger:
     )
 
     def __init__(self, name: str) -> None:
+        """
+        Obtiene (o crea) el logger de Python con el `name` indicado y le
+        configura nivel + handlers una única vez. Si el logger ya tiene
+        handlers (misma instancia reutilizada, ej. mismo `__name__` en
+        distintos módulos), no vuelve a configurarlos — evita duplicar
+        líneas de log.
 
+        Configura siempre un StreamHandler (en Lambda, stdout es capturado
+        automáticamente por CloudWatch Logs; en local, imprime en consola).
+        Además, solo si NO se está ejecutando en Lambda (detectado por la
+        ausencia de la variable de entorno AWS_LAMBDA_FUNCTION_NAME, que AWS
+        inyecta automáticamente), agrega un `TimedRotatingFileHandler` que
+        rota diariamente y conserva 3 backups.
+
+        Args:
+            name: nombre del logger, típicamente `__name__` del módulo que lo crea.
+
+        Returns:
+            None. Deja el logger configurado en `self.logger`.
+
+        Ejemplo:
+            log = Logger(__name__)
+            log.logger.info("mensaje")
+        """
         self.logger = logging.getLogger(name)
 
         if self.logger.handlers:
@@ -47,15 +81,11 @@ class Logger:
         formatter = logging.Formatter(self._DEFAULT_FMT)
 
         # StreamHandler siempre activo
-        # En Lambda, stdout es capturado automáticamente por CloudWatch.
-        # En local, imprime en consola.
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
 
-        #FileHandler solo en local (cuando NO estamos en Lambda).
-        # Lambda inyecta AWS_LAMBDA_FUNCTION_NAME automáticamente.
-        # Si esa variable no existe -> entorno local -> agregar FileHandler.
+        # FileHandler solo en local (cuando NO estamos en Lambda)
         running_in_lambda = "AWS_LAMBDA_FUNCTION_NAME" in os.environ
 
         if not running_in_lambda:

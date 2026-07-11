@@ -1,3 +1,14 @@
+"""
+clean.py
+
+Capa CLEAN del pipeline IAR (Mastercard) — módulo interno importado por
+`handler.py` (`pipeline_iar`, paso "CLEAN"). Normaliza el DataFrame crudo de
+la tabla IP0040T1 (rangos de BIN/reglas) producido por `transform.py`:
+completa columnas faltantes del layout, limpia strings, castea numéricos,
+parsea fechas y calcula la vigencia inicial (`app_date_valid`) antes de que
+`calculate.py` la use para el cálculo SCD2 completo.
+"""
+
 from datetime import datetime
 
 import pandas as pd
@@ -6,6 +17,28 @@ from schema.schema import IP0040T1_OPERATIONAL_COLUMNS
 
 
 def clean_ip0040t1(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza y castea el DataFrame de IP0040T1 según el layout operacional
+    (`IP0040T1_OPERATIONAL_COLUMNS`): crea con `None` cualquier columna del
+    layout ausente en `df`, limpia strings (`strip` + cadena vacía → `NA`),
+    castea `low_range`/`high_range` a numérico, parsea `app_processing_date`
+    (formato `YYYYMMDD`) y calcula `app_date_valid` a partir de
+    `effective_timestamp` (formato Mastercard `yy` + día juliano + `HHMM`,
+    completando con `"00"` los minutos faltantes). Agrega metadatos de
+    creación (`app_creation_user`/`app_creation_date`) y reordena columnas
+    según el layout antes de retornar.
+
+    Args:
+        df: DataFrame crudo de IP0040T1 (salida de
+            `transform_iar_table_from_raw`).
+
+    Returns:
+        Copia de `df` con tipos normalizados y columnas en el orden de
+        `IP0040T1_OPERATIONAL_COLUMNS`.
+
+    Ejemplo:
+        clean_ip0040t1(df_staging)  # DataFrame listo para la capa CALCULATE
+    """
     df = df.copy()
 
     # Crear columnas faltantes
@@ -43,8 +76,7 @@ def clean_ip0040t1(df: pd.DataFrame) -> pd.DataFrame:
         errors="coerce"
     ).dt.date
 
-    # Campo calculado de vigencia:
-    # effective_timestamp + "00" con formato yy + julian day + HHMM
+    # Campo calculado de vigencia (ver docstring de la función)
     effective_value = (
         df["effective_timestamp"]
         .astype("string")

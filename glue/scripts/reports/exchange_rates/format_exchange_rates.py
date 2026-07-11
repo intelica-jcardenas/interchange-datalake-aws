@@ -1,25 +1,38 @@
 """
-Glue ETL Job: enriquecimiento de exchange_rates con el maestro de monedas (m_currency)
+format_exchange_rates.py — Job real: itl-0004-itx-dev-intchg-02-glue-exchange-rates
+================================================================================
+Archivo:     glue/scripts/reports/exchange_rates/format_exchange_rates.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/format_exchange_rates.py
 
-Database  : itl_0004_itx_dev_02_glue_database_exchange_rates
-Input     : exchange_rates  (particionada por brand, exchange_date)
-            m_currency_csv  (currency_numeric_code, currency_alphabetic_code)
-Output    : exchange_rates_enriched
-            Mismo particionado (brand, exchange_date) + from_currency_numeric_code
-            y to_currency_numeric_code resueltos contra el maestro.
+Enriquece la tabla de tasas de cambio scrapeadas (exchange_rates, con solo
+códigos alfabéticos de moneda) cruzándola contra el maestro de monedas
+(m_currency) para resolver los códigos numéricos. Escribe el resultado
+particionado por brand y exchange_date, con sobreescritura dinámica por
+partición — solo reemplaza fechas presentes en la corrida actual, dejando
+intactas las que no cambiaron.
 
-Requiere que ambas tablas de entrada ya estén catalogadas en la base de datos
-indicada.
+Flujo:
+  1. Lectura bookmarked de exchange_rates (solo cambios desde la última
+     corrida exitosa) y lectura completa de m_currency (maestro pequeño que
+     puede evolucionar).
+  2. Normalización del maestro: un registro por código alfabético, deduplicado.
+  3. Cruce left join por from_currency y to_currency hacia códigos numéricos.
+  4. Reparticionamiento por brand/exchange_date + escritura en modo overwrite
+     dinámico.
+  5. Registración en catálogo Glue solo de particiones nuevas (las existentes
+     conservan su ubicación S3, solo se actualiza el contenido del archivo).
 
-Job Bookmarks: habilitados solo para exchange_rates (--job-bookmark-option
-job-bookmark-enable + transformation_ctx). m_currency_csv se relee completo
-en cada corrida, ya que es un maestro pequeño que puede cambiar.
-
-Escritura: overwrite dinámico por partición (spark.sql.sources.
-partitionOverwriteMode=dynamic), así que si una fecha ya procesada se
-sobrescribe en el origen, esta corrida vuelve a leerla (bookmark detecta el
-archivo modificado) y reemplaza esa partición en destino en vez de
-duplicarla. Las particiones no tocadas en la corrida actual no se modifican.
+Database / Input / Output:
+  Database: itl_0004_itx_dev_02_glue_database_exchange_rates
+  Input:
+    - exchange_rates (bookmarked, particionada por brand, exchange_date;
+      contiene from_currency, to_currency, exchange_rate)
+    - m_currency_csv (maestro pequeño: currency_alphabetic_code,
+      currency_numeric_code)
+  Output:
+    - exchange-rates-glue (destino S3 + tabla catálogo)
+    - Mismo particionado que input + 2 columnas nuevas:
+      from_currency_numeric_code, to_currency_numeric_code
 """
 
 import sys

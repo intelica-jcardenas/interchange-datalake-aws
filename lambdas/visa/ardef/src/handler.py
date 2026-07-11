@@ -1,11 +1,46 @@
-import gc 
-import json 
+"""
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-vi-ardef
+================================================================================
+Archivo:     lambdas/visa/ardef/src/handler.py
+
+Punto de entrada del motor de reglas ARDEF de Visa (rangos de BINes y reglas
+de fees). El router invoca este Lambda de forma asíncrona (InvocationType=
+'Event', sin Step Functions — ver decision.md "Por qué ARDEF e IAR no usan
+Step Functions") cuando clasifica un archivo con direction=ARDEF. Orquesta
+las 5 etapas internas del pipeline ARDEF (interpreter → transform → clean →
+calculate → operational), que van dejando el archivo en distintos subdirs de
+STAGING hasta consolidar la tabla maestra acumulada lu_ardef en REFERENCE —
+la que usan las Lambdas de calculate de Visa (calc_ardef) para cruzar
+transacciones contra el rango de BIN/regla vigente en la fecha de la
+transacción.
+
+Flujo:
+1. Recibir evento del router (payload en variables_input, ver
+   `_extract_event_params`)
+2. Validar file_id / file_processing_date
+3. Ejecutar interpretate_ardef() → transform_ardef() → clean_ardef() →
+   calculate_ardef() → load_operational_ardef(), en ese orden
+4. Liberar memoria (gc.collect) al finalizar
+
+Variables de entorno:
+  ITX_CLIENT_ID                : client_id por defecto (default: DEMO)
+  ITX_ENVIRONMENT              : nombre del ambiente (default: development)
+  ITX_S3_BUCKET_LANDING        : bucket de landing
+  ITX_S3_BUCKET_STAGING        : bucket de staging (etapas intermedias RAW/TRA/CLN/CAL)
+  ITX_S3_BUCKET_OPERATIONAL    : bucket de operational (salida final)
+  ITX_S3_BUCKET_REFERENCE      : bucket de reference (tabla maestra lu_ardef)
+  ITX_TABLE_FILE_CONTROL       : tabla DynamoDB de control de archivos
+  ITX_LOG_LEVEL                : nivel de logging (default: info)
+"""
+
+import gc
+import json
 import logging
 
 from ardef import calculate, clean, interpreter, operational, transform
 from ardef.persistence.file import FileStorage
 
-# Logger estándar 
+# Logger estándar
 # Lambda captura automáticamente todo lo que va a stout/stderr
 # y lo envía a CloudWatch logs sin configuración adicional.
 logger = logging.getLogger()
@@ -16,7 +51,24 @@ layer = FileStorage.Layer
 
 def _pipeline_ardef(file_id: str, file_processing_date: str) -> None:
     """
-    Orquesta las 5 etapas del pipeline ARDEF en orden.
+    Orquesta las 5 etapas del pipeline ARDEF en orden: interpreter → transform
+    → clean → calculate → operational. Cada etapa lee el output de la
+    anterior desde STAGING y escribe la suya en el mismo bucket, hasta que
+    `calculate_ardef` actualiza la tabla maestra lu_ardef en REFERENCE y
+    `load_operational_ardef` consolida el resultado final en OPERATIONAL.
+
+    Args:
+        file_id: ID único del archivo asignado por el router (MD5 del
+            contenido o variante si es una nueva versión).
+        file_processing_date: Fecha de negocio del archivo, formato
+            "YYYY-MM-DD".
+
+    Returns:
+        None. Lanza cualquier excepción de las etapas internas sin capturarla
+        — el try/except de `lambda_handler` es quien la maneja.
+
+    Ejemplo:
+        _pipeline_ardef("1606e40fdc88e10521c619ef69666528", "2026-04-24")
     """
     interpreter.interpretate_ardef(
         origin_layer=layer.LANDING,
@@ -58,7 +110,8 @@ def _pipeline_ardef(file_id: str, file_processing_date: str) -> None:
 
 def _extract_event_params(event:dict) -> tuple[str, str]:
     """
-    Extrae y valida file_id y file_processing_date del evento.
+    Extrae y valida file_id y file_processing_date del evento recibido del
+    router.
 
     El router invoca este Lambda con InvocationType='Event' (asíncrono)
     pasando el siguiente payload en variables_input:
@@ -76,7 +129,19 @@ def _extract_event_params(event:dict) -> tuple[str, str]:
             "content_hash":   "ABC123...",
         }
 
+    Nota: el router usa la clave 'file_date', pero internamente el pipeline
+    ARDEF la maneja como 'file_processing_date' — el mapeo ocurre acá.
 
+    Args:
+        event: Payload del router tal cual llega al handler (dict de arriba).
+
+    Returns:
+        Tupla (file_id, file_processing_date), ambos strings ya validados
+        como no vacíos.
+
+    Ejemplo:
+        _extract_event_params({"file_id": "ABC123", "file_date": "2026-04-24"})
+        # -> ("ABC123", "2026-04-24")
     """
     file_id: str = event.get("file_id", "").strip()
 
@@ -110,13 +175,20 @@ def lambda_handler(event, context):
         - Calculado el content_hash y verificado que no es duplicado
 
     Args:
-        event: dict con el payload del router (_extract_evetn_params)
-        context: objeto con info de la ejecución Lambda (tiempo restante, etc.)
+        event: dict con el payload del router (ver `_extract_event_params`).
+        context: objeto con info de la ejecución Lambda (tiempo restante, etc.),
+            no se usa directamente en este handler.
 
     Returns:
-        dict con statusCode 200 si el pipeline completa sin errores, 
-        400 si el payload está mal formado, 
-        500 si ocurre un error durante el pipeline.
+        dict con statusCode 200 si el pipeline completa sin errores,
+        400 si el payload está mal formado,
+        500 si ocurre un error durante el pipeline. El body siempre incluye
+        file_id, file_processing_date, client_id y filename para trazabilidad
+        en CloudWatch.
+
+    Ejemplo:
+        lambda_handler({"file_id": "ABC123", "file_date": "2026-04-24", ...}, context)
+        # -> {"statusCode": 200, "body": '{"message": "Pipeline ARDEF completado..."}'}
     """
     logger.info("=== Inicio pipeline ARDEF ===")
     logger.info(f"Event recibido: {json.dumps(event)}")

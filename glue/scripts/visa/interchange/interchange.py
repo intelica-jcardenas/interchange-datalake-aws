@@ -1,6 +1,50 @@
-# =============================================================================
-# ITX-INTERCHANGE (PySpark) - AWS Glue Job
-# =============================================================================
+"""
+interchange.py — Job real: itl-0004-itx-dev-intchg-02-glue-vi-interchange
+================================================================================
+Archivo:     glue/scripts/visa/interchange/interchange.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/visa/interchange.py
+
+Job de Glue (PySpark, Glue 4.0, Worker G.2X x4) que asigna la tarifa de
+interchange a cada transacción Visa (BASEII/SMS) evaluando el maestro de
+reglas `visa_rules` con un motor first-match-wins por jurisdicción (soporta
+condiciones de lista/rango, comparación numérica y montos con conversión de
+moneda). Lee las capas Clean (`s3-staging/.../300_*_cln_*`) y Calculate
+(`s3-staging/.../400_*_cal_*`, con los campos derivados de ARDEF ya
+calculados) del mismo archivo, las une por `record`, y evalúa las reglas en
+paralelo sobre los workers Spark vía `mapInPandas` — el motor de reglas en sí
+es pandas puro, igual al prototipo local ya validado. Escribe el resultado en
+la capa Interchange (`s3-staging/.../500_*_itx_*`), que `lmbd-vi-store`
+consolida junto con CLN y CAL en el Parquet final de operational.
+
+VSS (registros de liquidación) no pasa por este job — no tiene reglas de
+interchange propias; se usa solo como contraste de Data Quality en otro punto
+del pipeline.
+
+Arquitectura del rule engine:
+  - Las reglas (`visa_rules`, filtradas por vigencia a `file_date`) y las
+    tasas de cambio se cargan una sola vez y se hacen `broadcast()` a todos
+    los workers.
+  - `evaluate_interchange_fees()` reparte las transacciones en particiones
+    Spark; cada partición corre `_evaluate_rules_pandas()` de forma
+    independiente en el worker (sin volver al driver), lo que permite
+    escalar a cualquier volumen sin OOM.
+  - `calculate_fee_amounts()` aplica la fórmula final (fee_variable ×
+    source_amount + fee_fixed convertido a la moneda de la transacción),
+    con fee_min/fee_cap como piso/techo, ya en Spark (no en el engine
+    pandas).
+
+Job Parameters:
+  --client_id        Código de cliente (ej. "EBGR")
+  --file_id          ID del archivo procesado
+  --file_type        IN | OUT
+  --file_date        YYYY-MM-DD (fecha del archivo — filtra vigencia de
+                      reglas y tasas de cambio)
+  --staging_bucket   Bucket S3 de staging
+  --reference_bucket Bucket S3 de referencia (visa_rules, exchange-rates-glue)
+  --outputs          JSON: [{"output_type": "BASEII"|"SMS"|"VSS",
+                     "s3_key": "staging/..."}, …] — VSS se recibe pero se
+                     descarta (sin reglas de interchange propias).
+"""
 
 import sys
 import json
@@ -40,6 +84,20 @@ def log_error(msg): logger.error(f"GlueLogger: {msg}")
 # =============================================================================
 
 def load_parquet(path: str) -> DataFrame:
+    """
+    Lee un Parquet completo desde S3 como Spark DataFrame, logueando la ruta
+    y el conteo de filas resultante para trazabilidad en CloudWatch.
+
+    Args:
+        path: URL S3 completa del Parquet, ej.
+            "s3://itl-0004-itx-dev-intchg-02-s3-staging/EBGR/VISA/300_baseii_cln_drafts/...".
+
+    Returns:
+        DataFrame de Spark con el contenido leído.
+
+    Ejemplo:
+        cln_df = load_parquet(cln_path)
+    """
     log_info(f"  Reading: {path}")
     df = spark.read.parquet(path)
     log_info(f"  → {df.count():,} records")
@@ -47,9 +105,22 @@ def load_parquet(path: str) -> DataFrame:
 
 def save_parquet(df: DataFrame, path: str):
     """
-    Guarda el DataFrame como Parquet.
-    coalesce(1) para archivos pequeños, repartition(4) para grandes
-    evitando el error RPC message too large.
+    Guarda el DataFrame como Parquet en S3, con estrategia de particionado de
+    escritura según el volumen: `coalesce(1)` para archivos chicos (un solo
+    Parquet, más simple de leer) y `repartition(4)` para archivos grandes,
+    evitando el error "RPC message too large" que puede ocurrir al coalescer
+    demasiadas filas a una sola partición.
+
+    Args:
+        df: DataFrame a escribir.
+        path: URL S3 destino, ej.
+            "s3://itl-0004-itx-dev-intchg-02-s3-staging/EBGR/VISA/500_baseii_itx_drafts/...".
+
+    Returns:
+        None.
+
+    Ejemplo:
+        save_parquet(result, itx_path)
     """
     count = df.count()
     if count > 200_000:
@@ -64,6 +135,25 @@ def save_parquet(df: DataFrame, path: str):
 # =============================================================================
 
 def load_visa_rules(reference_bucket: str, file_date: date) -> pd.DataFrame:
+    """
+    Carga el maestro de reglas de interchange Visa (`visa_rules`) y lo filtra
+    a las reglas vigentes en `file_date` (entre `valid_from` y `valid_until`
+    inclusive; filas sin fecha de vigencia se tratan como vigentes hasta hoy).
+    Se lee una sola vez por ejecución del job y se reutiliza (via broadcast)
+    para todos los outputs del mismo archivo.
+
+    Args:
+        reference_bucket: Bucket S3 de referencia, ej.
+            "itl-0004-itx-dev-intchg-02-s3-reference".
+        file_date: Fecha de negocio del archivo, usada para filtrar vigencia.
+
+    Returns:
+        DataFrame de pandas con las reglas vigentes, ordenado por
+        (region_country_code, intelica_id), índice reseteado.
+
+    Ejemplo:
+        rules_pd = load_visa_rules("itl-0004-itx-dev-intchg-02-s3-reference", date(2026, 1, 3))
+    """
     path = f"s3://{reference_bucket}/visa_rules/data.parquet"
     log_info(f"Loading visa_rules from: {path}")
     df = spark.read.parquet(path).toPandas()
@@ -89,11 +179,27 @@ def load_visa_rules(reference_bucket: str, file_date: date) -> pd.DataFrame:
 
 def load_exchange_rates(reference_bucket: str, file_date: date, brand: str) -> pd.DataFrame:
     """
-    Fuente: exchange-rates-glue/brand={brand}/exchange_date={date}/ (enriquecido
-    con codigos numericos por glue-exchange-rates, cobertura viva y actualizada
-    — reemplaza a exchange_rate/, fuente manual congelada al 2026-04-30).
-    Columnas renombradas a los nombres legacy (currency_from/currency_to/
-    exchange_value) para no tocar el resto del script.
+    Carga las tasas de cambio del día para la marca indicada desde
+    `exchange-rates-glue/brand={brand}/exchange_date={date}/` — la fuente
+    oficial y viva de tipo de cambio del pipeline (enriquecida con códigos
+    numéricos por el job `glue-exchange-rates`; reemplaza a `exchange_rate/`,
+    fuente manual congelada al 2026-04-30). Columnas renombradas a los
+    nombres legacy (`currency_from`/`currency_to`/`exchange_value`) para no
+    tocar el resto del script, que ya espera ese vocabulario.
+
+    Args:
+        reference_bucket: Bucket S3 de referencia.
+        file_date: Fecha de negocio del archivo.
+        brand: Marca a filtrar, ej. "VISA" (se capitaliza para armar la
+            partición `brand=Visa/`).
+
+    Returns:
+        DataFrame de pandas con columnas currency_from, currency_to,
+        exchange_value. Si la partición exacta no existe, hace fallback
+        leyendo toda la tabla y filtrando por brand + exchange_date.
+
+    Ejemplo:
+        rates_pd = load_exchange_rates("itl-0004-itx-dev-intchg-02-s3-reference", date(2026, 1, 3), "VISA")
     """
     date_str = file_date.strftime("%Y-%m-%d")
     brand_partition = brand.capitalize()
@@ -128,6 +234,29 @@ def load_exchange_rates(reference_bucket: str, file_date: date, brand: str) -> p
 # =============================================================================
 
 def _rename_rules(rules_pd: pd.DataFrame, type_record: str) -> pd.DataFrame:
+    """
+    Renombra las columnas de condición de `visa_rules` (nombres genéricos del
+    maestro) a los nombres de campo reales que trae el Parquet de
+    transacciones, para poder evaluarlas directamente contra el DataFrame de
+    transacciones sin una capa de traducción en tiempo de evaluación. El
+    mapeo difiere entre BASEII ("draft") y SMS porque cada `type_record`
+    tiene su propio vocabulario de campos (ver `visa_fields` en DynamoDB);
+    columnas del maestro sin equivalente en el `type_record` dado se
+    descartan (`drop_cols`).
+
+    Args:
+        rules_pd: Reglas ya filtradas por vigencia (salida de
+            `load_visa_rules`).
+        type_record: "draft" (BASEII) o "sms". Cualquier otro valor deja
+            `rules_pd` sin cambios.
+
+    Returns:
+        Copia de `rules_pd` con columnas renombradas/descartadas según
+        `type_record`.
+
+    Ejemplo:
+        rules_renamed = _rename_rules(rules_pd, "draft")
+    """
     rules_pd = rules_pd.copy()
     rules_pd.columns = [c.lower() for c in rules_pd.columns]
 
@@ -215,9 +344,28 @@ def _add_converted_amount(
     rules_pd: pd.DataFrame
 ) -> DataFrame:
     """
-    Para cada moneda target en las reglas con condición de monto,
-    crea columna source_amount_{currency} con el monto convertido.
-    Ej: source_amount_eur = source_amount * exchange_rate(USD→EUR)
+    Pre-calcula, en Spark, una columna `source_amount_{moneda}` por cada
+    moneda que las reglas usan como condición de monto (`source_amount`) —
+    necesario porque las reglas expresan su umbral en una moneda propia
+    (`source_currency_code_alphabetic` de la regla) que puede no coincidir
+    con la moneda real de cada transacción, y el motor de reglas en pandas
+    (`_apply_amount_currency`) necesita el monto ya convertido a esa moneda
+    antes de comparar contra el umbral.
+
+    Args:
+        transactions: DataFrame de transacciones (CLN+CAL ya unidos).
+        rates_pd: Tasas de cambio del día (columnas currency_from,
+            currency_to, exchange_value).
+        rules_pd: Reglas ya renombradas (salida de `_rename_rules`).
+
+    Returns:
+        `transactions` con una columna `source_amount_{moneda}` agregada por
+        cada moneda target encontrada en las reglas; sin cambios si las
+        reglas no tienen condición de monto.
+
+    Ejemplo:
+        transactions = _add_converted_amount(transactions, rates_pd, rules_renamed)
+        # agrega, por ejemplo, source_amount_eur, source_amount_usd
     """
     if "source_amount" not in rules_pd.columns:
         return transactions
@@ -303,6 +451,36 @@ def _apply_default(
     condition_value: str,
     batch: pd.DataFrame
 ) -> pd.DataFrame:
+    """
+    Evalúa una condición de regla "por lista de valores" (la mayoría de las
+    condiciones de `visa_rules` — todo lo que no sea rango numérico o monto
+    con moneda, ver `_apply_condition_pandas`). Soporta:
+      - Lista separada por comas: "05,06,07" → matchea cualquiera de esos
+        valores.
+      - Rangos con guion dentro de un elemento de la lista: "1-5" → se
+        expande a ["1","2","3","4","5"] antes de comparar.
+      - Prefijo "NOT:" → invierte el criterio (excluye los valores listados
+        en vez de incluirlos).
+      - Literal "SPACE" → se traduce a un espacio literal `" "` (para
+        columnas en COLUMN_GROUP_SPACE, donde el espacio es un valor válido
+        y no debe normalizarse a "BLANK").
+      - Valores vacíos/nulos en la columna del batch → normalizados a
+        "BLANK" antes de comparar (salvo columnas de COLUMN_GROUP_SPACE, que
+        se comparan tal cual para no perder el espacio literal).
+
+    Args:
+        condition_name: Nombre de la columna de transacción a evaluar (ya
+            renombrada por `_rename_rules`).
+        condition_value: Valor crudo de la condición tal como viene en
+            `visa_rules`, ej. "05,06,07" o "NOT:Y".
+        batch: Sub-batch de transacciones aún sin matchear para esta regla.
+
+    Returns:
+        Subconjunto de `batch` cuyas filas cumplen la condición.
+
+    Ejemplo:
+        _apply_default("draft_code", "05,06,07", batch)
+    """
     batch = batch.copy()
     condition_value = condition_value.strip().upper()
     condition_value = condition_value.replace("SPACE", " ")
@@ -349,6 +527,29 @@ def _apply_greater_less(
     condition_value: str,
     batch: pd.DataFrame
 ) -> pd.DataFrame:
+    """
+    Evalúa una condición de comparación numérica sobre columnas de
+    COLUMN_GROUP_GREATER_LESS (`timeliness`, `surcharge_amount`,
+    `surcharge_amount_sms`). Soporta tres formatos de `condition_value` tal
+    como vienen en `visa_rules`:
+      - Operador relacional: ">5", "<=10", "=3" → se arma una query de
+        pandas (`batch.query(...)`).
+      - Rango: "BETWEEN 5 AND 10" → inclusive en ambos extremos.
+      - Valor exacto sin operador: "3" → equivalente a "=3".
+    Si `condition_value` no matchea ninguno de los tres formatos, retorna
+    `batch` sin filtrar (condición no aplicable/mal formada).
+
+    Args:
+        condition_name: Columna numérica a evaluar.
+        condition_value: Valor de la condición, ej. ">5", "BETWEEN 1 AND 10".
+        batch: Sub-batch de transacciones aún sin matchear para esta regla.
+
+    Returns:
+        Subconjunto de `batch` que cumple la condición.
+
+    Ejemplo:
+        _apply_greater_less("timeliness", "BETWEEN 1 AND 5", batch)
+    """
     if any(x in condition_value for x in ["<", ">", "="]):
         query = f"{condition_name} " + condition_value \
             .replace("<=", "<= ").replace(">=", ">= ") \
@@ -371,8 +572,36 @@ def _apply_amount_currency(
     rates_pd: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Condición de monto con conversión de moneda.
-    Fix: preservar índice original antes del merge para evitar KeyError.
+    Evalúa la condición de monto (`source_amount`) de una regla, convirtiendo
+    el monto de la transacción a la moneda en que la regla expresa su umbral
+    (`rule["source_currency_code_alphabetic"]`) antes de comparar — mismo
+    propósito que `_add_converted_amount`, pero aplicado acá fila por fila
+    dentro del engine pandas en vez de precalculado en Spark, porque el
+    umbral depende de la regla actual, no de una lista fija de monedas.
+    Soporta operador relacional (`>`,`<`,`>=`,`<=`,`=`) y `BETWEEN ... AND
+    ...`, igual que `_apply_greater_less`.
+
+    Nota de implementación: `pd.merge` resetea el índice del batch, así que
+    se preserva el índice original como columna (`reset_index()`) antes del
+    merge y se recupera al final (`batch.loc[matched_original_indices]`) —
+    sin esto, `batch.loc[filter_df.index]` lanzaría `KeyError` porque los
+    índices de `filter_df` (post-merge) no corresponden a los de `batch`.
+
+    Args:
+        condition_name: Columna de monto a evaluar (siempre `source_amount`
+            en la práctica, ver COLUMN_GROUP_AMOUNT_CURRENCY).
+        condition_value: Valor de la condición, ej. ">100", "BETWEEN 0 AND 50".
+        rule: Fila de `visa_rules` (renombrada) con la regla actual —
+            provee la moneda del umbral.
+        batch: Sub-batch de transacciones aún sin matchear para esta regla.
+        rates_pd: Tasas de cambio del día.
+
+    Returns:
+        Subconjunto de `batch` (con su índice original) que cumple la
+        condición de monto ya convertido.
+
+    Ejemplo:
+        _apply_amount_currency("source_amount", ">100", rule, batch, rates_pd)
     """
     target_currency = str(rule.get("source_currency_code_alphabetic", "")).strip().upper()
     if not target_currency or target_currency in ("", "NAN", "NONE"):
@@ -380,9 +609,7 @@ def _apply_amount_currency(
 
     target_rates = rates_pd[rates_pd["currency_to"].str.upper() == target_currency]
 
-    # ✅ Preservar índice original antes del merge
-    # pd.merge resetea los índices → batch.loc[filter_df.index] falla
-    batch_reset = batch.reset_index()  # índice original pasa a columna "index"
+    batch_reset = batch.reset_index()
 
     filter_df = pd.merge(
         batch_reset,
@@ -410,7 +637,6 @@ def _apply_amount_currency(
             filter_df["comparison_value"].between(lo, hi, inclusive="both")
         ]
 
-    # ✅ Recuperar filas originales usando el índice preservado
     matched_original_indices = filter_df["index"].tolist()
     return batch.loc[matched_original_indices]
 
@@ -421,6 +647,27 @@ def _apply_condition_pandas(
     batch: pd.DataFrame,
     rates_pd: pd.DataFrame
 ) -> pd.DataFrame:
+    """
+    Despacha la evaluación de una condición de regla al evaluador correcto
+    según a qué grupo de columnas pertenece `condition_name`:
+    COLUMN_GROUP_GREATER_LESS → `_apply_greater_less`,
+    COLUMN_GROUP_AMOUNT_CURRENCY → `_apply_amount_currency`, cualquier otra
+    columna → `_apply_default` (lista de valores). Condiciones vacías/NaN/
+    "NONE" en la regla se consideran "sin restricción" y no filtran nada.
+
+    Args:
+        condition_name: Nombre de la condición/columna a evaluar.
+        rule: Fila de `visa_rules` (renombrada) con el valor de la condición.
+        batch: Sub-batch de transacciones aún sin matchear para esta regla.
+        rates_pd: Tasas de cambio del día (solo usado si la condición es de
+            monto).
+
+    Returns:
+        Subconjunto de `batch` que cumple la condición evaluada.
+
+    Ejemplo:
+        next_batch = _apply_condition_pandas("draft_code", rule, next_batch, rates_pd)
+    """
     condition_value = str(rule[condition_name]).strip()
     if condition_value.upper() in ("", "NAN", "NONE"):
         return batch
@@ -439,9 +686,35 @@ def _evaluate_rules_pandas(
     rates_pd: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Evalúa reglas first-match-wins por jurisdicción.
-    Lógica idéntica al código local original.
-    Llamada desde mapInPandas — recibe un chunk de transacciones.
+    Motor de reglas first-match-wins: para cada transacción, recorre las
+    reglas de su misma jurisdicción (`region_country_code == jurisdiction_assigned`)
+    en el orden en que vienen ordenadas (ya ordenadas por
+    `load_visa_rules`) y le asigna los campos de la primera regla cuyas
+    condiciones activas matchean por completo. Transacciones ya matcheadas
+    (`interchange_intelica_id != -1`) se excluyen de reglas siguientes vía
+    "early exit" — si ninguna transacción de la jurisdicción sigue sin
+    matchear, se corta el loop de reglas para esa jurisdicción sin evaluar
+    las restantes. Lógica idéntica a la del prototipo local ya validado.
+
+    Llamada desde `mapInPandas` (ver `evaluate_interchange_fees`) — recibe un
+    chunk/partición de transacciones, corre enteramente en el worker sin
+    volver al driver.
+
+    Args:
+        transactions_pd: Chunk de transacciones (columnas CLN+CAL ya unidas,
+            incluye `jurisdiction_assigned`).
+        rules_pd: Reglas ya renombradas (salida de `_rename_rules`).
+        rates_pd: Tasas de cambio del día, usadas por condiciones de monto.
+
+    Returns:
+        `transactions_pd` con las columnas `interchange_region_country_code`,
+        `interchange_intelica_id` (-1 si ninguna regla matcheó),
+        `interchange_fee_descriptor`, `interchange_fee_currency`,
+        `interchange_fee_variable`, `interchange_fee_fixed`,
+        `interchange_fee_min`, `interchange_fee_cap` agregadas/pobladas.
+
+    Ejemplo:
+        result_pdf = _evaluate_rules_pandas(pdf, local_rules, local_rates)
     """
     update_columns = [
         "region_country_code", "intelica_id", "fee_descriptor",
@@ -522,6 +795,10 @@ def evaluate_interchange_fees(
     type_record: str
 ) -> DataFrame:
     """
+    Punto de entrada del rule engine para un `type_record` (BASEII o SMS):
+    prepara reglas y montos convertidos, y distribuye la evaluación real
+    (`_evaluate_rules_pandas`) sobre los workers Spark vía `mapInPandas`.
+
     Arquitectura híbrida distribuida:
       - Spark para I/O y conversión de moneda
       - mapInPandas para ejecutar el rule engine en paralelo en los workers
@@ -533,6 +810,22 @@ def evaluate_interchange_fees(
       Worker 2: chunk_2 → _evaluate_rules_pandas → resultado_2  ├ en paralelo
       Worker N: chunk_N → _evaluate_rules_pandas → resultado_N  ┘
       Spark ensambla los resultados sin pasar por el driver
+
+    Args:
+        transactions: DataFrame de transacciones (CLN+CAL ya unidos).
+        rules_pd: Reglas ya filtradas por vigencia (salida de
+            `load_visa_rules`), aún sin renombrar (se renombran acá adentro).
+        rates_pd: Tasas de cambio del día.
+        type_record: "draft" (BASEII) o "sms" — determina el renombrado de
+            columnas de reglas (`_rename_rules`).
+
+    Returns:
+        DataFrame de Spark con las columnas de `OUTPUT_COLS` (identificación
+        de la transacción + campos `interchange_*` asignados por el engine),
+        listo para pasar a `calculate_fee_amounts`.
+
+    Ejemplo:
+        result = evaluate_interchange_fees(merged, rules_pd, rates_pd, "draft")
     """
     log_info(f"Evaluating interchange fees for {type_record} using mapInPandas...")
 
@@ -559,6 +852,24 @@ def evaluate_interchange_fees(
     ]
 
     def process_pandas_partitions(iterator):
+        """
+        Función de partición pasada a `mapInPandas`: por cada chunk pandas
+        que Spark entrega en esta partición, corre el rule engine
+        (`_evaluate_rules_pandas`) usando las reglas/tasas ya broadcast
+        (`bc_rules`/`bc_rates`, sin volver a serializarlas por chunk), aplica
+        un "blindaje de tipos" final (nulls/NaN → valores por defecto
+        consistentes con `output_schema`) y yieldea solo las columnas de
+        `OUTPUT_COLS` — nunca las ~252 columnas completas del input, para no
+        inflar innecesariamente la salida serializada de vuelta a Spark.
+
+        Args:
+            iterator: Iterador de chunks pandas que Spark entrega para esta
+                partición (contrato de `mapInPandas`).
+
+        Returns:
+            Generador de DataFrames pandas, cada uno con las columnas de
+            `OUTPUT_COLS` y tipos ya coherentes con `output_schema`.
+        """
         local_rules = bc_rules.value
         local_rates = bc_rates.value
 
@@ -594,7 +905,6 @@ def evaluate_interchange_fees(
                 result_pdf["interchange_fee_cap"].astype(float)
             )
 
-            #Yield SOLO las columnas esenciales — no pasar las 252 columnas
             yield result_pdf[OUTPUT_COLS]
 
     # Schema INDEPENDIENTE — solo describe lo que el iterador yields
@@ -625,6 +935,30 @@ def evaluate_interchange_fees(
 # =============================================================================
 
 def calculate_fee_amounts(df: DataFrame, rates_pd: pd.DataFrame) -> DataFrame:
+    """
+    Calcula `interchange_fee_amount` en Spark a partir de los campos que
+    `_evaluate_rules_pandas` ya asignó a cada transacción
+    (interchange_fee_variable/fixed/min/cap, en la moneda de la regla), con
+    la fórmula `fee_variable × source_amount + fee_fixed_convertido`, donde
+    `fee_min`/`fee_cap` actúan como piso/techo del resultado. El detalle de
+    en qué moneda queda expresado el fee y por qué el join de tasas va en
+    esa dirección está documentado en el comentario inline justo antes del
+    join, más abajo (decisión ya validada, ver `decisions.md` — "dirección
+    del exchange_value").
+
+    Args:
+        df: Salida de `evaluate_interchange_fees` (con los campos
+            `interchange_*` ya asignados por regla).
+        rates_pd: Tasas de cambio del día.
+
+    Returns:
+        `df` con `interchange_fee_amount` calculado (columnas auxiliares
+        `_fee_*`/`exchange_value` usadas para el cálculo se eliminan al
+        final).
+
+    Ejemplo:
+        result = calculate_fee_amounts(result, rates_pd)
+    """
     log_info("Calculating fee amounts...")
     rates_spark = spark.createDataFrame(
         rates_pd[["currency_from", "currency_to", "exchange_value"]]
@@ -686,6 +1020,40 @@ def process_output(
     output_config: dict, staging_bucket: str, type_record: str,
     rules_pd: pd.DataFrame, rates_pd: pd.DataFrame, client_data: dict
 ) -> dict:
+    """
+    Procesa un único output (BASEII o SMS) de principio a fin: deriva las
+    rutas S3 de CAL e ITX a partir de la ruta CLN recibida (mismo patrón de
+    prefijos `NNN_..._XXX` usado en todo el pipeline — `300_..._cln_` →
+    `400_..._cal_`/`500_..._itx_`), une CLN+CAL por `record` (las columnas de
+    CAL, derivadas de ARDEF, tienen prioridad sobre las de CLN cuando hay
+    solapamiento — las de CLN se renombran con sufijo `_cln` para no perder
+    el dato original), evalúa las reglas de interchange y calcula el fee, y
+    escribe el resultado en la capa ITX.
+
+    `source_amount`/`source_currency_code_alphabetic` se usan durante el
+    cálculo pero se excluyen del output final — ya existen en CLN y
+    `lmbd-vi-store` los toma de ahí al consolidar (mismo criterio que el
+    prototipo local: `stage.drop([...])`).
+
+    Args:
+        output_config: Dict con `output_type` ("BASEII"/"SMS") y `s3_key`
+            (ruta CLN de este output dentro de `staging_bucket`).
+        staging_bucket: Bucket S3 de staging.
+        type_record: "draft" (BASEII) o "sms" — pasado a
+            `evaluate_interchange_fees`.
+        rules_pd: Reglas ya filtradas por vigencia (sin renombrar todavía).
+        rates_pd: Tasas de cambio del día.
+        client_data: Reservado para datos de cliente (no usado actualmente
+            en este job — Visa no necesita BINes propios del cliente para
+            interchange, a diferencia de otras etapas).
+
+    Returns:
+        Dict con `status`, `output_type`, `s3_key` (ruta ITX escrita) y
+        `records` (conteo final).
+
+    Ejemplo:
+        result = process_output(output_config, staging_bucket, "draft", rules_pd, rates_pd, {})
+    """
     output_type = output_config.get("output_type", "")
 
     base_s3_key = output_config.get("s3_key", "")
@@ -709,8 +1077,6 @@ def process_output(
     cal_df = load_parquet(cal_path)
 
     log_info("  Joining CLN + CAL...")
-    # CAL columns (ARDEF-derived computed fields) take precedence over CLN raw Visa fields.
-    # Rename overlapping CLN columns with _cln suffix so no data is lost and CAL version is used.
     key_cols = {"record", "content_hash"}
     overlap = {c for c in cln_df.columns if c in set(cal_df.columns) - key_cols}
     if overlap:
@@ -725,9 +1091,6 @@ def process_output(
 
     result = calculate_fee_amounts(result, rates_pd)
 
-    # source_amount y source_currency_code_alphabetic se usaron en calculate_fee_amounts
-    # pero no forman parte del output ITX — ya existen en el CLN y el store los toma de ahí.
-    # Alineado con el prototipo local: stage.drop(["source_currency_code_alphabetic", "source_amount"])
     interchange_cols = [
         "content_hash", "record",
         "interchange_intelica_id", "interchange_fee_descriptor", "interchange_fee_currency",
@@ -755,6 +1118,22 @@ def process_output(
 # =============================================================================
 
 def main():
+    """
+    Entry point del job. Resuelve los parámetros del Glue job, carga las
+    tablas de referencia una sola vez (`visa_rules`, tasas de cambio del día),
+    y procesa cada output declarado en `--outputs`: BASEII/SMS se pasan por
+    el rule engine completo (`process_output`); VSS se descarta (sin reglas
+    de interchange propias, ver docstring de módulo). Loguea progreso y
+    hace `job.commit()` al final para que Glue marque la ejecución como
+    completada.
+
+    Returns:
+        Dict con `status`, `total_outputs`, `total_records` y el detalle de
+        cada output procesado (mismo shape que devuelve `process_output`,
+        agregado en una lista) — usado para logging, no consumido por
+        Step Functions (el job no tiene salida estructurada hacia afuera,
+        solo side-effects en S3).
+    """
     args = getResolvedOptions(sys.argv, [
         "JOB_NAME", "client_id", "file_id", "file_type", "file_date",
         "staging_bucket", "reference_bucket", "outputs"

@@ -1,4 +1,15 @@
-# file: iar/iar_raw.py
+"""
+raw.py
+
+Capa RAW del pipeline IAR (Mastercard) — módulo interno importado por
+`handler.py` (`pipeline_iar`, paso "RAW"). Lee el stream ya desbloqueado
+(salida de `extract.py`) registro por registro usando un prefijo de longitud
+de 4 bytes big-endian (análogo al RDW del flujo transaccional IPM), y separa
+los records en tres capas: el header del archivo, el catálogo de tablas IPM
+(IP0000T1, que declara qué tablas de negocio contiene el archivo y en qué
+posición) y los records de detalle de cada tabla — sin interpretar todavía
+las columnas de negocio (eso lo hace `transform.py`).
+"""
 
 import io
 import struct
@@ -13,6 +24,27 @@ def read_record_with_metadata(
     encoding: str,
     record_sequence: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Lee un único record del stream IAR: primero 4 bytes big-endian con la
+    longitud del record (prefijo tipo RDW), luego esa cantidad de bytes de
+    payload, decodificados con `encoding`.
+
+    Args:
+        stream: Buffer posicionado al inicio de un record.
+        encoding: Encoding de texto del archivo ("cp500" para EBCDIC o
+            "Latin-1").
+        record_sequence: Número secuencial de este record dentro del
+            archivo, usado como metadata de trazabilidad.
+
+    Returns:
+        dict con `record_sequence`, `record_length` y `record_raw` (texto
+        decodificado), o `None` si el stream ya terminó (menos de 4 bytes
+        disponibles) o el largo declarado es 0.
+
+    Ejemplo:
+        read_record_with_metadata(stream, "Latin-1", 1)
+        # -> {"record_sequence": 1, "record_length": 27, "record_raw": "..."}
+    """
     raw_len = stream.read(4)
 
     if len(raw_len) < 4:
@@ -40,6 +72,26 @@ def read_record_with_metadata(
 
 
 def parse_header_raw(record: dict) -> dict:
+    """
+    Interpreta el primer record del archivo IAR (header) según su longitud,
+    que determina cuál de los dos layouts conocidos aplica: 27 caracteres
+    (formato "update_header": fecha `%Y%m%d`) o 80 caracteres (formato
+    "replace_header": fecha `%m%d%y` con separadores `/`). Ambos layouts
+    también están descritos en `getIPMParameters()` (`transform.py`).
+
+    Args:
+        record: dict producido por `read_record_with_metadata` para el
+            primer record del archivo.
+
+    Returns:
+        `record` extendido con `header_type`, `header_date`, `header_time`,
+        `app_processing_date` (normalizada a `YYYYMMDD`) y
+        `record_type="HEADER"`.
+
+    Ejemplo:
+        parse_header_raw({"record_raw": "..." , ...})
+        # -> {..., "app_processing_date": "20260103", "record_type": "HEADER"}
+    """
     record_raw = record["record_raw"]
 
     if len(record_raw) == 27:
@@ -76,14 +128,32 @@ def extract_raw_layers(
     encoding: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Genera la capa RAW del archivo IAR.
+    Genera la capa RAW del archivo IAR completo: lee el header, luego el
+    catálogo de tablas IPM (IP0000T1, hasta encontrar su trailer) y
+    finalmente todos los records de detalle, usando `read_record_with_metadata`
+    para cada uno. El catálogo determina, vía `table_ipm_id`/`table_sub_id`,
+    qué tabla de negocio (ej. IP0040T1) corresponde a cada grupo de records
+    de detalle — información que `transform.py` usa para filtrar los
+    records de la tabla que se está procesando. No parsea todavía las
+    columnas de negocio de cada tabla.
 
-    Devuelve:
-    - df_header
-    - df_catalog
-    - df_records
+    Args:
+        stream: Buffer con el archivo IAR ya desbloqueado (salida de
+            `extract.py`), posicionado al inicio.
+        source_file: Ruta S3 del archivo origen (ej.
+            "s3://bucket/SBSA/archivo.iar"), para trazabilidad en cada fila.
+        ebcdic: Usado solo si `encoding` es `None`, para decidir entre
+            "cp500" (EBCDIC) y "Latin-1".
+        encoding: Encoding explícito a usar; si se pasa, tiene prioridad
+            sobre `ebcdic`.
 
-    No parsea todavía las tablas de negocio.
+    Returns:
+        Tupla `(df_header, df_catalog, df_records)`: header (1 fila),
+        catálogo de tablas IPM detectadas (+ trailer), y records de detalle
+        sin parsear.
+
+    Ejemplo:
+        extract_raw_layers(stream, "s3://bucket/SBSA/archivo.iar", encoding="Latin-1")
     """
 
     if encoding is None:

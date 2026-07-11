@@ -1,10 +1,21 @@
+"""
+clean.py
+
+Tercera etapa del pipeline ARDEF. Lee el parquet TRANSFORM (campos ya
+extraídos por posición fija, todavía como texto sin castear) y aplica
+limpieza (ltrim/rtrim) y casteo de tipos según los data_type declarados en
+ARDEF_SCHEMA (campos de negocio) y METADATA_SCHEMA (campos de metadata del
+pipeline) — deja el DataFrame listo para que `calculate.py` compute
+`valid_until` sobre columnas ya tipadas.
+"""
+
 from datetime import datetime
 from typing import Optional
 
-import pandas as pd 
+import pandas as pd
 import numpy as np
 
-from ardef.logs.logger import Logger 
+from ardef.logs.logger import Logger
 from ardef.persistence.file import FileStorage
 from ardef.schema.ardef_schema import ARDEF_SCHEMA, METADATA_SCHEMA
 
@@ -15,8 +26,18 @@ _DATE_FORMATS = ["%Y-%m-%d", "%Y%m%d", "%d%m%Y"]
 
 def _try_parse_date(value: str) -> Optional[pd.Timestamp]:
     """
-    Intentar parser una cadena de fecha con múltiples formatos.
-    Devuelve NaT si ninguno aplica
+    Intenta parsear una cadena de fecha probando, en orden, cada formato de
+    `_DATE_FORMATS` ("%Y-%m-%d", "%Y%m%d", "%d%m%Y").
+
+    Args:
+        value: Cadena de fecha a parsear, ej. "20260424" o "2026-04-24".
+
+    Returns:
+        pd.Timestamp si algún formato aplica, o pd.NaT si ninguno matchea
+        (o si `value` no es un string parseable).
+
+    Ejemplo:
+        _try_parse_date("20260424")  # -> Timestamp('2026-04-24 00:00:00')
     """
     for fmt in _DATE_FORMATS:
         try:
@@ -27,7 +48,23 @@ def _try_parse_date(value: str) -> Optional[pd.Timestamp]:
 
 def _cast_series(series: pd.Series, data_type: str) -> pd.Series:
     """
-    Castea una Series de pandas según el data_type indicado en el schema.
+    Castea una Series de pandas al tipo indicado por `data_type`: "text"
+    (strip a string), "integer" (Int64 nullable), "decimal" (Float64
+    nullable), "date" (parseo con `_try_parse_date`). Cualquier valor no
+    convertible cae a NA/NaT (coerce), nunca lanza excepción. Un data_type
+    no reconocido cae al caso "text" con un warning.
+
+    Args:
+        series: Serie de pandas a castear (típicamente ya como string).
+        data_type: Uno de "text", "integer", "decimal", "date" (viene del
+            schema ARDEF_SCHEMA/METADATA_SCHEMA).
+
+    Returns:
+        Serie casteada al tipo pandas correspondiente (str, Int64, Float64
+        o datetime/NaT).
+
+    Ejemplo:
+        _cast_series(pd.Series(["123", "abc"]), "integer")  # -> [123, <NA>]
     """
 
     match data_type:
@@ -59,9 +96,30 @@ def _build_ardef_clean_dataframe(
         metadata_schema: dict[str, dict],
 ) -> pd.DataFrame:
     """
-    Aplicar ltrim/rtrim a todos los campos texto
-    Castear los campos de metadatos según METADATA_SCHEMA.
-    Castear los campos ARDEF según ARDEF_SCHEMA.
+    Construye el DataFrame CLEAN a partir del TRANSFORM: aplica ltrim/rtrim
+    y castea cada columna de metadata según `metadata_schema` y cada campo
+    de negocio ARDEF según `ardef_schema` (ambos vía `_cast_series`).
+    Columnas declaradas en el schema pero ausentes en el parquet de entrada
+    se saltean con un warning (no interrumpen el procesamiento).
+
+    Args:
+        transformed: DataFrame TRANSFORM (salida de `transform.py`), con
+            todos los campos aún como texto.
+        file_id: ID único del archivo, para logging.
+        file_processing_date: Fecha de negocio del archivo, para logging.
+        ardef_schema: Diccionario columna → {"data_type": ...} de los campos
+            de negocio ARDEF (típicamente ARDEF_SCHEMA).
+        metadata_schema: Diccionario columna → {"data_type": ...} de los
+            campos de metadata del pipeline (típicamente METADATA_SCHEMA).
+
+    Returns:
+        DataFrame con las mismas columnas de `transformed`, cada una
+        casteada a su tipo real. Vacío (mismas columnas, 0 filas) si
+        `transformed` estaba vacío.
+
+    Ejemplo:
+        _build_ardef_clean_dataframe(transformed, "ABC123", "2026-04-24",
+                                      ARDEF_SCHEMA, METADATA_SCHEMA)
     """
     if transformed.empty:
         log.logger.warning(
@@ -109,12 +167,32 @@ def clean_ardef(
         metadata_schema: dict[str, dict] | None = None,
 ) -> None:
     """
-    Lee el parquet TRANSFORM, aplica limpieza y casteo y escribe en STAGING/300_ARDEF_CLN
+    Etapa CLEAN del pipeline ARDEF. Lee el parquet TRANSFORM, aplica limpieza
+    y casteo y escribe en STAGING/300_ARDEF_CLN.
 
     Pasos:
         1. Leer STAGING / {brand_id} / {file_type} / {date} / 200_ARDEF_TRA / {file_id}.parquet
         2. Limpiar (strip) y castear según METADATA_SCHEMA + ARDEF_SCHEMA.
         3. Escribir STAGING / {brand_id} / {file_type} / {date} / 300_ARDEF_CLN / {file_id}.parquet
+
+    Args:
+        origin_layer: Layer de origen (típicamente STAGING).
+        target_layer: Layer de destino (típicamente STAGING).
+        file_id: ID único del archivo.
+        file_processing_date: Fecha de negocio del archivo, "YYYY-MM-DD".
+        origin_subdir: Subdirectorio de origen (default "200_ARDEF_TRA").
+        target_subdir: Subdirectorio de destino (default "300_ARDEF_CLN").
+        ardef_schema: Schema de campos de negocio a castear; si es None,
+            usa ARDEF_SCHEMA.
+        metadata_schema: Schema de campos de metadata a castear; si es
+            None, usa METADATA_SCHEMA.
+
+    Returns:
+        None. Escribe el parquet CLEAN en STAGING como efecto secundario.
+
+    Ejemplo:
+        clean_ardef(FileStorage.Layer.STAGING, FileStorage.Layer.STAGING,
+                    "ABC123", "2026-04-24")
     """
     if ardef_schema is None:
         ardef_schema = ARDEF_SCHEMA

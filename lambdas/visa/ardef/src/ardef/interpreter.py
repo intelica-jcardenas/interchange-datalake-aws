@@ -1,12 +1,23 @@
+"""
+interpreter.py
+
+Primera etapa del pipeline ARDEF. Lee el archivo ARDEF original desde
+LANDING como texto plano latin-1, identifica las líneas de detalle (rango de
+BIN / regla, prefijo "VL") descartando líneas de control ("C****"), y
+extrae del header ("AAACTRNG"/"AEPACRN") la versión y fecha más reciente del
+archivo. El resultado es un DataFrame RAW (una fila por línea de detalle,
+todo como texto sin parsear) que `transform.py` usa como entrada.
+"""
+
 import gc
 from datetime import datetime
- 
+
 import pandas as pd
 import pyarrow as pa
- 
+
 from ardef.logs.logger import Logger
 from ardef.persistence.file import FileStorage
- 
+
 log = Logger(__name__)
 fs = FileStorage()
 
@@ -18,11 +29,27 @@ def load_as_text(
     encoding: str = "Latin-1"
 ) -> pd.DataFrame:
     """
-    Funcion auxiliar.
-    Lee el archivo ARDEF como texto desde LANDING.
-    No escribe parquet.
+    Lee el archivo ARDEF fuente como texto plano (una fila por línea) desde
+    el layer y subdir indicados, sin escribir ningún parquet — función
+    auxiliar puramente de lectura, usada por `interpretate_ardef`.
+
+    Args:
+        layer: Layer de FileStorage desde donde leer (típicamente LANDING).
+        file_id: ID único del archivo.
+        file_processing_date: Fecha de negocio del archivo, "YYYY-MM-DD".
+        subdir: Subdirectorio dentro del layer, vacío si el archivo está en
+            la raíz del cliente (caso ARDEF en LANDING).
+        encoding: Encoding del archivo fuente (default "Latin-1", el usado
+            por los archivos ARDEF de Visa).
+
+    Returns:
+        DataFrame con una columna ("lines") y una fila por línea de texto del
+        archivo original.
+
+    Ejemplo:
+        load_as_text(FileStorage.Layer.LANDING, "ABC123", "2026-04-24")
     """
- 
+
     return fs.read_plaintext(
         layer=layer,
         file_id=file_id,
@@ -37,9 +64,30 @@ def _build_ardef_raw_dataframe(
         file_processing_date: str,
 ) -> pd.DataFrame:
     """
-    Convierte el archivo ARDEF leido como texto en un dataframe.
+    Convierte las líneas de texto del archivo ARDEF en el DataFrame RAW del
+    pipeline: filtra solo las líneas de detalle (prefijo "VL", excluyendo
+    líneas de control "C****") y extrae del header ("AAACTRNG"/"AEPACRN") la
+    versión y fecha más reciente del archivo (si hay múltiples versiones en
+    el header, se queda con la de número más alto). Agrega columnas de
+    metadata (file_id, file_processing_date, line_no, timestamps) a cada
+    línea de detalle conservada.
+
+    Args:
+        records: DataFrame con una columna "lines" (una fila por línea de
+            texto del archivo original), tal como lo devuelve `load_as_text`.
+        file_id: ID único del archivo.
+        file_processing_date: Fecha de negocio del archivo, "YYYY-MM-DD".
+
+    Returns:
+        DataFrame RAW con columnas file_id, file_processing_date,
+        ardef_version, ardef_header_date, line_no, lines,
+        row_creation_timestamp, _eff_ts — todas como texto. Vacío (mismas
+        columnas, 0 filas) si `records` no tenía líneas de detalle.
+
+    Ejemplo:
+        _build_ardef_raw_dataframe(records, "ABC123", "2026-04-24")
     """
- 
+
     # Timestamp de creación del parquet (mismo instante para row_creation_timestamp y _eff_ts)
     _now = datetime.now()
     row_creation_timestamp = _now.strftime("%Y-%m-%d %H:%M:%S.") + \
@@ -144,7 +192,38 @@ def interpretate_ardef(
         target_subdir: str = "100_ARDEF_RAW",
         encoding: str = "Latin-1",
 ) -> None:
-    
+    """
+    Etapa INTERPRETER del pipeline ARDEF (primera etapa, exclusiva de este
+    tipo de archivo). Lee el archivo original desde LANDING como texto,
+    aísla las líneas de detalle y el header más reciente, y escribe el
+    resultado como parquet RAW en STAGING.
+
+    Pasos:
+        1. Leer LANDING / {archivo original} como texto (`load_as_text`).
+        2. Construir el DataFrame RAW (`_build_ardef_raw_dataframe`).
+        3. Escribir STAGING / {brand_id} / {file_type} / {date} /
+           100_ARDEF_RAW / {file_id}.parquet
+
+    Args:
+        origin_layer: Layer de origen (típicamente LANDING).
+        target_layer: Layer de destino (típicamente STAGING).
+        file_id: ID único del archivo.
+        file_processing_date: Fecha de negocio del archivo, "YYYY-MM-DD".
+        origin_subdir: Subdirectorio de origen (vacío, el archivo ARDEF está
+            en la raíz del cliente en LANDING).
+        target_subdir: Subdirectorio de destino en STAGING (default
+            "100_ARDEF_RAW").
+        encoding: Encoding del archivo fuente (default "Latin-1").
+
+    Returns:
+        None. Escribe el parquet RAW en STAGING como efecto secundario y
+        libera `records`/`df_raw` de memoria antes de retornar.
+
+    Ejemplo:
+        interpretate_ardef(FileStorage.Layer.LANDING, FileStorage.Layer.STAGING,
+                            "ABC123", "2026-04-24")
+    """
+
     records = load_as_text(
         layer=origin_layer,
         file_id=file_id,

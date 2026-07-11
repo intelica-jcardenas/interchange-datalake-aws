@@ -1,3 +1,15 @@
+"""
+ardef_schema.py
+
+Definición estática (hardcodeada, no vive en DynamoDB a diferencia de los
+campos Visa/Mastercard transaccionales) del layout de campos ARDEF de Visa:
+posiciones de ancho fijo de cada campo dentro de la línea de texto plano del
+archivo fuente, más los metadatos de control que el pipeline agrega a cada
+registro. Usado por las etapas de transform/extract del motor de reglas
+ARDEF para parsear el archivo ARDEF y para tipar las columnas del parquet
+resultante.
+"""
+
 METADATA_SCHEMA: dict[str, dict[str, str]] = {
     "file_id":                  {"data_type":'text'},
     "file_processing_date":     {"data_type":'text'},

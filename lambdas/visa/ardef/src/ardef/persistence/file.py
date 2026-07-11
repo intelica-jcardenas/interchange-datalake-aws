@@ -1,3 +1,13 @@
+"""
+file.py
+
+Capa de acceso a S3 del motor de reglas ARDEF de Visa. Reemplaza el acceso a
+filesystem local del prototipo por lectura/escritura directa a los buckets
+de landing/staging/operational/reference, resolviendo internamente el
+bucket y la S3 key de cada capa a partir del file_id (vía
+`ardef.persistence.database.Database`).
+"""
+
 import io
 import os 
 from enum import StrEnum, auto
@@ -15,6 +25,11 @@ log = Logger(__name__)
  
  
 class _Layer(StrEnum):
+    """
+    Identifica cada una de las 4 capas S3 del pipeline (landing, staging,
+    operational, reference) usadas por `FileStorage` para resolver el bucket
+    y la estructura de key correspondiente.
+    """
     LANDING = auto()
     STAGING = auto()
     OPERATIONAL = auto()
@@ -44,11 +59,35 @@ class FileStorage:
         self._s3 = None
  
     def _get_client(self):
+        """
+        Devuelve el cliente boto3 S3, creándolo perezosamente en la primera
+        llamada y reutilizándolo en las siguientes.
+
+        Returns:
+            El cliente `boto3.client("s3", ...)` cacheado en la instancia.
+
+        Ejemplo:
+            client = fs._get_client()
+        """
         if self._s3 is None:
             self._s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "eu-south-2"))
         return self._s3
     
     def _get_bucket(self, layer: _Layer) -> str:
+        """
+        Resuelve el nombre de bucket S3 real para una capa, leyendo la
+        variable de entorno correspondiente (con default de desarrollo si
+        no está seteada).
+
+        Args:
+            layer: capa del pipeline (`FileStorage.Layer.LANDING/STAGING/OPERATIONAL/REFERENCE`).
+
+        Returns:
+            Nombre del bucket S3, ej. "itl-0004-itx-dev-poc-02-landing".
+
+        Ejemplo:
+            fs._get_bucket(FileStorage.Layer.STAGING)  # "itl-0004-itx-dev-poc-02-staging"
+        """
         mapping = {
             self.Layer.LANDING: ("ITX_S3_BUCKET_LANDING", "itl-0004-itx-dev-poc-02-landing"),
             self.Layer.STAGING: ("ITX_S3_BUCKET_STAGING", "itl-0004-itx-dev-poc-02-staging"),
@@ -59,6 +98,22 @@ class FileStorage:
         return os.environ.get(env_var, default)
     
     def _get_file_details(self, file_id: str, file_processing_date: str, ) -> dict[str, str]:
+        """
+        Recupera los metadatos del archivo (client_id, brand_id, file_type,
+        file_processing_date, landing_file_name) desde DynamoDB, usados por
+        `_get_s3_key_prefix`/`_get_s3_key` para construir la ruta S3 de cada
+        capa.
+
+        Args:
+            file_id: PK de la tabla file_control.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+
+        Returns:
+            dict con los campos de metadata del archivo.
+
+        Ejemplo:
+            fs._get_file_details("0A8221C3...", "2026-01-20")
+        """
         return Database().get_ardef_file_control(
             file_id=file_id,
             file_processing_date=file_processing_date
@@ -71,6 +126,24 @@ class FileStorage:
         file_processing_date: str, 
         subdir: str = "",
     ) -> str:
+        """
+        Construye el prefijo de S3 key (sin nombre de archivo) para una capa
+        dada, a partir de los metadatos del archivo. LANDING usa solo
+        `{client_id}/` (estructura plana); las demás capas usan
+        `{client_id}/{brand_id}/{file_type}/{file_processing_date}/[{subdir}/]`.
+
+        Args:
+            layer: capa del pipeline.
+            file_id: PK de la tabla file_control.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            subdir: subcarpeta adicional dentro de la capa (ej. "400_ARDEF_CAL").
+
+        Returns:
+            Prefijo de key con "/" final, ej. "EBGR/VISA/IN/2026-01-20/400_ARDEF_CAL/".
+
+        Ejemplo:
+            fs._get_s3_key_prefix(FileStorage.Layer.STAGING, "0A8221C3...", "2026-01-20", "400_ARDEF_CAL")
+        """
         details = self._get_file_details(
             file_id=file_id, 
             file_processing_date=file_processing_date
@@ -97,6 +170,24 @@ class FileStorage:
             file_processing_date: str,
             subdir: str = "",
     ) -> str:
+        """
+        Construye la S3 key completa (con nombre de archivo) para una capa.
+        LANDING usa el nombre de archivo original (`landing_file_name`); las
+        demás capas usan el `file_id` como nombre base (sin extensión — los
+        callers de lectura/escritura de parquet le agregan ".parquet").
+
+        Args:
+            layer: capa del pipeline.
+            file_id: PK de la tabla file_control.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            subdir: subcarpeta adicional dentro de la capa.
+
+        Returns:
+            S3 key completa, ej. "EBGR/VISA/IN/2026-01-20/400_ARDEF_CAL/0A8221C3...".
+
+        Ejemplo:
+            fs._get_s3_key(FileStorage.Layer.STAGING, "0A8221C3...", "2026-01-20", "400_ARDEF_CAL")
+        """
         details = self._get_file_details(file_id=file_id, file_processing_date=file_processing_date)
         prefix = self._get_s3_key_prefix(layer, file_id, file_processing_date, subdir)
  
@@ -114,7 +205,25 @@ class FileStorage:
             encoding: str = "Latin-1",
     ) -> pd.DataFrame:
         """
-        Lee el archivo fuente desde S3 y retorna un Dataframe con columna 'lines'.
+        Lee el archivo fuente ARDEF (texto plano, encoding Latin-1 por
+        default) desde S3 y lo retorna como un DataFrame de una sola columna
+        ('lines'), una fila por línea no vacía del archivo. Si el objeto no
+        existe en S3 (`ClientError`), retorna un DataFrame vacío en vez de
+        propagar la excepción.
+
+        Args:
+            layer: capa S3 de origen (típicamente LANDING).
+            file_id: PK de la tabla file_control.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            subdir: subcarpeta adicional dentro de la capa.
+            encoding: encoding del archivo fuente (default "Latin-1").
+
+        Returns:
+            DataFrame con columna 'lines' (dtype str), una fila por línea del
+            archivo; vacío si el objeto S3 no existe.
+
+        Ejemplo:
+            fs.read_plaintext(FileStorage.Layer.LANDING, "0A8221C3...", "2026-01-20")
         """
         bucket = self._get_bucket(layer)
         key = self._get_s3_key(layer, file_id, file_processing_date, subdir)
@@ -150,7 +259,21 @@ class FileStorage:
         subdir: str = "",
     ) -> pd.DataFrame:
         """
-        Lee un parquet desde S3 usando un buffer BytesIO en memoria.
+        Lee un parquet de una etapa del pipeline ARDEF (staging u
+        operational) desde S3, usando un buffer BytesIO en memoria (sin
+        pasar por disco).
+
+        Args:
+            layer: capa S3 de origen.
+            file_id: PK de la tabla file_control.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            subdir: subcarpeta de la etapa (ej. "300_ARDEF_CLN").
+
+        Returns:
+            DataFrame con el contenido del parquet.
+
+        Ejemplo:
+            fs.read_parquet(FileStorage.Layer.STAGING, "0A8221C3...", "2026-01-20", "300_ARDEF_CLN")
         """
         bucket = self._get_bucket(layer)
         key = self._get_s3_key(layer, file_id, file_processing_date, subdir) + ".parquet"
@@ -180,6 +303,15 @@ class FileStorage:
             columns:    lista de columnas a leer. None = todas las columnas.
                         Usar para cargar solo las columnas necesarias y reducir
                         el uso de memoria (e.g. columnas de lógica de calculate).
+
+        Returns:
+            DataFrame con el contenido del parquet (solo las columnas pedidas).
+
+        Raises:
+            FileNotFoundError: si la key no existe en S3.
+
+        Ejemplo:
+            fs.read_parquet_by_filepath("visa_ardef/data.parquet")
         """
         bucket = self._get_bucket(layer)
  
@@ -209,6 +341,15 @@ class FileStorage:
         Args:
             filepath:   S3 key dentro del bucket de la capa indicada.
             layer:      capa S3 donde reside el archivo. Default = REFERENCE.
+
+        Returns:
+            pa.Table con el contenido completo del parquet.
+
+        Raises:
+            FileNotFoundError: si la key no existe en S3.
+
+        Ejemplo:
+            fs.read_arrow_by_filepath("visa_ardef/data.parquet")
         """
         bucket = self._get_bucket(layer)
  
@@ -233,7 +374,23 @@ class FileStorage:
         index: bool = False,
     ) -> str:
         """
-        Serializa un Dataframe como parquet y lo sube a S3. Retorna la S3 URI.
+        Serializa un DataFrame como parquet (buffer BytesIO en memoria, sin
+        pasar por disco) y lo sube a la capa/subdir indicados. Retorna la S3
+        URI del objeto creado.
+
+        Args:
+            data: DataFrame a serializar.
+            layer: capa S3 de destino.
+            file_id: PK de la tabla file_control.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            subdir: subcarpeta de la etapa (ej. "500_ARDEF_OPE").
+            index: incluir índice pandas en el parquet.
+
+        Returns:
+            S3 URI del objeto escrito, ej. "s3//bucket/EBGR/VISA/IN/2026-01-20/500_ARDEF_OPE/0A8221C3....parquet".
+
+        Ejemplo:
+            fs.write_parquet(df, FileStorage.Layer.OPERATIONAL, "0A8221C3...", "2026-01-20", "500_ARDEF_OPE")
         """
         bucket = self._get_bucket(layer)
         key = self._get_s3_key(layer, file_id, file_processing_date, subdir) + ".parquet"
@@ -273,6 +430,12 @@ class FileStorage:
             layer:          capa S3 de destino. Default = REFERENCE.
             schema:         schema PyArrow opcional para forzar tipos en la escritura.
             compression:    algoritmo de compresión parquet (default: snappy).
+
+        Returns:
+            None. Sube el parquet a S3 como efecto secundario.
+
+        Ejemplo:
+            fs.write_parquet_by_filepath(df, "visa_ardef/data.parquet")
         """
         bucket = self._get_bucket(layer)
         buffer = io.BytesIO()
@@ -315,6 +478,12 @@ class FileStorage:
             filepath:       S3 key dentro del bucket de la capa indicada.
             layer:          capa S3 de destino. Default = REFERENCE.
             compression:    algoritmo de compresión parquet (default: snappy).
+
+        Returns:
+            None. Sube el parquet a S3 como efecto secundario.
+
+        Ejemplo:
+            fs.write_arrow_by_filepath(table, "visa_ardef/data.parquet")
         """
         bucket = self._get_bucket(layer)
         buffer = io.BytesIO()
@@ -338,16 +507,25 @@ class FileStorage:
         filename: str = "lu_ardef.parquet",
     ) -> str:
         """
-        Retorna la S3 key de la maestra ARDEF dentro del bucket REFERENCE.
- 
-        La ruta es fija e independiente del cliente o fecha de procesamiento:
-            visa_ardef/
-        
+        Retorna la S3 key de la maestra ARDEF (lu_ardef) dentro del bucket
+        REFERENCE. La ruta es fija e independiente del cliente o fecha de
+        procesamiento — los parámetros existen solo por compatibilidad de
+        firma con otros getters de key (`_get_s3_key`), pero no afectan el
+        resultado.
+
         Bucket: itl-0004-itx-dev-poc-02-reference (Layer.REFERENCE)
         ARN: arn:aws:s3:::itl-0004-itx-dev-poc-02-reference
- 
+
         Args:
-            file_id, file_processing_date, filename
+            file_id: sin uso (mantenido por compatibilidad de firma).
+            file_processing_date: sin uso (mantenido por compatibilidad de firma).
+            filename: sin uso (mantenido por compatibilidad de firma).
+
+        Returns:
+            S3 key fija "visa_ardef/data.parquet".
+
+        Ejemplo:
+            fs.get_lu_ardef_filepath()  # "visa_ardef/data.parquet"
         """
         return "visa_ardef/data.parquet"
     
@@ -359,7 +537,27 @@ class FileStorage:
         subdir: str = "",
     ) -> list[str]:
         """
-        Lista S3 keys de parquets con prefijo file_id bajo el prefijo de la capa.
+        Lista las S3 keys de parquets bajo el prefijo de la capa/subdir cuyo
+        nombre de archivo empieza con `file_id`, para soportar el patrón de
+        "listar solo los outputs de esta ejecución" (ver `decisions.md` —
+        filtrado por file_id para no reprocesar ejecuciones anteriores). Si
+        la operación de listado en S3 falla, retorna lista vacía en vez de
+        propagar la excepción.
+
+        Args:
+            layer: capa S3 a listar.
+            file_id: PK de la tabla file_control, usado como filtro de prefijo
+                de nombre de archivo.
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            subdir: subcarpeta de la etapa.
+
+        Returns:
+            Lista ordenada de S3 keys (".parquet") cuyo nombre de archivo
+            empieza con `file_id`; vacía si no hay resultados o si falla el
+            listado.
+
+        Ejemplo:
+            fs.get_list_files_folderpath(FileStorage.Layer.STAGING, "0A8221C3...", "2026-01-20", "300_ARDEF_CLN")
         """
         bucket = self._get_bucket(layer)
         prefix = self._get_s3_key_prefix(layer, file_id, file_processing_date, subdir)

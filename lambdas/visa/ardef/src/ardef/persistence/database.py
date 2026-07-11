@@ -1,7 +1,17 @@
+"""
+database.py
+
+Acceso a la tabla DynamoDB file_control para el motor de reglas ARDEF de
+Visa. Usado por `ardef.persistence.file.FileStorage` para resolver, a partir
+de un file_id, los metadatos (client_id, brand_id, file_type,
+file_processing_date, landing_file_name) necesarios para construir las
+S3 keys de cada capa del pipeline (landing/staging/operational/reference).
+"""
+
 import os
 from datetime import date
 
-import boto3 
+import boto3
 from botocore.exceptions import ClientError
 
 from ardef.logs.logger import Logger
@@ -10,21 +20,42 @@ log = Logger(__name__)
 
 class Database:
     """
-    Acceso a la table file_control en DynamoDB.
+    Encapsula el acceso de solo lectura a la tabla file_control en DynamoDB
+    (PK: file_id), usada para recuperar los metadatos de un archivo ya
+    registrado por el router.
     """
 
     DEFAULT_TABLE = 'itl-0004-itx-dev-dynamo-file_control-02'
 
     def __init__(self) -> None:
+        """
+        Inicializa el nombre de tabla y región desde variables de entorno
+        (con defaults de desarrollo) y difiere la creación del recurso
+        boto3 hasta el primer uso (ver `_get_resource`).
+
+        Ejemplo:
+            db = Database()  # table_name="itl-0004-itx-dev-dynamo-file_control-02"
+        """
         self.table_name = os.environ.get("ITX_TABLE_FILE_CONTROL", self.DEFAULT_TABLE)
         self.region = os.environ.get("AWS_REGION", "eu-south-2")
         self._dynamodb = None
 
     def _get_resource(self):
+        """
+        Devuelve el recurso boto3 DynamoDB, creándolo perezosamente en la
+        primera llamada y reutilizándolo en las siguientes (evita reabrir
+        conexión en cada invocación dentro del mismo ciclo de vida Lambda).
+
+        Returns:
+            El recurso `boto3.resource("dynamodb", ...)` cacheado en la instancia.
+
+        Ejemplo:
+            resource = db._get_resource()
+        """
         if self._dynamodb is None:
             self._dynamodb = boto3.resource("dynamodb", region_name=self.region)
         return self._dynamodb
-    
+
     def get_ardef_file_control(
         self,
         file_id: str,
@@ -32,15 +63,28 @@ class Database:
         fields: list[str] | None = None,
     ) -> dict[str, str]:
         """
-        Lee el registro de un archivo desde DynamoDB por file_id.
-        Valida que file_processing_date conicida con el registro encontrado.
-        
+        Lee el registro de un archivo desde DynamoDB por file_id y valida que
+        file_processing_date coincida con el registro encontrado, como
+        chequeo de consistencia contra el parámetro recibido por el caller
+        (evita usar el registro equivocado si el file_id fuera ambiguo).
+
+        Args:
+            file_id: PK de la tabla file_control (ej. "0A8221C3293EF535621FB1E35D709ACC").
+            file_processing_date: fecha esperada del archivo, "YYYY-MM-DD".
+            fields: lista de campos a devolver del item. Si es None, usa el
+                default (file_id, client_id, brand_id, file_type,
+                file_processing_date, landing_file_name).
+
         Returns:
             dict[str, str] con los campos solicitados.
-        
+
         Raises:
             ValueError: si el registro no existe o la fecha no coincide.
             ClientError: si hay error de comunicación con DynamoDB
+
+        Ejemplo:
+            Database().get_ardef_file_control("0A8221C3...", "2026-01-20")
+            # {"file_id": "0A8221C3...", "client_id": "EBGR", ...}
         """
         if fields is None:
             fields = [
@@ -99,7 +143,20 @@ class Database:
 
 def _normalize_date(value) -> str:
     """
-    Convierte cualquier representación de fecha a string YYYY-MM-DD.
+    Convierte cualquier representación de fecha (objeto `date` de Python o
+    string ya formateado) a un string plano "YYYY-MM-DD", para poder
+    comparar el valor almacenado en DynamoDB contra el parámetro recibido
+    sin importar cómo llegó serializado.
+
+    Args:
+        value: valor de fecha, `datetime.date` o cualquier otro tipo
+            convertible a string (ej. Decimal/str desde DynamoDB).
+
+    Returns:
+        String "YYYY-MM-DD" (o `str(value).strip()` si no es un `date`).
+
+    Ejemplo:
+        _normalize_date(date(2026, 1, 20))  # "2026-01-20"
     """
     if isinstance(value, date):
         return value.strftime("%Y-%m-%d")

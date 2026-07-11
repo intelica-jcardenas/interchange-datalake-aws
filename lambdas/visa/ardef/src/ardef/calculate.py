@@ -1,13 +1,24 @@
+"""
+calculate.py
+
+Cuarta etapa del pipeline ARDEF. Calcula la vigencia (valid_until) de cada
+registro de rango de BIN/regla contra la tabla maestra acumulada lu_ardef
+(en la capa REFERENCE), soportando llegada de registros fuera de orden, y
+mantiene esa tabla maestra actualizada en S3 para que las Lambdas de
+calculate de Visa (calc_ardef) puedan cruzar transacciones contra el rango
+vigente en la fecha correspondiente.
+"""
+
 import gc
 from datetime import datetime, timedelta
 from typing import Optional
- 
+
 import pandas as pd
 import pyarrow as pa
- 
+
 from ardef.logs.logger import Logger
 from ardef.persistence.file import FileStorage
- 
+
 log = Logger(__name__)
 fs = FileStorage()
  
@@ -30,10 +41,20 @@ _LU_LOGIC_COLS = [_LINES_COL] + _MATCH_KEYS + [_EFFECTIVE_DATE_COL, _DATE_VALID_
  
 def _parse_effective_date_series(series: pd.Series) -> pd.Series:
     """
-    Convierte una Serie de cadenas a pd.Timestamp probando múltiples formatos.
-    Devuelve NaT cuando no es posible parsear.
+    Convierte una Serie de cadenas a pd.Timestamp probando múltiples formatos
+    (`_DATE_FORMATS`). Devuelve NaT cuando no es posible parsear.
+
+    Args:
+        series: Serie de strings a parsear (típicamente `effective_date`).
+
+    Returns:
+        Serie de pd.Timestamp (NaT donde no se pudo parsear).
+
+    Ejemplo:
+        _parse_effective_date_series(pd.Series(["20260424"]))
+        # -> [Timestamp('2026-04-24')]
     """
- 
+
     def _try(val: str) -> Optional[pd.Timestamp]:
         if pd.isna(val) or str(val).strip() in ("", "nan", "NaT", "None"):
             return pd.NaT
@@ -51,9 +72,21 @@ def _valid_until_to_str(series: pd.Series) -> pd.Series:
     """
     Convierte una serie de fechas (datetime64 / Timestamp / string) a strings
     'yyyy-mm-dd' con pd.NA para nulos (registros vigentes).
- 
+
     Se usa pd.StringDtype() para que pyarrow escriba siempre como utf8
     y nunca como date32 (int32), independientemente del contenido.
+
+    Args:
+        series: Serie con fechas en cualquier formato aceptado por
+            `pd.to_datetime` (datetime64, Timestamp o string), o valores
+            nulos para registros aún vigentes.
+
+    Returns:
+        Serie de tipo `pd.StringDtype()` con fechas "YYYY-MM-DD" o `pd.NA`.
+
+    Ejemplo:
+        _valid_until_to_str(pd.Series([pd.Timestamp("2026-04-24"), None]))
+        # -> ["2026-04-24", <NA>]
     """
     dt = pd.to_datetime(series, errors="coerce")                         # datetime64[ns]
     result = dt.dt.strftime("%Y-%m-%d").where(dt.notna(), other=pd.NA)   # str o pd.NA
@@ -63,11 +96,24 @@ def _valid_until_to_str(series: pd.Series) -> pd.Series:
 def _load_lu_ardef_logic(filepath: str) -> pd.DataFrame:
     """
     Carga solo las columnas necesarias para el cálculo desde lu_ardef (Fase 1).
- 
+
     Carga únicamente _LU_LOGIC_COLS (6 columnas) en lugar de las 54 del full.
     Esto reduce el uso de RAM de ~5.5 GB a ~0.3 GB para 1.7M filas.
- 
+
     Retorna DataFrame vacío si la key no existe (primera ejecución).
+
+    Args:
+        filepath: Ruta/key de lu_ardef dentro de la capa REFERENCE (ver
+            `FileStorage.get_lu_ardef_filepath`).
+
+    Returns:
+        DataFrame con las columnas `_LU_LOGIC_COLS` (agrega `valid_until`
+        como NaT si el parquet leído no la tenía). DataFrame vacío si el
+        archivo no existe (primera ejecución) o si ocurre cualquier otro
+        error de lectura (logueado como error, no se propaga la excepción).
+
+    Ejemplo:
+        _load_lu_ardef_logic("reference/visa/ardef/lu_ardef/data.parquet")
     """
     try:
         df = fs.read_parquet_by_filepath(
@@ -102,10 +148,25 @@ def _deduplicate_incoming(
 ) -> pd.DataFrame:
     """
     Elimina de las filas entrantes aquellas cuyo campo 'lines' ya existe en lu_ardef.
- 
-    El campo 'lines' es la línea de texto original del archivo fuente, y actúa como 
-    llave natural única de cada registro: si 'lines' ya esta en lu_ardef, el registro 
+
+    El campo 'lines' es la línea de texto original del archivo fuente, y actúa como
+    llave natural única de cada registro: si 'lines' ya esta en lu_ardef, el registro
     es idéntico al que procesó en una ejecución anterior -> se descarta.
+
+    Args:
+        df: DataFrame CLEAN (filas entrantes candidatas a nuevas).
+        lu_ardef: Tabla maestra lu_ardef ya cargada (columnas de lógica),
+            usada solo para consultar el set de 'lines' ya existentes.
+        file_id: ID único del archivo, para logging.
+        file_processing_date: Fecha de negocio del archivo, para logging.
+
+    Returns:
+        Subconjunto de `df` sin las filas cuyo 'lines' ya está en
+        `lu_ardef` (índice reseteado). Si `lu_ardef` está vacío o no tiene
+        la columna 'lines', retorna `df` sin cambios.
+
+    Ejemplo:
+        _deduplicate_incoming(df, lu_ardef, "ABC123", "2026-04-24")
     """
     if lu_ardef.empty:
         return df
@@ -153,14 +214,27 @@ def _build_calculate_dataframe(
     Paso 2: valid_until para filas nuevas out-of-order:
         Si en lu existe un registro con las mismas claves y _eff_parsed > E:
             valid_until_nueva = min(eff_sucesor_en_lu) - 1d
- 
-    Retorna:
-    * df_calculate: nuevas filas con valid_until calculado (400_ARDEF_CAL).
-                    Contiene todas las columnas del CLEAN + valid_until.
-    * lu_valid_until: Serie con el valid_until actualizado para TODAS las filas de
-                      lu_logic, indexed 0..N-1 (mismo orden posicional que lu_full).
-                      None si lu_logic estaba vacío (primera ejecución) o si todos
-                      los registros entrantes eran duplicados (sin cambios en la maestra).
+
+    Args:
+        clean: DataFrame CLEAN (etapa 300_ARDEF_CLN), con todos los campos ya
+            casteados.
+        lu_logic: Tabla maestra lu_ardef con solo las columnas de lógica
+            (`_LU_LOGIC_COLS`), tal como la devuelve `_load_lu_ardef_logic`.
+            Vacía en la primera ejecución.
+        file_id: ID único del archivo, para logging.
+        file_processing_date: Fecha de negocio del archivo, para logging.
+
+    Returns:
+        Tupla (df_calculate, lu_valid_until):
+        * df_calculate: nuevas filas con valid_until calculado (400_ARDEF_CAL).
+                        Contiene todas las columnas del CLEAN + valid_until.
+        * lu_valid_until: Serie con el valid_until actualizado para TODAS las filas de
+                          lu_logic, indexed 0..N-1 (mismo orden posicional que lu_full).
+                          None si lu_logic estaba vacío (primera ejecución) o si todos
+                          los registros entrantes eran duplicados (sin cambios en la maestra).
+
+    Ejemplo:
+        _build_calculate_dataframe(clean, lu_logic, "ABC123", "2026-04-24")
     """
  
     # nuevas filas con valid_until inicializado a NaT
@@ -338,8 +412,29 @@ def calculate_ardef(
     4. Liberar memoria (Fase 1 → Fase 2)
     5. Leer lu_ardef completo como Arrow, actualizar y escribir en REFERENCE
     6. Escribir STAGING / 400_ARDEF_CAL (solo nuevas filas)
- 
+
     valid_until se almacena siempre como string 'yyyy-mm-dd' o None.
+
+    Args:
+        origin_layer: Layer de origen del CLEAN (típicamente STAGING).
+        target_layer: Layer de destino del CALCULATE (típicamente STAGING).
+        file_id: ID único del archivo.
+        file_processing_date: Fecha de negocio del archivo, "YYYY-MM-DD".
+        origin_subdir: Subdirectorio de origen (default "300_ARDEF_CLN").
+        target_subdir: Subdirectorio de destino en STAGING (default
+            "400_ARDEF_CAL").
+        operational_subdir: Nombre de archivo de la tabla maestra dentro de
+            REFERENCE (default "data.parquet", ver `_LU_ARDEF_FILENAME`).
+
+    Returns:
+        None. Actualiza lu_ardef en REFERENCE y escribe el parquet CALCULATE
+        (solo filas nuevas) en STAGING, ambos como efecto secundario.
+        Cualquier error al escribir lu_ardef se loguea pero no interrumpe el
+        procesamiento — el parquet CALCULATE se escribe igualmente.
+
+    Ejemplo:
+        calculate_ardef(FileStorage.Layer.STAGING, FileStorage.Layer.STAGING,
+                         "ABC123", "2026-04-24")
     """
  
     log.logger.info(

@@ -1,8 +1,16 @@
 """
-Lambda Unzip - itl-0004-itx-dev-intchg-02-lmbd-unzip
-=========================
-Descomprime archivos ZIP que llegan al landing y sube al landing
-solo los archivos que hacen match con los patrones de itx-file-pattern.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-unzip
+================================================================================
+Archivo:     lambdas/unzip/src/handler.py
+
+Descomprime archivos ZIP detectados por el router antes de que lleguen al
+flujo normal del pipeline. Sube al landing solo los archivos internos que
+hacen match con los patrones de `file_pattern` en DynamoDB (los mismos que
+usa el router), archiva el ZIP original en s3-archive (no en s3-operational)
+y elimina el ZIP del landing. Cada archivo extraído y subido dispara al
+router nuevamente via S3 Event — es la forma en que el pipeline logra
+paralelismo gratis al procesar los N archivos internos de un ZIP sin
+orquestación adicional.
 
 Flujo:
   1. Recibe el S3 key del ZIP y la file_date extraída por el router
@@ -58,8 +66,22 @@ MULTIPART_THRESHOLD = 100 * 1024 * 1024  # 100MB
 
 def _load_patterns(customer_code: str) -> List[Dict]:
     """
-    Carga patrones activos de DynamoDB para el cliente.
-    Misma lógica que el router para garantizar consistencia.
+    Carga patrones activos de DynamoDB para el cliente (incluyendo los
+    patrones genéricos `customer_code='ALL'`), ordenados por prioridad.
+    Misma lógica que el router para garantizar consistencia — un archivo
+    dentro de un ZIP debe clasificarse igual que si hubiera llegado suelto
+    al landing.
+
+    Args:
+        customer_code: Código del cliente, ej. "EBGR".
+
+    Returns:
+        Lista de patrones (dicts) ordenados por `priority` ascendente, ya
+        filtrados por cliente. Lista vacía si no hay patrones activos o si
+        falla la consulta a DynamoDB (el error se loguea, no se relanza).
+
+    Ejemplo:
+        _load_patterns("EBGR")  # -> [{"file_format": "...", "brand": "VISA", ...}, ...]
     """
     try:
         table    = dynamodb.Table(FILE_PATTERN_TABLE)
@@ -93,7 +115,25 @@ def _load_patterns(customer_code: str) -> List[Dict]:
 
 
 def _matches_pattern(filename: str, patterns: List[Dict]) -> Optional[Dict]:
-    """Retorna la clasificación del primer patrón que hace match, o None."""
+    """
+    Retorna la clasificación del primer patrón (ya ordenados por prioridad)
+    cuyo regex hace match con el nombre de archivo, o None si ninguno
+    matchea.
+
+    Args:
+        filename: Nombre del archivo interno del ZIP a clasificar.
+        patterns: Lista de patrones ya cargados y ordenados por prioridad
+            (ver `_load_patterns`).
+
+    Returns:
+        Dict con `brand`, `direction`, `pattern_id` y `customer_code` del
+        primer patrón que matchea, o None si no hay match o el regex de
+        algún patrón es inválido (se ignora ese patrón y se sigue probando).
+
+    Ejemplo:
+        _matches_pattern("I479273260330", patterns)
+        # -> {"brand": "VISA", "direction": "IN", "pattern_id": "1", "customer_code": "EBGR"}
+    """
     for patron in patterns:
         regex = patron.get('file_format', '')
         if not regex:
@@ -119,7 +159,18 @@ def _download_zip_to_tmp(bucket: str, key: str, tmp_path: str) -> int:
     """
     Descarga el ZIP de S3 a /tmp en chunks de EXTRACT_CHUNK_BYTES.
     Nunca carga el ZIP completo en RAM.
-    Retorna el tamaño descargado en bytes.
+
+    Args:
+        bucket: Bucket origen (landing).
+        key: Key del ZIP en el bucket origen.
+        tmp_path: Ruta local en /tmp donde se escribe el ZIP descargado.
+
+    Returns:
+        Tamaño descargado en bytes.
+
+    Ejemplo:
+        _download_zip_to_tmp("itx-landing-dev", "EBGR/VISA260416.zip",
+            "/tmp/VISA260416.zip")  # -> 52428800
     """
     logger.info(f"Downloading ZIP: s3://{bucket}/{key} → {tmp_path}")
 
@@ -147,8 +198,20 @@ def _download_zip_to_tmp(bucket: str, key: str, tmp_path: str) -> int:
 
 def _inspect_zip(tmp_path: str) -> List[str]:
     """
-    Lista los archivos dentro del ZIP sin extraerlos.
-    Filtra carpetas y archivos ocultos.
+    Lista los archivos dentro del ZIP sin extraerlos — solo lee el índice
+    central del ZIP. Filtra carpetas (entradas que terminan en "/") y
+    archivos ocultos (nombre que empieza con ".").
+
+    Args:
+        tmp_path: Ruta local del ZIP ya descargado.
+
+    Returns:
+        Lista de nombres de entrada (paths dentro del ZIP) procesables —
+        excluye carpetas y ocultos.
+
+    Ejemplo:
+        _inspect_zip("/tmp/VISA260416.zip")
+        # -> ["I479273260330", "I479273260331", ...]
     """
     with zipfile.ZipFile(tmp_path, 'r') as zf:
         all_names = zf.namelist()
@@ -180,12 +243,32 @@ def _extract_and_upload(
     file_date: str  = None
 ) -> str:
     """
-    Extrae un archivo del ZIP y lo sube al landing.
-    Para archivos pequeños: upload simple.
-    Para archivos grandes (>100MB): multipart upload.
+    Extrae un archivo del ZIP y lo sube al landing, sin escribirlo a disco
+    intermedio — lee la entrada del ZIP en streaming y la sube directo a S3.
+    Para archivos pequeños: upload simple. Para archivos grandes (>100MB):
+    multipart upload, acumulando en buffer hasta alcanzar 10MB por parte
+    (mínimo de S3 es 5MB).
 
-    Destino en landing: {client_id}/{filename}
-    Retorna el S3 key del archivo subido.
+    Destino en landing: {client_id}/{filename} — salvo `pattern_id == '7'`
+    (patrón VISA ARDEF, cuyo nombre de archivo no trae fecha), donde se
+    antepone `file_date` al nombre para evitar colisiones entre versiones.
+
+    Args:
+        tmp_zip_path: Ruta local del ZIP ya descargado.
+        zip_entry_name: Path de la entrada dentro del ZIP a extraer.
+        client_id: Código del cliente, usado como prefijo del key destino.
+        dest_bucket: Bucket destino (landing).
+        pattern_id: ID del patrón que clasificó este archivo — condiciona el
+            key destino si es "7" (VISA ARDEF).
+        file_date: Fecha de negocio, antepuesta al nombre solo si
+            `pattern_id == '7'`.
+
+    Returns:
+        S3 key del archivo subido al landing.
+
+    Ejemplo:
+        _extract_and_upload("/tmp/VISA260416.zip", "I479273260330", "EBGR",
+            "itx-landing-dev")  # -> "EBGR/I479273260330"
     """
     filename = zip_entry_name.split('/')[-1]
     if pattern_id == '7': # Solo para patrones con fecha en el nombre (VISA ARDEF)
@@ -279,11 +362,29 @@ def _archive_zip(
     dest_bucket: str
 ) -> str:
     """
-    Archiva el ZIP original en archive/originals/zip/.
-    Usa copy_object server-side — no descarga el archivo.
+    Archiva el ZIP original en el bucket de archive, bajo
+    originals/zip/{year}/{month}/. Usa `copy_object` server-side — no
+    descarga ni vuelve a subir el archivo, la copia ocurre íntegramente
+    dentro de S3. Si `file_date` no se puede parsear, usa la fecha actual
+    como fallback.
 
     Estructura:
       {client_id}/originals/zip/{year}/{month}/{zip_filename}
+
+    Args:
+        source_bucket: Bucket origen del ZIP (landing).
+        source_key: Key del ZIP en el bucket origen.
+        client_id: Código del cliente, usado como prefijo del key destino.
+        file_date: Fecha de negocio en formato "YYYY-MM-DD".
+        dest_bucket: Bucket destino (archive).
+
+    Returns:
+        S3 key donde quedó archivado el ZIP.
+
+    Ejemplo:
+        _archive_zip("itx-landing-dev", "EBGR/VISA260416.zip", "EBGR",
+            "2026-04-16", "itl-...-s3-archive")
+        # -> "EBGR/originals/zip/2026/04/VISA260416.zip"
     """
     zip_filename = source_key.split('/')[-1]
 
@@ -309,12 +410,39 @@ def _archive_zip(
 
 
 def _delete_from_landing(bucket: str, key: str) -> None:
+    """
+    Elimina el ZIP original de landing. Se llama solo después de haberlo
+    archivado en s3-archive (ver `_archive_zip`).
+
+    Args:
+        bucket: Bucket de landing.
+        key: Key del ZIP a eliminar.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _delete_from_landing("itx-landing-dev", "EBGR/VISA260416.zip")
+    """
     logger.info(f"Deleting ZIP from landing: s3://{bucket}/{key}")
     s3.delete_object(Bucket=bucket, Key=key)
     logger.info("Landing clean")
 
 
 def _cleanup_tmp(tmp_path: str) -> None:
+    """
+    Elimina el ZIP temporal de /tmp para liberar espacio. No lanza excepción
+    si falla — solo registra un warning.
+
+    Args:
+        tmp_path: Ruta local a eliminar.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _cleanup_tmp("/tmp/VISA260416.zip")
+    """
     try:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -328,27 +456,45 @@ def _cleanup_tmp(tmp_path: str) -> None:
 
 def lambda_handler(event, context):
     """
-    Entry point del Lambda unzip.
-    Invocado asincrónicamente por itx-router cuando detecta un ZIP.
+    Entry point del Lambda unzip. Invocado asincrónicamente por el router
+    cuando detecta un ZIP en el landing. Descarga el ZIP, inspecciona su
+    índice sin extraer nada a disco, clasifica cada archivo interno contra
+    los patrones de DynamoDB, sube al landing solo los que hacen match
+    (los que no matchean se descartan, quedando registrados en `skipped`),
+    archiva el ZIP original en s3-archive y limpia el landing. Cada archivo
+    subido dispara al router nuevamente vía S3 Event, logrando paralelismo
+    sin orquestación adicional. El bloque `finally` limpia /tmp tanto en
+    éxito como en fallo.
 
-    Input (desde itx-router):
-    {
-        "client_id":      "EBGR",
-        "bucket_landing": "itx-landing-dev",
-        "s3_key":         "EBGR/VISA260416.zip",
-        "file_date":      "2026-04-16"
-    }
+    Args:
+        event: Payload recibido desde el router:
+            {
+                "client_id":      "EBGR",
+                "bucket_landing": "itx-landing-dev",
+                "s3_key":         "EBGR/VISA260416.zip",
+                "file_date":      "2026-04-16"
+            }
+        context: Contexto de ejecución de Lambda (no usado por el handler).
 
-    Output:
-    {
-        "status":        "EXTRACTED",
-        "zip_file":      "VISA260416.zip",
-        "total_in_zip":  10,
-        "matched":       4,
-        "skipped":       6,
-        "uploaded_keys": ["EBGR/I479273260330", ...],
-        "archive_key":   "EBGR/originals/zip/2026/04/VISA260416.zip"
-    }
+    Returns:
+        Dict con el resultado de la descompresión:
+        {
+            "status":        "EXTRACTED",
+            "zip_file":      "VISA260416.zip",
+            "total_in_zip":  10,
+            "matched":       4,
+            "skipped":       6,
+            "uploaded_keys": ["EBGR/I479273260330", ...],
+            "archive_key":   "EBGR/originals/zip/2026/04/VISA260416.zip"
+        }
+        Lanza `ValueError` si faltan `S3_BUCKET_LANDING`/`S3_BUCKET_ARCHIVE`,
+        campos requeridos del evento, o no hay patrones activos para el
+        cliente.
+
+    Ejemplo:
+        lambda_handler({"client_id": "EBGR", "s3_key": "EBGR/VISA260416.zip",
+            "file_date": "2026-04-16"}, None)
+        # -> {"status": "EXTRACTED", "zip_file": "VISA260416.zip", ...}
     """
     logger.info("=" * 60)
     logger.info("ITX UNZIP LAMBDA - START")

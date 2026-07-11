@@ -1,8 +1,12 @@
 """
-Lambda Archive - itx-archive-file
-==================================
-Mueve el archivo original de landing a operational/originals comprimido en ZIP.
-Se ejecuta SIEMPRE al final del pipeline — éxito o fallo.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-archive-file
+================================================================================
+Archivo:     lambdas/archive-file/src/handler.py
+
+Último paso del pipeline de interchange (Visa y Mastercard) — se ejecuta
+SIEMPRE al final, tanto en éxito como en fallo. Comprime el archivo original
+recibido en el landing y lo mueve, ya comprimido en ZIP, al bucket de
+archive (s3-archive), dejando el landing limpio para el siguiente archivo.
 
 Estrategia de compresión (streaming):
   - Lee el archivo de S3 en chunks de COMPRESS_CHUNK_SIZE (nunca > 8MB en RAM)
@@ -64,13 +68,28 @@ def _build_archive_key(
     filename: str
 ) -> str:
     """
-    Construye el S3 key de destino en operational/originals.
+    Construye el S3 key de destino en el bucket de archive, agrupando por
+    cliente/marca/tipo de archivo/año/mes. Si `file_date` no se puede parsear
+    (formato inesperado o vacío), usa la fecha actual como fallback en vez de
+    fallar el archivado completo.
 
     Estructura:
       {client_id}/originals/{brand}/{file_type}/{year}/{month}/{filename}.zip
 
+    Args:
+        client_id: Código del cliente, ej. "EBGR".
+        brand: Marca del archivo, "VISA" o "MASTERCARD".
+        file_type: Dirección del archivo, "IN" u "OUT".
+        file_date: Fecha de negocio en formato "YYYY-MM-DD".
+        filename: Nombre del archivo original (sin comprimir).
+
+    Returns:
+        S3 key de destino, con extensión ".zip" agregada si el archivo
+        original no la tenía ya.
+
     Ejemplo:
-      EBGR/originals/VISA/IN/2026/04/I479273260330.zip
+      _build_archive_key("EBGR", "VISA", "IN", "2026-04-03", "I479273260330")
+      # -> "EBGR/originals/VISA/IN/2026/04/I479273260330.zip"
     """
     try:
         dt    = datetime.strptime(file_date, "%Y-%m-%d")
@@ -100,9 +119,21 @@ def _compress_and_save_to_tmp(
 ) -> int:
     """
     Lee el archivo de S3 en chunks y lo escribe comprimido en /tmp.
-    Nunca tiene más de COMPRESS_CHUNK_BYTES en RAM al mismo tiempo.
+    Nunca tiene más de COMPRESS_CHUNK_BYTES en RAM al mismo tiempo — necesario
+    porque los archivos de interchange pueden superar 1.5 GB.
 
-    Retorna el tamaño del ZIP resultante en bytes.
+    Args:
+        source_bucket: Bucket origen (landing).
+        source_key: Key del archivo original dentro del bucket origen.
+        filename: Nombre con el que se registra la entrada dentro del ZIP.
+        tmp_path: Ruta local en /tmp donde se escribe el ZIP resultante.
+
+    Returns:
+        Tamaño del ZIP resultante en bytes.
+
+    Ejemplo:
+        _compress_and_save_to_tmp("itx-landing-dev", "EBGR/I479273260330",
+            "I479273260330", "/tmp/I479273260330.zip")  # -> 209715200
     """
     logger.info(f"Compressing s3://{source_bucket}/{source_key}")
     logger.info(f"  Chunk size: {COMPRESS_CHUNK_BYTES // 1024 // 1024}MB")
@@ -147,6 +178,22 @@ def _upload_zip_to_s3(tmp_path: str, dest_bucket: str, dest_key: str, zip_size: 
     Para archivos >= 100MB: multipart upload
       → recomendado por AWS para archivos grandes
       → más eficiente en red y más tolerante a fallos
+
+    Args:
+        tmp_path: Ruta local del ZIP a subir.
+        dest_bucket: Bucket destino (archive).
+        dest_key: Key destino dentro del bucket de archive.
+        zip_size: Tamaño del ZIP en bytes, usado para decidir la estrategia
+            de subida.
+
+    Returns:
+        None. Si el multipart upload falla, aborta la subida en curso
+        (`abort_multipart_upload`) para no dejar partes huérfanas en S3 y
+        relanza la excepción original.
+
+    Ejemplo:
+        _upload_zip_to_s3("/tmp/file.zip", "itl-...-s3-archive",
+            "EBGR/originals/VISA/IN/2026/04/file.zip", 157286400)
     """
     if zip_size < MULTIPART_THRESHOLD:
         logger.info(f"Uploading (simple): s3://{dest_bucket}/{dest_key}")
@@ -212,7 +259,23 @@ def _upload_zip_to_s3(tmp_path: str, dest_bucket: str, dest_key: str, zip_size: 
 # =============================================================================
 
 def _verify_upload(bucket: str, key: str) -> bool:
-    """Verifica que el ZIP existe en S3 antes de eliminar el original."""
+    """
+    Verifica que el ZIP existe en S3 antes de eliminar el original de
+    landing — evita borrar el archivo fuente si la subida falló o quedó
+    incompleta.
+
+    Args:
+        bucket: Bucket donde debería estar el ZIP subido (archive).
+        key: Key del ZIP a verificar.
+
+    Returns:
+        True si el objeto existe en S3, False si `head_object` falla por
+        cualquier motivo (no encontrado, permisos, etc.).
+
+    Ejemplo:
+        _verify_upload("itl-...-s3-archive", "EBGR/originals/.../file.zip")
+        # -> True
+    """
     try:
         s3.head_object(Bucket=bucket, Key=key)
         return True
@@ -222,14 +285,39 @@ def _verify_upload(bucket: str, key: str) -> bool:
 
 
 def _delete_from_landing(bucket: str, key: str) -> None:
-    """Elimina el archivo original de landing. Solo se llama tras verificación exitosa."""
+    """
+    Elimina el archivo original de landing. Solo se llama tras verificación
+    exitosa del ZIP en destino (ver `_verify_upload`).
+
+    Args:
+        bucket: Bucket de landing.
+        key: Key del archivo original a eliminar.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _delete_from_landing("itx-landing-dev", "EBGR/I479273260330")
+    """
     logger.info(f"Deleting from landing: s3://{bucket}/{key}")
     s3.delete_object(Bucket=bucket, Key=key)
     logger.info("Deleted from landing — landing is now clean")
 
 
 def _cleanup_tmp(tmp_path: str) -> None:
-    """Elimina el archivo temporal de /tmp para liberar espacio."""
+    """
+    Elimina el archivo temporal de /tmp para liberar espacio del entorno de
+    ejecución. No lanza excepción si falla — solo registra un warning.
+
+    Args:
+        tmp_path: Ruta local a eliminar.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _cleanup_tmp("/tmp/I479273260330.zip")
+    """
     try:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -244,25 +332,42 @@ def _cleanup_tmp(tmp_path: str) -> None:
 
 def lambda_handler(event, context):
     """
-    Entry point del Lambda archive.
+    Entry point del Lambda archive. Comprime el archivo original del landing
+    y lo sube al bucket de archive, verifica que la subida se completó
+    correctamente, y solo entonces elimina el original de landing. Si la
+    verificación falla, deja el archivo original intacto en landing y lanza
+    `RuntimeError` en vez de borrarlo. El bloque `finally` limpia /tmp tanto
+    en éxito como en fallo.
 
-    Input (desde Step Functions — PrepareArchiveInput):
-    {
-        "file_id":        "ABC123",
-        "client_id":      "EBGR",
-        "brand":          "VISA",
-        "file_type":      "IN",
-        "file_date":      "2026-04-03",
-        "s3_key_landing": "EBGR/I479273260330",
-        "bucket_landing": "itx-landing-dev"
-    }
+    Args:
+        event: Payload recibido desde Step Functions (paso PrepareArchiveInput):
+            {
+                "file_id":        "ABC123",
+                "client_id":      "EBGR",
+                "brand":          "VISA",
+                "file_type":      "IN",
+                "file_date":      "2026-04-03",
+                "s3_key_landing": "EBGR/I479273260330",
+                "bucket_landing": "itx-landing-dev"
+            }
+        context: Contexto de ejecución de Lambda (no usado por el handler).
 
-    Output:
-    {
-        "status":      "ARCHIVED",
-        "file_id":     "ABC123",
-        "archive_key": "EBGR/originals/VISA/IN/2026/04/I479273260330.zip"
-    }
+    Returns:
+        Dict con el resultado del archivado:
+        {
+            "status":      "ARCHIVED",
+            "file_id":     "ABC123",
+            "archive_key": "EBGR/originals/VISA/IN/2026/04/I479273260330.zip"
+        }
+        Lanza `ValueError` si falta `S3_BUCKET_ARCHIVE` o algún campo
+        requerido del evento; `RuntimeError` si la verificación post-subida
+        falla.
+
+    Ejemplo:
+        lambda_handler({"file_id": "ABC123", "client_id": "EBGR",
+            "brand": "VISA", "file_type": "IN", "file_date": "2026-04-03",
+            "s3_key_landing": "EBGR/I479273260330"}, None)
+        # -> {"status": "ARCHIVED", "file_id": "ABC123", "archive_key": "..."}
     """
     logger.info("=" * 60)
     logger.info("ITX ARCHIVE LAMBDA - START")

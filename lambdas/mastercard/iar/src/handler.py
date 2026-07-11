@@ -1,3 +1,43 @@
+"""
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-iar
+================================================================================
+Archivo:     lambdas/mastercard/iar/src/handler.py
+
+Motor de reglas IAR (Interchange Assessment Rules) de Mastercard — equivalente
+funcional al módulo `ardef` de Visa (rangos de BINes y reglas de fees). Se
+invoca directo desde `lmbd-router` (async, sin pasar por Step Functions)
+cuando la clasificación del archivo es `direction=IAR`, igual que `vi-ardef`
+para Visa (ver CLAUDE.md — "Por qué ARDEF/IAR no usan Step Functions").
+
+Lee el archivo IAR (EBCDIC o latin-1, opcionalmente bloqueado en bloques de
+1014 bytes) desde landing, lo descompone en tres capas RAW (header, catálogo
+de tablas IPM, records de detalle), extrae y transforma la tabla de negocio
+IP0040T1 (rangos de BIN + reglas por layout de posiciones fijas), la limpia
+y normaliza, y finalmente acumula el resultado sobre el histórico maestro en
+`s3-reference/mastercard_iar/data.parquet` aplicando lógica tipo SCD2
+(dedup por llave de negocio + cálculo de vigencia `app_date_valid`/
+`app_date_end`). Esa tabla maestra es la fuente que luego consume
+`glue-mc-calculate` (`calculate_pre2`, range-join IAR) para asignar
+jurisdicción/país a las transacciones Mastercard.
+
+Flujo (`pipeline_iar`):
+1. LANDING: descarga el archivo binario desde S3 landing y la configuración
+   del cliente (bloqueo/encoding) desde DynamoDB.
+2. EXTRACT: si el archivo viene bloqueado, remueve los separadores de bloque
+   de 1014 bytes (`extract_iar_bytes`).
+3. RAW: parsea header + catálogo + records de detalle a nivel de bytes
+   (`extract_raw_layers`), sin interpretar aún las tablas de negocio.
+4. TRANSFORM: para cada tabla en `TABLES_TO_PROCESS` (hoy solo IP0040T1),
+   expande los records de detalle en columnas según el layout de
+   `getIPMParameters()`.
+5. CLEAN: normaliza tipos, fechas y columnas faltantes (`clean_ip0040t1`).
+6. OPERATIONAL: escribe una copia del resultado limpio de esta ejecución.
+7. FOR REFERENCE: concatena con el histórico ya acumulado en
+   `s3-reference/mastercard_iar/data.parquet` (si existe) y recalcula la
+   capa CALCULATE (dedup + vigencia SCD2) antes de sobrescribir esa tabla
+   maestra.
+"""
+
 import json
 from pathlib import Path
 
@@ -22,13 +62,41 @@ layer = FileStorage.Layer
 fs = FileStorage()
 
 def pipeline_iar(
-    origin_layer: FileStorage.Layer, 
-    target_layer: FileStorage.Layer, 
-    client_id: str, 
+    origin_layer: FileStorage.Layer,
+    target_layer: FileStorage.Layer,
+    client_id: str,
     file_id: str,
     blocked: bool ,
     ebcdic: bool,
 ):
+    """
+    Ejecuta el pipeline IAR completo para un archivo Mastercard: landing →
+    extract → raw → transform → clean → operational → actualización del
+    histórico maestro en `s3-reference/mastercard_iar/`. Ver la sección
+    "Flujo" del docstring de módulo para el detalle de cada paso.
+
+    Nota: `blocked`/`ebcdic` llegan como parámetros pero se sobreescriben
+    dentro de la función con `file_config["file_iar_block"]`/
+    `file_config["file_iar_encoding"]` leídos de DynamoDB (tabla `client`) —
+    la configuración real por cliente prevalece sobre lo recibido.
+
+    Args:
+        origin_layer: Capa de origen del archivo (normalmente `Layer.LANDING`).
+        target_layer: Capa donde se escribe el Parquet de la etapa TRANSFORM
+            (normalmente `Layer.STAGING`).
+        client_id: Identificador del cliente, ej. "SBSA".
+        file_id: Identificador del archivo en `file_control` (DynamoDB).
+        blocked: Ignorado en la práctica — ver nota arriba.
+        ebcdic: Ignorado en la práctica — el encoding real viene de
+            `file_config["file_iar_encoding"]`.
+
+    Returns:
+        None. Escribe Parquets en S3 (staging/operational/reference) y loguea
+        el progreso de cada etapa.
+
+    Ejemplo:
+        pipeline_iar(layer.LANDING, layer.STAGING, "SBSA", "ABC123...", True, False)
+    """
     # 1. LANDING PATH
     landing_bytes = fs.read_binary(
         layer=layer.LANDING,
@@ -209,6 +277,23 @@ def pipeline_iar(
 
 
 def lambda_handler(event, context):
+    """
+    Entry point del Lambda `itl-0004-itx-dev-intchg-02-lmbd-mc-iar`. Invocado
+    directamente por `lmbd-router` (async) cuando el archivo se clasifica
+    como `direction=IAR`. Valida el payload y delega en `pipeline_iar()`.
+
+    Args:
+        event: Payload de invocación; debe incluir `client_id` y `file_id`.
+        context: Contexto de ejecución de Lambda (no usado).
+
+    Returns:
+        dict con `statusCode` 400 si falta `client_id`/`file_id`, o 200 con
+        un body JSON confirmando la ejecución exitosa del pipeline.
+
+    Ejemplo:
+        lambda_handler({"client_id": "SBSA", "file_id": "ABC123..."}, None)
+        # -> {"statusCode": 200, "body": '{"message": "pipeline ejecutado correctamente", ...}'}
+    """
     client_id = event.get("client_id")
     file_id = event.get("file_id")
 
