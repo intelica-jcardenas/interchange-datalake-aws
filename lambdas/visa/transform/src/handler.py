@@ -1,27 +1,38 @@
 """
-Lambda Transform Unificada - itx-transform
-===========================================
-Lee el archivo CTF de S3 en UNA SOLA PASADA y genera los Parquets de:
-  - BASEII (TC 05/06/07/25/26/27)
-  - SMS    (TC 33)
-  - VSS    (TC 46, solo file_type=IN)
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-vi-transform
+================================================================================
+Archivo:     lambdas/visa/transform/src/handler.py
 
-Optimizaciones aplicadas vs versión anterior:
-  1. Chunks de 16MB en vez de 256KB
-     → Menos overhead de socket, red más eficiente
-     → De 6,144 lecturas del socket a solo 96
+Primera etapa del pipeline Visa. Lee el archivo CTF de texto plano de
+ancho fijo (latin-1) desde el bucket de landing en UNA SOLA PASADA y
+agrupa los bytes en records estructurados según los manuales Visa,
+generando tres tipos de Parquet en paralelo:
+  - BASEII (TC 05/06/07/25/26/27) — records transaccionales
+  - SMS    (TC 33) — records transaccionales de settlement messages
+  - VSS    (TC 46, solo file_type=IN) — records de liquidación, lo que
+    Visa reporta que cobró; se contrastan más adelante en
+    `glue-vi-interchange` contra la tarificación propia (Data Quality)
 
-  2. splitlines() en vez de buffer slicing línea a línea
-     → splitlines() es C puro, no Python
-     → Elimina el patrón O(n²) de `buffer = buffer[pos:]`
-     → 4x más rápido en CPU
+Cada línea del archivo se clasifica por su Transaction Code (`tc`,
+posición 0-2) y TCSN (`tcsn`, posición 3-4), se acumula en el record
+lógico correspondiente vía `RecordAccumulator` (detecta el cierre de un
+record cuando la clave TCSN/record_type "baja") y se escribe en streaming
+a S3 vía `ParquetBatchWriter` (flush cada FLUSH_BATCH_SIZE records, para
+no acumular el archivo completo en memoria). Escribe a
+`s3-staging/100_*_raw_*/`.
 
-  Impacto estimado: de ~9 minutos a ~1-2 minutos para archivos de 1.5GB
+Optimizaciones aplicadas vs. una versión anterior más lenta:
+  1. Chunks de lectura S3 de 16MB (configurable) en vez de 256KB — menos
+     overhead de socket (de 6,144 lecturas a 96 para un archivo de 1.5GB).
+  2. `splitlines()` (C puro) en vez de slicing de buffer línea a línea en
+     Python puro — elimina el patrón O(n²) de `buffer = buffer[pos:]`, ~4x
+     más rápido en CPU.
+  Impacto estimado: de ~9 minutos a ~1-2 minutos para archivos de 1.5GB.
 
 Variables de entorno:
   S3_BUCKET_LANDING   : bucket origen del archivo CTF
   S3_BUCKET_STAGING   : bucket destino de los Parquets
-  CHUNK_SIZE_MB       : tamaño de chunk en MB (default: 16)
+  CHUNK_SIZE_MB       : tamaño de chunk de lectura S3 en MB (default: 16)
   FLUSH_BATCH_SIZE    : records por flush a PyArrow (default: 200000)
 """
 
@@ -105,7 +116,8 @@ def _read_line_blocks(
     block_size: int = 50_000
 ) -> Iterator[list]:
     """
-    Lee el archivo de S3 y devuelve bloques de líneas (listas de strings).
+    Lee el archivo de S3 y devuelve bloques de líneas (listas de strings)
+    en streaming, sin cargar el archivo completo en memoria.
 
     Cómo funciona:
       - Descarga el archivo en chunks de CHUNK_SIZE_BYTES (16MB por defecto)
@@ -121,6 +133,22 @@ def _read_line_blocks(
     Normalización VMS:
       Los archivos en formato VMS tienen 170 chars por línea.
       Se normalizan a 168 removiendo los bytes en posiciones 2-4.
+      El formato se detecta una sola vez, en la primera línea no vacía.
+
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo CTF a leer.
+        block_size: Cantidad de líneas a acumular antes de hacer `yield`
+            de un bloque (default: 50000).
+
+    Yields:
+        Listas de líneas decodificadas (latin-1), ya normalizadas si el
+        archivo es VMS, sin líneas vacías. El último bloque puede ser
+        menor a `block_size`.
+
+    Ejemplo:
+        for block in _read_line_blocks(bucket, "EBGR/VS.EBGR.TC00...txt"):
+            for line in block: ...
     """
     logger.info(f"Reading s3://{bucket}/{key} "
                 f"(chunk={CHUNK_SIZE_BYTES // 1024 // 1024}MB, "
@@ -213,13 +241,36 @@ class RecordAccumulator:
     """
 
     def __init__(self):
+        """
+        Inicializa el acumulador sin ningún record en progreso.
+
+        Returns:
+            None.
+        """
         self._current  = {}    # {key: line} del record en progreso
         self._prev_key = None  # última clave vista
 
     def feed(self, key: str, line: str) -> Optional[dict]:
         """
-        Procesa una línea.
-        Retorna el record completo si cerró, o None si sigue incompleto.
+        Procesa una línea del record en progreso: si la clave (TCSN o
+        record_type) es menor o igual a la última vista, el record
+        anterior se considera cerrado y se retorna; la línea actual pasa a
+        formar parte del nuevo record en progreso.
+
+        Args:
+            key: Clave de la línea (TCSN "0"-"7" para BASEII/VSS, o
+                record_type de 5 dígitos para SMS).
+            line: Contenido completo de la línea.
+
+        Returns:
+            El record completo (dict `{key: line}`) si la clave bajó y
+            cerró el record anterior, o `None` si el record sigue
+            incompleto.
+
+        Ejemplo:
+            acc.feed("0", linea0)  # None (primer record, sigue abierto)
+            acc.feed("1", linea1)  # None
+            acc.feed("0", linea2)  # {"0": linea0, "1": linea1} (cerró)
         """
         # Convertir clave a entero para comparar (TCSN "0"-"7" o índice)
         key_int = int(key) if key.isdigit() else 0
@@ -235,7 +286,17 @@ class RecordAccumulator:
         return completed
 
     def flush_last(self) -> Optional[dict]:
-        """Devuelve el último record al llegar al fin del archivo."""
+        """
+        Devuelve el último record en progreso al llegar al fin del
+        archivo, ya que ningún cambio de clave posterior va a cerrarlo.
+
+        Returns:
+            El último record (dict `{key: line}`), o `None` si no hay
+            ningún record en progreso.
+
+        Ejemplo:
+            acc.flush_last()  # {"0": linea0, "1": linea1} o None
+        """
         return dict(self._current) if self._current else None
 
 
@@ -257,6 +318,23 @@ class ParquetBatchWriter:
     """
 
     def __init__(self, bucket: str, s3_key: str, columns: list, content_hash: str):
+        """
+        Inicializa el writer, definiendo el schema PyArrow del Parquet de
+        salida (content_hash, record, una columna string por cada `tcsn`/
+        `record_type` posible). El `ParquetWriter` real recién se crea en
+        el primer flush.
+
+        Args:
+            bucket: Bucket S3 destino.
+            s3_key: Key del Parquet a escribir.
+            columns: Nombres de columna (uno por cada `tcsn`/record_type
+                posible para este output_type), ej. `BASEII_COLUMNS`.
+            content_hash: MD5 del archivo origen, escrito como primera
+                columna de cada record.
+
+        Returns:
+            None.
+        """
         self.bucket        = bucket
         self.s3_key        = s3_key
         self.columns       = columns
@@ -274,7 +352,23 @@ class ParquetBatchWriter:
         ])
 
     def add(self, record: dict):
-        """Agrega un record al buffer, con flush automático al llegar al límite."""
+        """
+        Agrega un record completo al buffer en memoria, con flush
+        automático al `ParquetWriter` cuando el buffer alcanza
+        FLUSH_BATCH_SIZE records. Columnas ausentes en `record` (TCSN/
+        record_type que no aparecieron en ese record lógico) se rellenan
+        con `""`, equivalente al `fillna("")` del prototipo local.
+
+        Args:
+            record: Dict `{columna: línea}` de un record lógico completo,
+                producido por `RecordAccumulator.feed()`/`flush_last()`.
+
+        Returns:
+            None.
+
+        Ejemplo:
+            writer.add({"0": linea0, "1": linea1})
+        """
         row = {"record": self._total}
         for col in self.columns:
             row[col] = record.get(col, "")   # "" equivale al fillna("") original
@@ -285,7 +379,13 @@ class ParquetBatchWriter:
             self._flush()
 
     def _flush(self):
-        """Escribe el buffer actual al ParquetWriter."""
+        """
+        Escribe el buffer actual al `ParquetWriter` (creándolo en el
+        primer flush) y lo vacía. No hace nada si el buffer está vacío.
+
+        Returns:
+            None.
+        """
         if not self._buffer:
             return
 
@@ -311,8 +411,16 @@ class ParquetBatchWriter:
 
     def close(self) -> int:
         """
-        Finaliza y sube el Parquet a S3.
-        Retorna el número total de records escritos (0 si no hubo datos).
+        Finaliza el writer (flush del buffer pendiente, cierre del
+        `ParquetWriter`) y sube el Parquet consolidado a S3. Si no se
+        agregó ningún record, no sube nada.
+
+        Returns:
+            Cantidad total de records escritos (0 si no hubo datos, en
+            cuyo caso tampoco se sube ningún archivo a S3).
+
+        Ejemplo:
+            writer.close()  # 350000
         """
         if not self._total:
             return 0
@@ -341,10 +449,24 @@ def _build_s3_key(
     file_date: str, subdir: str, content_hash: str
 ) -> str:
     """
-    Construye el S3 key con el esquema de particionamiento del pipeline.
+    Construye el S3 key de destino con el esquema de particionamiento del
+    pipeline (`{client}/{brand}/{subdir}/file_type={tipo}/date={fecha}/{hash}.parquet`).
+
+    Args:
+        client_id: Código del cliente, ej. "EBGR".
+        brand: Marca del archivo, ej. "VISA".
+        file_type: "IN" u "OUT".
+        file_date: Fecha del archivo en formato "YYYY-MM-DD".
+        subdir: Subdirectorio de salida (uno de BASEII_SUBDIR, SMS_SUBDIR,
+            o un valor de VSS_SUBDIRS), ej. "100-BASEII_RAW_DRAFTS".
+        content_hash: MD5 del archivo origen, usado como nombre de archivo.
+
+    Returns:
+        S3 key completo del Parquet de salida.
 
     Ejemplo:
-      "EBGR/VISA/100_baseii_raw_drafts/file_type=IN/date=2026-01-03/HASH.parquet"
+        _build_s3_key("EBGR", "VISA", "IN", "2026-01-03", "100-BASEII_RAW_DRAFTS", "HASH")
+        # "EBGR/VISA/100_baseii_raw_drafts/file_type=IN/date=2026-01-03/HASH.parquet"
     """
     folder = subdir.replace("-", "_").lower()
     return f"{client_id}/{brand}/{folder}/file_type={file_type}/date={file_date}/{content_hash}.parquet"
@@ -360,15 +482,48 @@ def _process_single_pass(
     file_type: str, file_date: str, content_hash: str
 ) -> list:
     """
-    Lee el archivo CTF UNA SOLA VEZ y genera todos los Parquets en paralelo.
+    Lee el archivo CTF UNA SOLA VEZ y genera todos los Parquets (BASEII,
+    SMS, VSS) en paralelo, sin necesidad de releer el archivo por tipo.
 
-    Por cada bloque de líneas leído:
-      1. Filtra líneas BASEII → RecordAccumulator → ParquetBatchWriter
-      2. Filtra líneas SMS   → RecordAccumulator → ParquetBatchWriter
-      3. Filtra líneas VSS   → RecordAccumulator → 4 ParquetBatchWriters (uno por tipo)
+    Por cada bloque de líneas leído (`_read_line_blocks`), clasifica cada
+    línea por su Transaction Code (`tc`) y TCSN (`tcsn`), y la alimenta al
+    `RecordAccumulator` correspondiente:
+      1. BASEII: TC en BASEII_TC_SET/TCSN en BASEII_TCSN_SET → acumulador
+         único → ParquetBatchWriter
+      2. SMS: TC=33/TCSN=0, con filtros adicionales de tipo/versión/
+         record_type en posiciones fijas de la línea → acumulador único →
+         ParquetBatchWriter
+      3. VSS (solo file_type=IN): TC=46/TCSN en {0,1} → acumulador único →
+         se determina el tipo (110/120/130/140) leyendo una posición fija
+         del record ya cerrado → uno de 4 ParquetBatchWriters según el tipo
 
-    Retorna la lista de outputs con la estructura que espera el siguiente
-    paso del pipeline (Extract).
+    Al terminar la lectura, hace flush del último record en progreso de
+    cada acumulador (`flush_last()`), ya que el fin del archivo no dispara
+    un cambio de clave que los cierre naturalmente.
+
+    Args:
+        bucket: Bucket S3 donde está el archivo CTF (landing).
+        key: Key del archivo CTF.
+        client_id: Código del cliente, usado para construir los S3 keys de
+            salida.
+        brand: Marca del archivo ("VISA"), usado para construir los S3
+            keys de salida.
+        file_type: "IN" u "OUT" — VSS solo se genera si es "IN".
+        file_date: Fecha del archivo, usado para construir los S3 keys de
+            salida.
+        content_hash: MD5 del archivo origen, propagado a cada Parquet
+            como primera columna.
+
+    Returns:
+        Lista de dicts `{output_type, s3_key, records, subdir}`, uno por
+        cada Parquet generado con al menos 1 record (los output_types sin
+        records no se incluyen). Estructura consumida por la siguiente
+        etapa del pipeline (`lmbd-vi-extract`).
+
+    Ejemplo:
+        _process_single_pass(bucket, "EBGR/VS.EBGR.TC00...txt",
+                              "EBGR", "VISA", "IN", "2026-01-03", "HASH")
+        # [{'output_type': 'BASEII', 's3_key': '...', 'records': 350000, ...}, ...]
     """
     # ── S3 keys de destino ──────────────────────────────────────────────────
     baseii_key = _build_s3_key(client_id, brand, file_type, file_date, BASEII_SUBDIR, content_hash)
@@ -502,35 +657,58 @@ def _process_single_pass(
 
 def lambda_handler(event, context):
     """
-    Entry point del Lambda.
+    Punto de entrada de la Lambda `lmbd-vi-transform`. Invocada por la
+    Step Function Visa como primer paso tras la clasificación del router.
+    Descarga el archivo CTF de landing y delega en `_process_single_pass()`
+    la generación de los Parquets BASEII/SMS/VSS.
 
-    Input (desde Step Functions):
-    {
-        "client_id":      "EBGR",
-        "file_id":        "ABC123",
-        "brand":          "VISA",
-        "file_type":      "IN",          # IN o OUT
-        "file_date":      "2026-01-03",
-        "content_hash":   "XYZ789",
-        "s3_key_landing": "EBGR/VS.EBGR.TC00.20260103.001.txt",
-        "bucket_landing": "itx-landing-dev"
-    }
+    Args:
+        event: Payload de Step Functions con `client_id`, `file_id`,
+            `brand`, `file_type` ("IN" u "OUT"), `file_date`,
+            `content_hash`, `s3_key_landing` y `bucket_landing` (opcional,
+            default `S3_BUCKET_LANDING`), ej.:
+            ```
+            {
+                "client_id":      "EBGR",
+                "file_id":        "ABC123",
+                "brand":          "VISA",
+                "file_type":      "IN",
+                "file_date":      "2026-01-03",
+                "content_hash":   "XYZ789",
+                "s3_key_landing": "EBGR/VS.EBGR.TC00.20260103.001.txt",
+                "bucket_landing": "itx-landing-dev"
+            }
+            ```
+        context: Contexto de ejecución de Lambda (no usado).
 
-    Output (para el siguiente paso, Extract):
-    {
-        "status":        "SUCCESS",
-        "total_outputs": 5,
-        "total_records": 430000,
-        "outputs": [
-            {"output_type": "BASEII",   "s3_key": "...", "records": 350000, "subdir": "100-BASEII_RAW_DRAFTS"},
-            {"output_type": "SMS",      "s3_key": "...", "records": 80000,  "subdir": "100-SMS_RAW_MESSAGES"},
-            {"output_type": "VSS_110",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_110_RAW"},
-            {"output_type": "VSS_120",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_120_RAW"},
-            {"output_type": "VSS_130",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_130_RAW"},
-        ],
-        "client_id": ..., "file_id": ..., "brand": ...,
-        "file_type": ..., "file_date": ..., "content_hash": ...
-    }
+    Returns:
+        Dict con `status` ("SUCCESS" si hubo al menos un output, "ERROR"
+        si no), `total_outputs`, `total_records`, y la lista `outputs`
+        (estructura de `_process_single_pass`) — consumido por la
+        siguiente etapa (`lmbd-vi-extract`). Lanza `ValueError` si faltan
+        `S3_BUCKET_LANDING`/`S3_BUCKET_STAGING`. Ejemplo:
+        ```
+        {
+            "status":        "SUCCESS",
+            "total_outputs": 5,
+            "total_records": 430000,
+            "outputs": [
+                {"output_type": "BASEII",   "s3_key": "...", "records": 350000, "subdir": "100-BASEII_RAW_DRAFTS"},
+                {"output_type": "SMS",      "s3_key": "...", "records": 80000,  "subdir": "100-SMS_RAW_MESSAGES"},
+                {"output_type": "VSS_110",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_110_RAW"},
+                {"output_type": "VSS_120",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_120_RAW"},
+                {"output_type": "VSS_130",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_130_RAW"},
+            ],
+            "client_id": ..., "file_id": ..., "brand": ...,
+            "file_type": ..., "file_date": ..., "content_hash": ...
+        }
+        ```
+
+    Ejemplo:
+        lambda_handler({'client_id': 'EBGR', 'file_id': 'ABC123', 'brand': 'VISA',
+                         'file_type': 'IN', 'file_date': '2026-01-03',
+                         'content_hash': 'XYZ789',
+                         's3_key_landing': 'EBGR/VS.EBGR.TC00.20260103.001.txt'}, None)
     """
     logger.info("=== ITX Transform Lambda ===")
     logger.info(f"Event: {json.dumps(event)}")

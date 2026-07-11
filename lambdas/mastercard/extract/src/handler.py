@@ -1,27 +1,47 @@
 """
-Mastercard extraction pipeline — AWS Lambda handler.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-extract
+================================================================================
+Archivo:     lambdas/mastercard/extract/src/handler.py
 
-Reads raw parquet files from S3, aligns their schema against the field layouts
-stored in DynamoDB, renames technical column names to standardised extract names,
-fills any missing layout columns with NA, reorders columns, and writes the result
-back to S3.
+Tercera etapa del pipeline Mastercard (tras interpreter y transform). Lee
+los Parquets RAW de transform (capa TRA), alinea el schema contra los
+layouts de campos declarados en DynamoDB (mastercard_fields), renombra las
+columnas técnicas (DE_n/PDS_n) a los nombres de extract estandarizados,
+rellena con NA las columnas del layout que falten en un archivo concreto,
+reordena las columnas de forma determinística y escribe a
+s3-staging/300_IPM_{mti}_EXT/. Equivalente funcional al extract de Visa.
+MTIs soportados: 1240, 1442, 1644 (filtrado por Function Code 685/688/691),
+1740.
 
-Supported MTIs
---------------
-- 1240
-- 1442
-- 1644  (filtered by Function Code: 685, 688, 691)
-- 1740
+El MTI 1644 tiene un pipeline propio (_extract_1644) porque cada Function
+Code trae un subconjunto distinto de DEs/PDS tags — el resto de los MTIs
+comparte un pipeline único (_extract_standard). Ambos procesan cada
+Parquet en streaming (iter_batches + ParquetWriter) para no materializar
+el DataFrame completo en memoria.
 
-Environment variables
----------------------
-S3_BUCKET                  (required)  S3 bucket name.
-DYNAMO_TABLE_FILE_CONTROL  (optional)  DynamoDB table with file metadata.
-                                        Default: "itl-0004-itx-dev-dynamo-file_control-02"
+Los layouts (dict_de, dict_pds) y el mapa de renombrado (rename_map) se
+cargan una sola vez desde DynamoDB por invocación (caché a nivel de
+módulo, _fields_rows_cache/_layout_cache) y se reutilizan entre todos los
+MTIs procesados en la misma ejecución del Lambda, evitando escaneos
+repetidos de una tabla de configuración que no cambia durante la
+ejecución.
 
-S3 key structure
-----------------
-{client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
+Flujo:
+1. Derivar los MTIs a procesar desde extract_input.outputs (fallback: todos
+   los MTIs registrados en EXTRACTS)
+2. Por cada MTI: listar los Parquets TRA del file_id, procesarlos en
+   streaming (alinear schema, renombrar, rellenar faltantes, reordenar)
+3. Escribir cada Parquet alineado a 300_IPM_{mti}_EXT/
+4. Recolectar los paths reales escritos y construir la lista de outputs
+   para la siguiente etapa (lmbd-mc-clean)
+
+Variables de entorno:
+  S3_BUCKET                  : bucket de staging (lectura de TRA, escritura de EXT)
+  DYNAMO_TABLE_FIELDS        : tabla de layouts DE/PDS por MTI (mastercard_fields)
+  DYNAMO_TABLE_FILE_CONTROL  : tabla de control de archivos (no usada actualmente — file_details se arma desde el evento)
+  ITX_EXTRACT_BATCH_SIZE     : filas por batch de streaming (default: 100000)
+
+Estructura de S3 key: {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
 """
 
 from __future__ import annotations
@@ -168,12 +188,20 @@ _fields_rows_cache: list[dict] = []
 
 def _get_fields_rows() -> list[dict]:
     """
-    Return all rows from DYNAMO_TABLE_FIELDS, fetching from DynamoDB only once.
+    Devuelve todas las filas de DYNAMO_TABLE_FIELDS, consultando DynamoDB solo
+    una vez por ciclo de vida del proceso (caché a nivel de módulo,
+    compartida por _load_layout, _build_rename_map y _fill_missing_cols, para
+    que la tabla se consulte una sola vez sin importar cuántos MTIs se
+    procesen). Usa Scan en vez de PartiQL para no requerir el permiso IAM
+    dynamodb:PartiQLSelect — la tabla es pequeña, un scan completo es
+    aceptable.
 
-    Uses Scan (dynamodb:Scan) instead of PartiQL to avoid requiring the
-    dynamodb:PartiQLSelect permission.  The table is small so a full scan is
-    acceptable.  The result is cached at module level so every downstream
-    function shares the same data.
+    Returns:
+        Lista de items crudos de DynamoDB (dicts con el envelope de tipo de
+        cada atributo, ej. {"S": "..."}).
+
+    Ejemplo:
+        _get_fields_rows()  # [{'type_mti': {'S': '1240'}, 'tag': {'N': '4'}, ...}, ...]
     """
     global _fields_rows_cache
     if _fields_rows_cache:
@@ -197,10 +225,19 @@ def _get_fields_rows() -> list[dict]:
 
 def _dval(attr: dict) -> str:
     """
-    Extract the value from a DynamoDB attribute dict.
+    Extrae el valor de un atributo de DynamoDB, que viene envuelto en su
+    envelope de tipo (ej. {"S": "valor"} para strings, {"N": "42"} para
+    números).
 
-    DynamoDB wraps every attribute in a type envelope, e.g. {"S": "value"} for
-    strings or {"N": "42"} for numbers.  Returns a stripped plain string.
+    Args:
+        attr: Dict de atributo DynamoDB, ej. {"S": "1240"}.
+
+    Returns:
+        El valor como string, recortado de espacios. Cadena vacía si el
+        atributo no tiene ni "S" ni "N".
+
+    Ejemplo:
+        _dval({"S": " 1240 "})  # "1240"
     """
     return str(attr.get("S") or attr.get("N") or "").strip()
 
@@ -214,17 +251,25 @@ _layout_cache: dict[str, tuple[dict, dict]] = {}
 
 def _load_layout(mti: str) -> tuple[dict, dict]:
     """
-    Build and return (dict_de, dict_pds) layout dicts for the given MTI.
+    Construye y devuelve (dict_de, dict_pds), los layouts de campos DE y PDS
+    para un MTI dado, a partir de las filas cacheadas de DYNAMO_TABLE_FIELDS
+    filtradas por type_mti. El resultado se cachea por MTI (_layout_cache).
 
-    Filters the cached field rows by type_mti and groups them into two dicts:
-    - dict_de  : DE fields   e.g. {"DE_4": 14} or {"DE_3": {"DE_3_1": 2, ...}}
-    - dict_pds : PDS fields  same structure
+    Reglas de reconstrucción:
+      - subfield == 0  →  campo escalar:    {"DE_4": 14}
+      - subfield != 0  →  campo con subcampos: {"DE_3": {"DE_3_1": 2, "DE_3_2": 4}}
+      - Si un tag tiene filas con subfield=0 Y subfield>0, gana la variante
+        con subcampos.
 
-    Reconstruction rules
-    --------------------
-    - subfield == 0  →  scalar:    {"DE_4": 14}
-    - subfield != 0  →  subfields: {"DE_3": {"DE_3_1": 2, "DE_3_2": 4}}
-    - If a tag has both subfield=0 and subfield>0 rows, the subfield dict wins.
+    Args:
+        mti: MTI a consultar, ej. "1240".
+
+    Returns:
+        Tupla (dict_de, dict_pds). Ambos vacíos si no hay filas para ese MTI
+        (se loguea un warning).
+
+    Ejemplo:
+        _load_layout("1240")  # ({'DE_3': {'DE_3_1': 2, ...}, 'DE_4': 14, ...}, {...})
     """
     if mti in _layout_cache:
         return _layout_cache[mti]
@@ -277,13 +322,22 @@ def _load_layout(mti: str) -> tuple[dict, dict]:
 
 def _build_rename_map() -> dict[str, str]:
     """
-    Return a {field_mc: column_name} dict for DataFrame.rename().
+    Construye un dict {field_mc: column_name} para usar con
+    DataFrame.rename(), donde field_mc es la clave técnica del campo
+    (tag+subfield) y column_name es el nombre de extract estandarizado
+    declarado en DynamoDB.
 
-    field_mc is built from column_name + tag + subfield:
-    - subfield == "0"  →  "DE_4"    (no subfield suffix)
-    - subfield != "0"  →  "DE_3_1"  (subfield appended)
+      - subfield == "0"  →  "DE_4"    (sin sufijo de subcampo)
+      - subfield != "0"  →  "DE_3_1"  (con sufijo de subcampo)
 
-    First occurrence of each field_mc wins; duplicates are ignored.
+    La primera ocurrencia de cada field_mc gana; duplicados se ignoran.
+
+    Returns:
+        Dict {field_mc: column_name} para renombrar columnas técnicas a
+        nombres de extract.
+
+    Ejemplo:
+        _build_rename_map()  # {'DE_4': 'amount_transaction_de_4', 'DE_3_1': '...', ...}
     """
     rename_map: dict[str, str] = {}
 
@@ -304,12 +358,23 @@ def _build_rename_map() -> dict[str, str]:
 
 def _fill_missing_cols(df: pd.DataFrame, missing_tokens: list[str]) -> pd.DataFrame:
     """
-    Add missing layout columns to the DataFrame in-place, set to pd.NA.
+    Agrega al DataFrame, in-place, las columnas del layout que falten,
+    seteadas a pd.NA. Para cada token (ej. "de_25", "pds_358_1"), busca el
+    column_name canónico en las filas cacheadas de campos y agrega la columna
+    solo si no existe ya. Los tokens sin metadata correspondiente se ignoran
+    silenciosamente.
 
-    For each token (e.g. "de_25", "pds_358_1"), looks up the canonical
-    column_name in the cached field rows and adds the column if absent.
-    Operates directly on df to avoid creating an extra copy in memory.
-    Tokens not found in the metadata are silently skipped.
+    Args:
+        df: DataFrame a completar (modificado in-place).
+        missing_tokens: Lista de tokens de layout ausentes (formato
+            "{tlv}_{tag}[_{subfield}]" en minúsculas), típicamente el
+            resultado de _missing_layout_keys().
+
+    Returns:
+        El mismo df, con las columnas faltantes agregadas.
+
+    Ejemplo:
+        _fill_missing_cols(df, ["de_25", "pds_358_1"])
     """
     for token in missing_tokens:
         parts = token.split("_")
@@ -349,16 +414,38 @@ def _fill_missing_cols(df: pd.DataFrame, missing_tokens: list[str]) -> pd.DataFr
 
 def _build_ordered_extract_cols(*layouts: dict[str, Any]) -> list[str]:
     """
-    Merge layout dicts into an ordered, deduplicated list of extract column names.
+    Combina uno o más layouts (dict_de, dict_pds) en una lista ordenada y sin
+    duplicados de nombres de columna de extract, preservando el orden de
+    aparición en los layouts (incluyendo las claves de subcampos anidadas).
 
-    Traverses each dict depth-first to collect all keys (including nested subfield
-    keys), then resolves each key to its extract column_name via the cached field
-    rows.  Returns the names in layout order, deduplicated.
+    Args:
+        *layouts: Uno o más dicts de layout (dict_de, dict_pds), en el orden
+            en que deben aparecer las columnas resultantes.
+
+    Returns:
+        Lista de nombres de columna de extract (normalizados), en el orden
+        combinado de los layouts recibidos.
+
+    Ejemplo:
+        _build_ordered_extract_cols(dict_de, dict_pds)
+        # ['amount_transaction_de_4', 'processing_code_de_3', ...]
     """
     # Collect all layout keys depth-first, preserving order.
     layout_keys: list[str] = []
 
     def _walk(d: dict[str, Any]) -> None:
+        """
+        Recorre un dict de layout en profundidad, acumulando cada clave (incluidas
+        las de subcampos anidados) en layout_keys, en el orden en que aparecen.
+
+        Args:
+            d: Dict de layout a recorrer (puede tener sub-dicts anidados de
+                subcampos).
+
+        Returns:
+            None — agrega las claves encontradas a layout_keys (closure de la
+            función contenedora).
+        """
         for k, v in d.items():
             layout_keys.append(k)
             if isinstance(v, dict):
@@ -407,13 +494,30 @@ def _build_ordered_extract_cols(*layouts: dict[str, Any]) -> list[str]:
 
 def _get_file_details(client_id: str, file_id: str) -> dict:
     """
-    Retrieve file metadata from the DynamoDB file_control table.
+    Recupera la metadata de un archivo desde la tabla DynamoDB file_control,
+    por file_id (llave de partición). No usada actualmente en el flujo
+    principal del handler (que arma file_details directamente desde el
+    evento para evitar un round-trip redundante a DynamoDB — ver paso 4 de
+    lambda_handler) — queda disponible para reprocesos manuales o casos donde
+    el evento no trae los campos de identidad completos.
 
-    Uses get_item (dynamodb:GetItem) by file_id (partition key).
-    Raises ValueError if no record is found or client_id does not match.
+    Args:
+        client_id: Código de cliente esperado, para validar que el registro
+            encontrado le pertenece.
+        file_id: Identificador del archivo (llave de partición de
+            file_control).
 
-    Returns a dict with keys: brand_id, file_type, file_processing_date,
-    landing_file_name.
+    Returns:
+        Dict con brand_id, file_type, file_processing_date,
+        landing_file_name.
+
+    Raises:
+        ValueError: si no existe un registro para file_id, o si el
+            client_id del registro no coincide con el esperado.
+
+    Ejemplo:
+        _get_file_details("SBSA", "DD9D...")
+        # {'brand_id': 'MC', 'file_type': 'IN', 'file_processing_date': '2026-02-18', ...}
     """
     response = DYNAMO.get_item(
         TableName=DYNAMO_TABLE_FILE_CONTROL,
@@ -443,9 +547,20 @@ def _get_file_details(client_id: str, file_id: str) -> dict:
 
 def _s3_prefix(client_id: str, subdir: str, file_details: dict) -> str:
     """
-    Build the S3 key prefix for a given client and subdirectory.
+    Construye el prefix de S3 key para un cliente y subdirectorio dados,
+    según el esquema de particionamiento del pipeline.
 
-        {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
+    Args:
+        client_id: Código de cliente, ej. "SBSA".
+        subdir: Subdirectorio de staging, ej. "200_IPM_1240_TRA".
+        file_details: Dict con brand_id, file_type y file_processing_date.
+
+    Returns:
+        Prefix con barra final: "{client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/".
+
+    Ejemplo:
+        _s3_prefix("SBSA", "300_IPM_1240_EXT", file_details)
+        # "SBSA/MC/300_IPM_1240_EXT/file_type=IN/date=2026-02-18/"
     """
     parts = [
         client_id,
@@ -459,9 +574,19 @@ def _s3_prefix(client_id: str, subdir: str, file_details: dict) -> str:
 
 def _list_parquet_keys(prefix: str, file_id: str) -> list[str]:
     """
-    List S3 keys of parquet files under prefix whose filename starts with file_id.
+    Lista los S3 keys de Parquets bajo prefix cuyo nombre de archivo empieza
+    con file_id, paginando automáticamente.
 
-    Paginates automatically and returns results sorted by filename.
+    Args:
+        prefix: Prefix de S3 donde buscar.
+        file_id: Prefijo del nombre de archivo a filtrar (identificador del
+            archivo origen).
+
+    Returns:
+        Lista de keys que matchean, ordenada por nombre de archivo.
+
+    Ejemplo:
+        _list_parquet_keys("SBSA/MC/200_IPM_1240_TRA/file_type=IN/date=2026-02-18/", "DD9D...")
     """
     keys: list[str] = []
     paginator = S3.get_paginator("list_objects_v2")
@@ -478,13 +603,40 @@ def _list_parquet_keys(prefix: str, file_id: str) -> list[str]:
 
 
 def _read_parquet(key: str) -> pd.DataFrame:
-    """Download a parquet file from S3 and return it as a DataFrame."""
+    """
+    Descarga un Parquet de S3 y lo devuelve como DataFrame de pandas (lectura
+    completa, no streaming — usada solo fuera del hot path de extracción, que
+    usa iter_batches directamente).
+
+    Args:
+        key: S3 key del Parquet a leer.
+
+    Returns:
+        DataFrame con el contenido del Parquet.
+
+    Ejemplo:
+        _read_parquet("SBSA/MC/200_IPM_1240_TRA/.../x.parquet")
+    """
     body = S3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
     return pd.read_parquet(io.BytesIO(body))
 
 
 def _write_parquet(df: pd.DataFrame, key: str) -> None:
-    """Serialise a DataFrame as parquet (snappy) and upload it to S3."""
+    """
+    Serializa un DataFrame completo como Parquet (snappy) y lo sube a S3
+    (escritura no incremental — usada solo fuera del hot path de extracción,
+    que escribe con ParquetWriter en streaming).
+
+    Args:
+        df: DataFrame a escribir.
+        key: S3 key de destino.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _write_parquet(df, "SBSA/MC/300_IPM_1240_EXT/.../x.parquet")
+    """
     buf = io.BytesIO()
     df.to_parquet(buf, index=False, compression="snappy",coerce_timestamps="us")
     S3.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue())
@@ -494,13 +646,28 @@ def _target_key(
     raw_key: str, target_prefix: str, mti: str, fc: str | None = None
 ) -> str:
     """
-    Derive the destination S3 key from the source key.
+    Deriva el S3 key de destino a partir del key de origen, cambiando el
+    nombre de archivo según el patrón esperado:
+      - MTI 1644 con Function Code (fuera de RAW): {md5}_{file_idn}_{mti}_{fc}.parquet
+      - Resto de los casos:                        {md5}_{file_idn}_{mti}.parquet
 
-    Output filename:
-    - MTI 1644 with FC  →  {md5}_{file_idn}_{mti}_{fc}.parquet
-    - All others        →  {md5}_{file_idn}_{mti}.parquet
+    Args:
+        raw_key: S3 key de origen (dentro de una carpeta *_TRA).
+        target_prefix: Prefix de destino (carpeta *_EXT).
+        mti: MTI del archivo, ej. "1240" o "1644".
+        fc: Function Code (solo relevante para MTI 1644 fuera de RAW).
 
-    Raises ValueError if the source filename does not match the expected pattern.
+    Returns:
+        S3 key completo de destino.
+
+    Raises:
+        ValueError: si el stem del archivo de origen no matchea ninguno de
+            los 2 patrones esperados.
+
+    Ejemplo:
+        _target_key("SBSA/MC/200_IPM_1644_TRA/.../HASH_FILEIDN25CHARS_1644_685.parquet",
+                    "SBSA/MC/300_IPM_1644_EXT/.../", mti="1644", fc="685")
+        # ".../HASH_FILEIDN25CHARS_1644_685.parquet"
     """
     stem = Path(raw_key).stem
     has_raw = any("raw" in part.lower() for part in raw_key.split("/"))
@@ -531,16 +698,40 @@ def _target_key(
 
 
 def _normalize_col(name: object) -> str:
-    """Strip, lowercase, and replace whitespace with underscores in a column name."""
+    """
+    Recorta, pasa a minúscula y reemplaza espacios por guiones bajos en un
+    nombre de columna.
+
+    Args:
+        name: Nombre de columna a normalizar (cualquier tipo, se castea a
+            string).
+
+    Returns:
+        Nombre normalizado.
+
+    Ejemplo:
+        _normalize_col("DE 4 ")  # "de_4"
+    """
     return _WS_RE.sub("_", str(name).strip().lower())
 
 
 def _missing_layout_keys(df: pd.DataFrame, expected_keys: Iterable[str]) -> list[str]:
     """
-    Return layout keys that are expected but absent from the DataFrame columns.
+    Devuelve las claves de layout esperadas que no aparecen entre las
+    columnas del DataFrame, escaneando los nombres de columna en busca de
+    tokens DE_*/PDS_* ya presentes.
 
-    Scans column names for DE_* and PDS_* tokens and returns any expected keys
-    not found.
+    Args:
+        df: DataFrame cuyas columnas se van a escanear.
+        expected_keys: Claves de layout esperadas (de dict_de/dict_pds), ej.
+            "DE_25", "PDS_358_1".
+
+    Returns:
+        Lista ordenada de claves esperadas (en minúscula) que no se
+        encontraron entre las columnas de df.
+
+    Ejemplo:
+        _missing_layout_keys(df, ["DE_25", "PDS_358_1"])  # ["pds_358_1"] si falta esa
     """
     found: set[str] = set()
     for col in df.columns:
@@ -557,11 +748,24 @@ def _reorder_cols(
     first_cols: list[str],
 ) -> pd.DataFrame:
     """
-    Reorder DataFrame columns: first_cols → layout columns → remaining extras.
+    Reordena las columnas del DataFrame: primero first_cols, luego las
+    columnas de layout en el orden dado, y al final cualquier columna extra
+    no contemplada en ninguna de las dos listas. Los nombres de columna se
+    normalizan in-place antes de reordenar. La selección de columnas no
+    genera una copia completa de los datos.
 
-    Column names are normalised in-place before reordering.  Columns not in
-    either list are preserved at the end.  No full DataFrame copy is made —
-    only a new column-order view is returned.
+    Args:
+        df: DataFrame a reordenar.
+        ordered_layout_cols: Columnas de layout en el orden deseado (ej.
+            resultado de _build_ordered_extract_cols).
+        first_cols: Columnas fijas que deben ir primero, ej. _FIRST_COLS.
+
+    Returns:
+        DataFrame con las columnas reordenadas (vista o copia liviana, no
+        copia completa de los datos).
+
+    Ejemplo:
+        _reorder_cols(df, ordered_layout_cols, _FIRST_COLS)
     """
     df.columns = [_normalize_col(c) for c in df.columns]
     cols = list(df.columns)
@@ -585,15 +789,27 @@ def _reorder_cols(
 
 def _align_df_1644(df: pd.DataFrame, fc: str, pds_layout: dict) -> pd.DataFrame:
     """
-    Select and order MTI 1644 columns for the given Function Code.
+    Selecciona y ordena las columnas de un DataFrame MTI 1644 para un
+    Function Code específico: conserva las columnas base de extract, las
+    columnas técnicas/de metadata (BLOCK, ENC, FUNCTION_ROLE, PARSE_OK, DE_1,
+    DE_48), las columnas DE propias del FC, y los tags/subcampos PDS propios
+    del FC (expandidos a subcampos salvo que estén en force_raw, en cuyo caso
+    se conserva solo el campo escalar). Las columnas esperadas que falten se
+    crean como pd.NA.
 
-    Keeps:
-    - Base extract columns
-    - Technical metadata columns
-    - FC-specific DE columns
-    - FC-specific PDS tags/subfields
+    Args:
+        df: DataFrame de un archivo MTI 1644 (un Function Code).
+        fc: Function Code del archivo ("685", "688" o "691").
+        pds_layout: Layout PDS completo del MTI 1644 (dict_pds de
+            _load_layout("1644")).
 
-    Missing columns are created as pd.NA.
+    Returns:
+        DataFrame con las columnas seleccionadas y ordenadas (base + técnicas
+        + FC-específicas + extras al final), o el mismo df sin cambios si
+        está vacío o es None.
+
+    Ejemplo:
+        _align_df_1644(df, "685", pds_layout)
     """
     if df is None or df.empty:
         return df
@@ -674,11 +890,30 @@ def _extract_1644(
     content_hash: str = "",
 ) -> None:
     """
-    Extract and standardise MTI 1644 parquet files.
+    Extrae y estandariza los Parquets MTI 1644 de un archivo, uno por
+    Function Code. Por cada Parquet: deriva el FC del nombre de archivo,
+    descarta FCs no soportados (VALID_FC_1644), procesa en streaming
+    (iter_batches) inyectando FUNCTION_CODE, alinea el schema por FC
+    (_align_df_1644), renombra columnas técnicas a nombres de extract
+    (rename_map + RENAME_COLS_1644 semánticos: MSG_NO→ref_id, MTI→type_mti),
+    normaliza nombres de columna y escribe el resultado a
+    300_IPM_1644_EXT/{fc}.parquet.
 
-    For each file: derive FC from filename → skip unsupported FCs → read parquet
-    → inject FUNCTION_CODE → align schema by FC → rename columns → apply semantic
-    renames → normalise column names → write to S3 → free memory.
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        origin_sub_dir: Subdirectorio de origen (default: "200_IPM_1644_TRA").
+        target_sub_dir: Subdirectorio de destino (default: "300_IPM_1644_EXT").
+        content_hash: MD5 del archivo origen (no usado directamente en esta
+            función — el content_hash ya viene propagado como columna desde
+            transform).
+
+    Returns:
+        None — escribe los Parquets alineados directamente a S3.
+
+    Ejemplo:
+        _extract_1644("SBSA", "DD9D...", file_details)
     """
     origin_prefix = _s3_prefix(client_id, origin_sub_dir, file_details)
     target_prefix = _s3_prefix(client_id, target_sub_dir, file_details)
@@ -748,10 +983,31 @@ def _extract_standard(
     content_hash: str = "",
 ) -> None:
     """
-    Shared extract pipeline for MTIs 1240, 1442, and 1740.
+    Pipeline de extracción compartido para los MTIs 1240, 1442 y 1740. Por
+    cada Parquet del archivo: procesa en streaming (iter_batches), renombra
+    columnas técnicas a nombres de extract, normaliza nombres, descarta
+    columnas padre cuyo layout tiene subcampos ya expandidos presentes
+    (cols_to_drop, calculado una sola vez desde el primer batch — los nombres
+    de columna no cambian entre batches del mismo archivo), rellena con NA
+    las columnas de layout ausentes (_fill_missing_cols), reordena columnas
+    (_reorder_cols) y escribe el resultado a {target_sub_dir}/.
 
-    For each file: read parquet → rename columns → normalise names → fill any
-    missing layout columns with NA → reorder columns → write to S3 → free memory.
+    Args:
+        mti: MTI a procesar, ej. "1240".
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        origin_sub_dir: Subdirectorio de origen, ej. "200_IPM_1240_TRA".
+        target_sub_dir: Subdirectorio de destino, ej. "300_IPM_1240_EXT".
+        content_hash: MD5 del archivo origen (no usado directamente en esta
+            función — ya viene propagado como columna desde transform).
+
+    Returns:
+        None — escribe los Parquets alineados directamente a S3.
+
+    Ejemplo:
+        _extract_standard("1240", "SBSA", "DD9D...", file_details,
+                           "200_IPM_1240_TRA", "300_IPM_1240_EXT")
     """
     origin_prefix = _s3_prefix(client_id, origin_sub_dir, file_details)
     target_prefix = _s3_prefix(client_id, target_sub_dir, file_details)
@@ -843,7 +1099,21 @@ def _extract_standard(
 
 
 def _extract_1240(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
-    """Extract MTI 1240: 200_IPM_1240_TRA → 300_IPM_1240_EXT."""
+    """
+    Wrapper de _extract_standard para MTI 1240: 200_IPM_1240_TRA → 300_IPM_1240_EXT.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        content_hash: MD5 del archivo origen.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _extract_1240("SBSA", "DD9D...", file_details)
+    """
     _extract_standard(
         "1240", client_id, file_id, file_details, "200_IPM_1240_TRA", "300_IPM_1240_EXT",
         content_hash=content_hash,
@@ -851,7 +1121,21 @@ def _extract_1240(client_id: str, file_id: str, file_details: dict, content_hash
 
 
 def _extract_1442(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
-    """Extract MTI 1442: 200_IPM_1442_TRA → 300_IPM_1442_EXT."""
+    """
+    Wrapper de _extract_standard para MTI 1442: 200_IPM_1442_TRA → 300_IPM_1442_EXT.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        content_hash: MD5 del archivo origen.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _extract_1442("SBSA", "DD9D...", file_details)
+    """
     _extract_standard(
         "1442", client_id, file_id, file_details, "200_IPM_1442_TRA", "300_IPM_1442_EXT",
         content_hash=content_hash,
@@ -859,7 +1143,21 @@ def _extract_1442(client_id: str, file_id: str, file_details: dict, content_hash
 
 
 def _extract_1740(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
-    """Extract MTI 1740: 200_IPM_1740_TRA → 300_IPM_1740_EXT."""
+    """
+    Wrapper de _extract_standard para MTI 1740: 200_IPM_1740_TRA → 300_IPM_1740_EXT.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        content_hash: MD5 del archivo origen.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _extract_1740("SBSA", "DD9D...", file_details)
+    """
     _extract_standard(
         "1740", client_id, file_id, file_details, "200_IPM_1740_TRA", "300_IPM_1740_EXT",
         content_hash=content_hash,
@@ -886,13 +1184,22 @@ EXTRACTS: dict[str, Any] = {
  
 def _build_outputs_for_stepfunction(s3_urls: list[str]) -> list[dict]:
     """
-    Convert the list of full S3 URLs written during extraction into the
-    structured array consumed by downstream Step Functions states.
- 
-    Input:  ["s3://bucket/SBSA/MC/300_IPM_1240_EXT/file_type=IN/date=.../xxx.parquet", ...]
-    Output: [{"mti": "1240", "s3_key": "SBSA/MC/300_IPM_1240_EXT/file_type=IN/date=.../xxx.parquet"}, ...]
- 
-    Mirrors mc_transform._build_outputs_for_stepfunction exactly.
+    Convierte la lista de URLs S3 completas escritas durante la extracción en
+    el array estructurado que consumen los estados downstream de Step
+    Functions. Replica exactamente la lógica de
+    mc_transform._build_outputs_for_stepfunction.
+
+    Args:
+        s3_urls: Lista de URLs completas ("s3://bucket/key") de los Parquets
+            escritos.
+
+    Returns:
+        Lista de dicts {"mti": ..., "s3_key": ...}, con "mti"="UNKNOWN" si el
+        path no matchea el patrón esperado.
+
+    Ejemplo:
+        _build_outputs_for_stepfunction(["s3://bucket/SBSA/MC/300_IPM_1240_EXT/.../x.parquet"])
+        # [{'mti': '1240', 's3_key': 'SBSA/MC/300_IPM_1240_EXT/.../x.parquet'}]
     """
     result: list[dict] = []
     for url in s3_urls:
@@ -916,57 +1223,74 @@ def _build_outputs_for_stepfunction(s3_urls: list[str]) -> list[dict]:
 
 def lambda_handler(event: dict, context: Any) -> dict:
     """
-    AWS Lambda entry point for the Mastercard extraction stage.
- 
-    Receives the full Step Functions state as the event payload
-    (``Payload.$: "$"``).  Identity fields (client_id, file_id, …) are
-    present at the event root level; the transform outputs that drive MTI
-    detection live under ``$.extract_input.outputs`` as a list of
-    ``{"mti": "...", "s3_key": "..."}`` objects — the same structure that
-    mc_transform.py produces and mc_interpreter.py produces before it.
- 
-    Input event (flat, Step Functions contract)
-    -------------------------------------------
-    {
-        "client_id":    "SBSA",
-        "file_id":      "DD9D...",
-        "brand":        "MASTERCARD",
-        "brand_id":     "MC",
-        "file_type":    "IN",
-        "file_date":    "2026-02-18",
-        "content_hash": "...",
-        "filename":     "...",
-        "extract_inputs": {
+    Punto de entrada de la Lambda lmbd-mc-extract. Invocada por la Step
+    Function Mastercard tras lmbd-mc-transform. Recibe el estado completo de
+    Step Functions como payload (Payload.$: "$") — los campos de identidad
+    (client_id, file_id, ...) están en la raíz del evento, y los outputs de
+    transform que determinan qué MTIs procesar viven bajo
+    $.extract_input.outputs (misma estructura que producen mc_transform.py y
+    mc_interpreter.py). Deriva los MTIs a procesar desde esos outputs
+    (fallback: todos los MTIs registrados en EXTRACTS si no se puede derivar
+    ninguno), arma file_details directamente desde el evento (sin round-trip
+    a DynamoDB), ejecuta el extract de cada MTI con la función registrada en
+    EXTRACTS, y recolecta los paths reales escritos a 300_IPM_*_EXT para
+    construir el payload de salida — mismo contrato que mc_transform.py.
+
+    Args:
+        event: Payload de Step Functions con client_id, file_id, brand,
+            brand_id, file_type, file_date, content_hash, filename, y
+            extract_input.outputs (lista de outputs de transform):
+            ```
+            {
+                "client_id":    "SBSA",
+                "file_id":      "DD9D...",
+                "brand":        "MASTERCARD",
+                "brand_id":     "MC",
+                "file_type":    "IN",
+                "file_date":    "2026-02-18",
+                "content_hash": "...",
+                "filename":     "...",
+                "extract_inputs": {
+                    "outputs": [
+                        {"mti": "1240", "s3_key": "SBSA/MC/200_IPM_1240_TRA/…parquet"},
+                        {"mti": "1644", "s3_key": "SBSA/MC/200_IPM_1644_TRA/…parquet"},
+                        ...
+                    ],
+                    ...
+                },
+                ...
+            }
+            ```
+        context: Contexto de ejecución de Lambda; se usa
+            context.aws_request_id para logging.
+
+    Returns:
+        Dict con status ("SUCCESS" si se escribió al menos un output, "ERROR"
+        si no), total_outputs, total_records (siempre 0 — el conteo de
+        records no se rastrea en esta etapa), outputs (lista {"mti", "s3_key"}
+        de los Parquets escritos) y los campos de identidad heredados del
+        evento. Lanza ValueError si falta S3_BUCKET, client_id/file_id, o no
+        se pudo derivar ningún MTI a procesar. Ejemplo:
+        ```
+        {
+            "status":        "SUCCESS",
+            "total_outputs": <int>,
+            "total_records": 0,
             "outputs": [
-                {"mti": "1240", "s3_key": "SBSA/MC/200_IPM_1240_TRA/…parquet"},
-                {"mti": "1644", "s3_key": "SBSA/MC/200_IPM_1644_TRA/…parquet"},
+                {"mti": "1240", "s3_key": "SBSA/MC/300_IPM_1240_EXT/…parquet"},
+                {"mti": "1644", "s3_key": "SBSA/MC/300_IPM_1644_EXT/…parquet"},
                 ...
             ],
-            ...
-        },
-        ...
-    }
- 
-    Return (flat dict — aligned with mc_transform.py contract)
-    ----------------------------------------------------------
-    {
-        "status":        "SUCCESS" | "ERROR",
-        "total_outputs": <int>,
-        "total_records": 0,
-        "outputs": [
-            {"mti": "1240", "s3_key": "SBSA/MC/300_IPM_1240_EXT/…parquet"},
-            {"mti": "1644", "s3_key": "SBSA/MC/300_IPM_1644_EXT/…parquet"},
-            ...
-        ],
-        "client_id":     "SBSA",
-        "file_id":       "DD9D...",
-        "brand":         "MASTERCARD",
-        "brand_id":      "MC",
-        "file_type":     "IN",
-        "file_date":     "2026-02-18",
-        "content_hash":  "...",
-        "filename":      "...",
-    }
+            "client_id": "SBSA", "file_id": "DD9D...", "brand": "MASTERCARD",
+            "brand_id": "MC", "file_type": "IN", "file_date": "2026-02-18",
+            "content_hash": "...", "filename": "...",
+        }
+        ```
+
+    Ejemplo:
+        lambda_handler({'client_id': 'SBSA', 'file_id': 'DD9D...', 'brand_id': 'MC',
+                         'file_type': 'IN', 'file_date': '2026-02-18',
+                         'extract_input': {'outputs': [...]}}, context)
     """
     log.info("REQUEST_ID=%s", context.aws_request_id)
     log.info("EVENT=%s", json.dumps(event))

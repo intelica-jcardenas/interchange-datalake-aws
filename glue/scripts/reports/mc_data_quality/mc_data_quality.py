@@ -1,4 +1,61 @@
 
+"""
+mc_data_quality.py — Job real: itl-0004-itx-dev-intchg-02-glue-mc-data-quality
+================================================================================
+Archivo:     glue/scripts/reports/mc_data_quality/mc_data_quality.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/mc_data_quality.py
+
+Replica en PySpark la lógica de Data Quality Mastercard del SP legacy en
+PostgreSQL: compara, para un rango de fechas y un cliente, los datos
+transaccionales (operational IPM_1240) contra los datos de liquidación
+reportados por la marca (operational IPM_1644, function_code=685) —
+agrupados por las mismas dimensiones de negocio (fecha, tipo de mensaje,
+business_mode, jurisdiction, moneda, trx_type, ird) para poder comparar
+conteos y montos lado a lado en un reporte único. Aún no integrado a
+ningún Step Function (ver CLAUDE.md → tabla de Glue Jobs) — se ejecuta
+manualmente, nunca corrido en producción (ver decisions.md/gotchas.md).
+
+Cada fuente (settlement, transactional) tiene su propia función que arma
+un DataFrame normalizado y agrega con una consulta SQL vía Spark SQL
+(temp views), replicando columna por columna las expresiones CASE/JOIN del
+SQL original. El combinado (unionByName de ambas fuentes) se calcula día
+por día en un rango [start_date, end_date] — un fallo en un día individual
+no aborta el rango completo, se loguea y se omite (ver
+get_mastercard_validation_results_range).
+
+Particularidad SBSA: aplica un filtro adicional de hash de archivo
+(hash_file_filter) contra un Parquet de control equivalente a la tabla
+legacy control.t_control_file — ver get_control_hash_codes(). Para el
+resto de los clientes este filtro no aplica.
+
+Flujo:
+1. get_mastercard_validation_results_range(): itera día por día el rango
+2. Por día: get_mastercard_validation_results_combined() = settlement UNION transactional
+3. get_mastercard_validation_results_settlement(): lee IPM_1644 (function_code=685),
+   normaliza y agrega vía SQL contra business_transaction_type/currency/exchange-rates-glue
+4. get_mastercard_validation_results_transactional(): lee IPM_1240,
+   normaliza y agrega vía SQL contra las mismas 3 referencias
+5. Escribe el resultado combinado del rango completo a s3-analytics
+
+Job Parameters:
+  --CUSTOMER_CODE               Código de cliente único, ej: "EBGR"
+  --START_DATE                  Inicio del rango en formato YYYY-MM-DD (inclusive)
+  --END_DATE                    Fin del rango en formato YYYY-MM-DD (inclusive)
+  --ISSUER_ACQUIRER_INDICATOR   "I" (Issuer/IN) o "A" (Acquirer/OUT) — determina file_type
+  --BRAND_LOCAL_INDICATOR       "brand" o "default" — filtro de hash_file_filter para SBSA
+
+Variables de entorno (no son Job Parameters, se leen con os.getenv):
+  S3_REFERENCE             : bucket de referencia (default: s3a://itl-0004-itx-dev-intchg-02-s3-reference)
+  S3_OPERATIONAL           : bucket operational (default: s3a://itl-0004-itx-dev-intchg-02-s3-operational)
+  S3_OUTPUT                : bucket de salida del reporte (default: s3a://itl-0004-itx-dev-intchg-02-s3-analytics)
+  DYNAMO_TABLE_CLIENT      : tabla DynamoDB de clientes (default: itl-0004-itx-dev-dynamo-client-02)
+  AWS_REGION               : región AWS (default: eu-south-2)
+  CONTROL_FILE_PATH        : path del Parquet de control para hash_file_filter (solo SBSA, default: "")
+  SPARK_SHUFFLE_PARTITIONS : particiones de shuffle Spark (default: 32)
+
+Salida:
+  S3 analytics: {S3_OUTPUT}/{customer_code}/reports/quality/range_{start_date}_{end_date}/
+"""
 import os
 from decimal import Decimal
 from typing import Any, List
@@ -116,6 +173,25 @@ COL_TRX_RATE_CURRENCY = "rate_currency"
 # =============================================================================
 
 def read_ipm_1644_operational(spark, path: str) -> DataFrame:
+    """
+    Lee el Parquet operational de MTI 1644 (settlement) con un schema Arrow/
+    Spark explícito, para evitar que Spark infiera tipos inconsistentes entre
+    archivos (ver decisions.md → "Por qué lmbd-mc-store restaura el schema
+    Arrow del CLN..." — mismo problema que motivó el schema explícito en la
+    capa operational).
+
+    Args:
+        spark: Sesión de Spark activa.
+        path: Path S3 al directorio operational de IPM_1644 a leer
+            ({S3_OPERATIONAL}/{customer_code}/MC/IPM_1644/file_type=IN/date={query_date}/).
+
+    Returns:
+        DataFrame con el schema fijo declarado (18 columnas — llaves,
+        columnas reconciled_*, content_hash, file_id, file_processing_date).
+
+    Ejemplo:
+        read_ipm_1644_operational(spark, "s3a://.../EBGR/MC/IPM_1644/file_type=IN/date=2026-01-03/")
+    """
     schema = StructType([
         StructField("file_idn", StringType(), True),
         StructField("file_dt", StringType(), True),
@@ -161,6 +237,24 @@ def read_ipm_1644_operational(spark, path: str) -> DataFrame:
     )
     
 def read_ipm_1240_operational(spark, path: str) -> DataFrame:
+    """
+    Lee el Parquet operational de MTI 1240 (transaccional) con un schema
+    Arrow/Spark explícito, incluyendo las columnas ya enriquecidas por el
+    pipeline (jurisdiction, settlement_report_currency_code, intelica_id,
+    calculated_value, rate_currency) — mismo motivo que
+    read_ipm_1644_operational().
+
+    Args:
+        spark: Sesión de Spark activa.
+        path: Path S3 al directorio operational de IPM_1240 a leer
+            ({S3_OPERATIONAL}/{customer_code}/MC/IPM_1240/file_type={file_type}/date={query_date}/).
+
+    Returns:
+        DataFrame con el schema fijo declarado (21 columnas).
+
+    Ejemplo:
+        read_ipm_1240_operational(spark, "s3a://.../EBGR/MC/IPM_1240/file_type=IN/date=2026-01-03/")
+    """
     schema = StructType([
         StructField("file_idn", StringType(), True),
         StructField("file_dt", StringType(), True),
@@ -199,12 +293,46 @@ def read_ipm_1240_operational(spark, path: str) -> DataFrame:
     )
     
 def clean_decimal(value: Any) -> Any:
+    """
+    Convierte un valor Decimal de DynamoDB a int (si es un entero exacto) o
+    float, para que sea serializable/comparable sin el tipo Decimal de
+    Python. Cualquier otro tipo se devuelve sin cambios.
+
+    Args:
+        value: Valor a convertir, típicamente un atributo de un item de
+            DynamoDB.
+
+    Returns:
+        int, float, o el valor original sin cambios si no es Decimal.
+
+    Ejemplo:
+        clean_decimal(Decimal('4.0'))  # 4
+        clean_decimal(Decimal('4.5'))  # 4.5
+    """
     if isinstance(value, Decimal):
         return int(value) if value % 1 == 0 else float(value)
     return value
 
 
 def get_client_from_dynamo(customer_code: str) -> dict:
+    """
+    Consulta en DynamoDB (tabla client) la configuración de un cliente por
+    su client_id, convirtiendo todos los valores Decimal a int/float con
+    clean_decimal().
+
+    Args:
+        customer_code: Código de cliente, ej. "EBGR".
+
+    Returns:
+        Dict con los atributos del cliente (incluye report_currency_code,
+        usado en ambas funciones de validación).
+
+    Raises:
+        ValueError: si no existe un item para customer_code en la tabla.
+
+    Ejemplo:
+        get_client_from_dynamo("EBGR")  # {'client_id': 'EBGR', 'report_currency_code': 'EUR', ...}
+    """
     ddb = boto3.resource("dynamodb", region_name=AWS_REGION)
     table = ddb.Table(DYNAMO_TABLE_CLIENT)
 
@@ -218,6 +346,24 @@ def get_client_from_dynamo(customer_code: str) -> dict:
 
 
 def read_parquet(spark, path: str, name: str) -> DataFrame:
+    """
+    Lee un directorio Parquet desde S3 sin schema explícito, dejando que
+    Spark infiera el schema desde los datos (a diferencia de
+    read_ipm_1644_operational/read_ipm_1240_operational, que sí declaran
+    schema fijo). Usado para tablas de referencia pequeñas y consistentes
+    (business_transaction_type, currency, validation_conditions).
+
+    Args:
+        spark: Sesión de Spark activa.
+        path: Path S3 al directorio Parquet a leer.
+        name: Nombre descriptivo de la fuente, solo para logging.
+
+    Returns:
+        DataFrame con el contenido del directorio.
+
+    Ejemplo:
+        read_parquet(spark, f"{S3_REFERENCE}/currency/", "currency")
+    """
     print(f"[READ] {name}: {path}", flush=True)
     return spark.read.option("mergeSchema", "false").parquet(path)
 
@@ -244,12 +390,43 @@ def read_exchange_rates_glue(spark, s3_reference: str, query_date: str) -> DataF
 
 
 def safe_col(df: DataFrame, col_name: str, default=""):
+    """
+    Devuelve la columna col_name si existe en df, o un literal default si
+    no — evita AnalysisException: cannot resolve column cuando una columna
+    opcional (ej. message_reason_code, ausente en algunos bloques) falta en
+    el schema leído.
+
+    Args:
+        df: DataFrame donde buscar la columna.
+        col_name: Nombre de columna a buscar.
+        default: Valor literal a usar si la columna no existe (default: "").
+
+    Returns:
+        F.col(col_name) si existe, o F.lit(default) si no.
+
+    Ejemplo:
+        safe_col(df, "message_reason_code", "")  # F.col(...) o F.lit("")
+    """
     if col_name in df.columns:
         return F.col(col_name)
     return F.lit(default)
 
 
 def yymmdd_to_date(col_expr):
+    """
+    Convierte una columna con año de 2 dígitos + mes + día (formato interno
+    file_dt/file_date del pipeline MC, ej. "260103") a DATE, asumiendo siglo
+    2000 (prefijo "20" fijo).
+
+    Args:
+        col_expr: Expresión de columna con el valor YYMMDD.
+
+    Returns:
+        Columna DATE.
+
+    Ejemplo:
+        yymmdd_to_date(F.col("file_dt"))  # DATE 2026-01-03 para "260103"
+    """
     return F.to_date(
         F.concat(F.lit("20"), col_expr.cast("string")),
         "yyyyMMdd",
@@ -262,6 +439,30 @@ def get_validation_condition(
     condition_type: str,
     data_source: str | None = None,
 ) -> str:
+    """
+    Busca en la tabla de referencia validation_conditions la condición SQL
+    configurada para un cliente, marca ("MC" fijo) y tipo de condición (ej.
+    "where", "hash_file_filter"), opcionalmente filtrando también por
+    data_source ("stl"/"trx"). Solo se admiten filas con vc_report ==
+    "validation".
+
+    Args:
+        df_validation: DataFrame de la tabla validation_conditions ya
+            cargada.
+        customer_code: Código de cliente a filtrar.
+        condition_type: Tipo de condición a buscar, ej. "where" o
+            "hash_file_filter".
+        data_source: Filtro adicional opcional ("stl" o "trx"); si es None,
+            no se aplica.
+
+    Returns:
+        El string de la condición (vc_query_code) de la primera fila que
+        matchea, o "" si no hay ninguna.
+
+    Ejemplo:
+        get_validation_condition(df_validation, "SBSA", "hash_file_filter")
+        # "app_hash_file IN (...)" o ""
+    """
     df = df_validation.filter(
         (F.col("vc_report") == "validation")
         & (F.col("vc_brand") == "MC")
@@ -292,18 +493,40 @@ def get_control_hash_codes(
     include_cps_collections: bool = False,
 ) -> List[str]:
     """
-    Replica la lógica PostgreSQL para SBSA.
+    Replica la lógica PostgreSQL de filtrado por hash de archivo, exclusiva
+    de SBSA — obtiene los códigos de archivo válidos desde un Parquet de
+    control equivalente a la tabla legacy control.t_control_file, filtrando
+    por cliente, marca ("MC" fijo), fecha, y el patrón de nombre de archivo
+    correspondiente al indicador brand/local:
 
-    Settlement:
-      brand: MasterCard_Inward / MasterCard_Outward
-      default: Local_MasterCard
+      Settlement:
+        brand: MasterCard_Inward / MasterCard_Outward
+        default: Local_MasterCard
 
-    Transactional:
-      brand: MasterCard_Inward / MasterCard_Outward / MasterCard_CPS_Collections_File
-      default: Local_MasterCard
+      Transactional:
+        brand: MasterCard_Inward / MasterCard_Outward / MasterCard_CPS_Collections_File
+        default: Local_MasterCard
 
-    Si no hay CONTROL_FILE_PATH, retorna ['xyz'] como fallback,
-    igual que el SQL original.
+    Si no hay CONTROL_FILE_PATH configurado, retorna ['xyz'] como fallback
+    (sentinel que no matchea ningún hash real), igual que el SQL original.
+
+    Args:
+        spark: Sesión de Spark activa.
+        customer_code: Código de cliente (se espera "SBSA", único caso donde
+            se llama a esta función).
+        query_date: Fecha a filtrar, formato "YYYY-MM-DD".
+        brand_local_indicator: "brand" o "default" — determina qué patrones
+            de process_file_name se incluyen.
+        include_cps_collections: Si es True, agrega el patrón
+            MasterCard_CPS_Collections_File al filtro "brand" (usado solo
+            para el data_source "trx").
+
+    Returns:
+        Lista de códigos de archivo (code) que matchean los filtros, o
+        ["xyz"] si no hay ninguno o falta CONTROL_FILE_PATH.
+
+    Ejemplo:
+        get_control_hash_codes(spark, "SBSA", "2026-01-03", "brand", include_cps_collections=True)
     """
 
     if not CONTROL_FILE_PATH:
@@ -357,11 +580,43 @@ def apply_validation_conditions(
     hash_col: str = "content_hash",
 ) -> DataFrame:
     """
-    Aplica condiciones dinámicas desde validation_conditions.
+    Aplica condiciones dinámicas de la tabla validation_conditions sobre un
+    DataFrame ya normalizado, replicando dos patrones conocidos del SQL
+    legacy:
+      - Filtro por reconciled_member_activity (o el campo equivalente pasado
+        en member_activity_col) igual a issuer_acquirer_indicator, si la
+        condición "where" configurada lo menciona.
+      - hash_file_filter, exclusivo de SBSA (ver get_control_hash_codes()),
+        si la condición configurada lo menciona y la columna de hash está
+        presente en df.
 
-    Se interpretan patrones conocidos del SQL legacy:
-      - where con reconciled_member_activity
-      - hash_file_filter solo para SBSA
+    Args:
+        spark: Sesión de Spark activa (necesaria para get_control_hash_codes
+            en el caso SBSA).
+        df: DataFrame ya normalizado (settlement o transactional) a filtrar.
+        df_validation: DataFrame de la tabla validation_conditions.
+        query_date: Fecha en formato "YYYY-MM-DD".
+        customer_code: Código de cliente.
+        issuer_acquirer_indicator: "I" o "A", usado para el filtro de
+            member_activity.
+        brand_local_indicator: "brand" o "default", pasado a
+            get_control_hash_codes() para SBSA.
+        data_source: "stl" o "trx" — determina qué condición "where" se busca
+            y si se incluye MasterCard_CPS_Collections_File en el hash filter.
+        member_activity_col: Nombre de la columna de member_activity a filtrar
+            (solo aplica a settlement; None para transactional).
+        hash_col: Nombre de columna de hash preferido (default:
+            "content_hash"); si no está en df, se usa "app_hash_file" como
+            fallback.
+
+    Returns:
+        El DataFrame filtrado (puede ser el mismo df sin cambios si ninguna
+        condición aplicó).
+
+    Ejemplo:
+        apply_validation_conditions(spark, df, df_validation, "2026-01-03",
+                                     "SBSA", "I", "brand", "trx",
+                                     member_activity_col=None, hash_col="content_hash")
     """
 
     where_sql = get_validation_condition(
@@ -420,6 +675,38 @@ def get_mastercard_validation_results_settlement(
     issuer_acquirer_indicator: str,
     brand_local_indicator: str = "default",
 ) -> DataFrame:
+    """
+    Arma el resultado de validación de un día desde la fuente de liquidación
+    (operational IPM_1644, function_code=685, reconciled_transaction_function_1=
+    "1240"). Lee, filtra por MTI/function_code, aplica las condiciones
+    dinámicas de validation_conditions (member_activity + hash_file_filter
+    SBSA), normaliza a un schema intermedio (t1_norm) y agrega vía Spark SQL
+    contra 3 referencias (business_transaction_type, exchange-rates-glue,
+    currency), calculando jurisdiction desde
+    reconciled_business_activity_2/settlement_indicator_1 y convirtiendo
+    los montos netos a report_currency_code con el tipo de cambio de la
+    fecha.
+
+    Args:
+        spark: Sesión de Spark activa.
+        query_date: Fecha a procesar, formato "YYYY-MM-DD".
+        customer_code: Código de cliente, ej. "EBGR".
+        issuer_acquirer_indicator: "I" o "A" — determina file_type (IN/OUT,
+            aunque el settlement 1644 siempre se lee de IN, ver comentario
+            inline) y se usa para el filtro de member_activity.
+        brand_local_indicator: "brand" o "default" (default: "default").
+
+    Returns:
+        DataFrame agregado con columnas app_processing_date, data_source,
+        file_source, app_customer_code, app_message_type, business_mode,
+        jurisdiction, report_currency_code, settlement_currency, trx_type,
+        ird, intelica_id, message_reason_code, electronic_commerce_indicator,
+        reconciled_file_flg, trx_count, trx_amt, itx_amt — una fila por
+        combinación única de dimensiones.
+
+    Ejemplo:
+        get_mastercard_validation_results_settlement(spark, "2026-01-03", "EBGR", "I")
+    """
     customer_code = customer_code.upper()
     brand_local_indicator = brand_local_indicator or "default"
 
@@ -639,6 +926,37 @@ def get_mastercard_validation_results_transactional(
     issuer_acquirer_indicator: str,
     brand_local_indicator: str = "default",
 ) -> DataFrame:
+    """
+    Arma el resultado de validación de un día desde la fuente transaccional
+    (operational IPM_1240), usando file_type derivado de
+    issuer_acquirer_indicator ("A"→OUT, "I"→IN). Lee, filtra por MTI=1240,
+    aplica las condiciones dinámicas de validation_conditions (solo
+    hash_file_filter SBSA — no hay member_activity_col para esta fuente,
+    app_type_file ya distingue Issuer/Acquirer), normaliza a un schema
+    intermedio (t1_norm) y agrega vía Spark SQL contra 3 referencias
+    (business_transaction_type, exchange-rates-glue con doble join X1/X2,
+    currency). Las expresiones de monto/moneda difieren según file_type: IN
+    usa amount_reconciliation/amounts_transaction_fee_7 con join de tipo de
+    cambio por currency_code_reconciliation; OUT usa
+    amount_transaction/calculated_value con join por
+    currency_code_transaction/rate_currency.
+
+    Args:
+        spark: Sesión de Spark activa.
+        query_date: Fecha a procesar, formato "YYYY-MM-DD".
+        customer_code: Código de cliente, ej. "EBGR".
+        issuer_acquirer_indicator: "I" o "A" — determina file_type (IN/OUT)
+            y por lo tanto qué columnas/joins de moneda se usan.
+        brand_local_indicator: "brand" o "default" (default: "default").
+
+    Returns:
+        DataFrame agregado con las mismas columnas que
+        get_mastercard_validation_results_settlement() (mismo schema, para
+        poder unir ambas fuentes con unionByName).
+
+    Ejemplo:
+        get_mastercard_validation_results_transactional(spark, "2026-01-03", "EBGR", "I")
+    """
     customer_code = customer_code.upper()
     brand_local_indicator = brand_local_indicator or "default"
 
@@ -863,6 +1181,23 @@ def get_mastercard_validation_results_combined(
     brand_local_indicator: str = "default",
 ) -> DataFrame:
 
+    """
+    Combina los resultados de settlement y transactional de un mismo día en
+    un único DataFrame (unionByName, mismo schema en ambas fuentes).
+
+    Args:
+        spark: Sesión de Spark activa.
+        query_date: Fecha a procesar, formato "YYYY-MM-DD".
+        customer_code: Código de cliente.
+        issuer_acquirer_indicator: "I" o "A".
+        brand_local_indicator: "brand" o "default" (default: "default").
+
+    Returns:
+        DataFrame con la unión de settlement + transactional para ese día.
+
+    Ejemplo:
+        get_mastercard_validation_results_combined(spark, "2026-01-03", "EBGR", "I")
+    """
     df_settlement = get_mastercard_validation_results_settlement(
         spark=spark,
         query_date=query_date,
@@ -897,6 +1232,31 @@ def get_mastercard_validation_results_range(
     brand_local_indicator: str = "default",
 ) -> DataFrame:
 
+    """
+    Itera día por día un rango [start_date, end_date] y combina el resultado
+    de get_mastercard_validation_results_combined() de cada día en un único
+    DataFrame. Un fallo en un día individual (ej. archivo faltante para esa
+    fecha) no aborta el rango completo — se loguea como warning y se omite,
+    acumulando failed_dates.
+
+    Args:
+        spark: Sesión de Spark activa.
+        start_date: Inicio del rango, formato "YYYY-MM-DD" (inclusive).
+        end_date: Fin del rango, formato "YYYY-MM-DD" (inclusive).
+        customer_code: Código de cliente.
+        issuer_acquirer_indicator: "I" o "A".
+        brand_local_indicator: "brand" o "default" (default: "default").
+
+    Returns:
+        DataFrame con la unión (unionByName acumulado) de todos los días
+        procesados exitosamente.
+
+    Raises:
+        RuntimeError: si ningún día del rango produjo datos válidos.
+
+    Ejemplo:
+        get_mastercard_validation_results_range(spark, "2026-01-01", "2026-01-05", "EBGR", "I")
+    """
     current_date = datetime.strptime(start_date, "%Y-%m-%d")
     end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
 

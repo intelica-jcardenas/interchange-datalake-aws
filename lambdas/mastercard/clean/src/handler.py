@@ -1,35 +1,60 @@
 """
-Mastercard clean pipeline — AWS Lambda handler.
- 
-Reads extracted parquet files from S3 (EXT layer), casts and normalises every
-column according to metadata-driven dtype definitions stored in DynamoDB,
-enforces a deterministic column order, and writes the result back to S3 (CLN
-layer) using a PyArrow schema.
- 
-Supported MTIs
---------------
-- 1240
-- 1442
-- 1644  (filtered by Function Code: 685, 688, 691)
-- 1740
- 
-Environment variables
----------------------
-S3_BUCKET                  (required)  Main S3 bucket (staging).
-S3_BUCKET_REFERENCE        (optional)  Reference data bucket.
-                                        Default: "itl-0004-itx-dev-poc-02-reference"
-DYNAMO_TABLE_FILE_CONTROL  (optional)  DynamoDB table with file metadata.
-                                        Default: "itl-0004-itx-dev-dynamo-file_control-02"
- 
-S3 key structure
-----------------
-Input  (EXT): {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
-Output (CLN): {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
- 
-Currency reference
-------------------
-s3://{S3_BUCKET_REFERENCE}/currency/data.parquet
-Loaded once per process and cached at module level.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-clean
+================================================================================
+Archivo:     lambdas/mastercard/clean/src/handler.py
+
+Cuarta etapa del pipeline Mastercard (tras extract). Lee los Parquets de
+extract (capa EXT), castea y normaliza cada columna según definiciones de
+dtype declaradas en DynamoDB (mastercard_fields), aplica conversión de
+moneda usando la tabla de referencia de decimales por moneda desde S3
+(currency/data.parquet), aplica un orden de columnas determinístico y
+escribe a s3-staging/400_IPM_{mti}_CLN/ usando un schema PyArrow explícito
+(_build_arrow_schema). Equivalente funcional al clean de Visa. Timeout
+600s, /tmp 10240 MB (config.json).
+
+El motor de casteo (_cast_df) soporta 6 tipos declarados en DynamoDB:
+int64, string, timestamp, date, time, decimal — con 3 variantes de
+decimal según el flag float_decimals:
+  - >= 0   : decimales implícitos de escala fija (ej. "1234"/scale=2 → 12.34)
+  - -1     : formato "scale-prefixed" de Mastercard (primer dígito =
+             exponente, resto = mantisa — usado en tipos de cambio)
+  - -2/-3/-4: decimales dinámicos, cuya escala depende del código de
+             moneda de la propia fila (DE_49/DE_50/DE_51 según el flag) —
+             requiere el mapa de decimales por moneda (currency_map)
+
+Como CAL/ITX (Glue) no tienen el mismo control de schema explícito que
+esta etapa, el schema Arrow que arma _build_arrow_schema() es la fuente
+de verdad que consumen mc-store y consumidores downstream para detectar
+degradaciones de tipo (ver decisions.md → "Por qué lmbd-mc-store restaura
+el schema Arrow del CLN...").
+
+Cada Parquet se procesa en streaming (iter_batches + ParquetWriter) para
+no materializar el DataFrame completo en memoria — mismo patrón que
+mc-extract.
+
+Flujo:
+1. Derivar los MTIs a procesar desde clean_input.outputs (fallback: todos
+   los MTIs registrados en CLEANS)
+2. Por cada MTI: listar los Parquets EXT del file_id, procesarlos en
+   streaming (castear tipos, construir/reutilizar schema Arrow, escribir)
+3. Escribir cada Parquet limpio a 400_IPM_{mti}_CLN/
+4. Recolectar los paths reales escritos y construir la lista de outputs
+   para la siguiente etapa (glue-mc-calculate)
+
+MTIs soportados: 1240, 1442, 1644 (filtrado por Function Code: 685, 688, 691), 1740
+
+Variables de entorno:
+  S3_BUCKET                  : bucket de staging (lectura de EXT, escritura de CLN; default: itl-0004-itx-dev-intchg-02-s3-staging)
+  S3_BUCKET_REFERENCE        : bucket de referencia, para currency/data.parquet (default: itl-0004-itx-dev-intchg-02-s3-reference)
+  DYNAMO_TABLE_FILE_CONTROL  : tabla de control de archivos (no usada actualmente — file_details se arma desde el evento; default: itl-0004-itx-dev-dynamo-file_control-02)
+  ITX_CLEAN_BATCH_SIZE       : filas por batch de streaming (default: 100000)
+
+Estructura de S3 key:
+  Entrada (EXT): {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
+  Salida  (CLN): {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
+
+Referencia de moneda: s3://{S3_BUCKET_REFERENCE}/currency/data.parquet,
+cargada una sola vez por proceso y cacheada a nivel de módulo.
 """
 
 from __future__ import annotations
@@ -132,16 +157,38 @@ _currency_map_cache: Optional[dict[str, int | None]] = None
  
  
 def _quantize(d: Decimal, scale: int) -> Decimal:
-    """Quantize a Decimal to ``scale`` fractional digits using ROUND_HALF_UP."""
+    """
+    Redondea un Decimal a scale dígitos fraccionarios usando ROUND_HALF_UP.
+
+    Args:
+        d: Decimal a redondear.
+        scale: Cantidad de dígitos fraccionarios deseados.
+
+    Returns:
+        Decimal redondeado a scale dígitos fraccionarios.
+
+    Ejemplo:
+        _quantize(Decimal("12.345"), 2)  # Decimal("12.35")
+    """
     return d.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
  
  
 def _to_implied_decimal(x: Any, scale: int) -> Optional[Decimal]:
     """
-    Convert a digit-only string to Decimal by applying implied decimals.
- 
-    scale=2: "1234" → Decimal("12.34").  Values that already contain a decimal
-    point are returned as-is to avoid double scaling.  Empty / NA → None.
+    Convierte un string numérico a Decimal aplicando decimales implícitos.
+
+    scale=2: "1234" → Decimal("12.34"). Los valores que ya contienen un punto
+    decimal se devuelven tal cual, para evitar escalar dos veces. Vacío/NA → None.
+
+    Args:
+        x: Valor crudo a convertir (string numérico, o ya con punto decimal).
+        scale: Cantidad de decimales implícitos a aplicar si x no tiene punto.
+
+    Returns:
+        Decimal convertido, o None si x es NA/vacío o no es un número válido.
+
+    Ejemplo:
+        _to_implied_decimal("1234", 2)  # Decimal("12.34")
     """
     if pd.isna(x) or x == "":
         return None
@@ -161,11 +208,25 @@ def _to_scale_prefixed_decimal(
     x: Any, *, out_scale: Optional[int] = None
 ) -> Optional[Decimal]:
     """
-    Parse a Mastercard scale-prefixed numeric value into a Decimal.
- 
-    Encoding: first digit = exponent, remaining digits = mantissa.
-    Example: "212345" → exponent=2, mantissa=12345 → Decimal("123.45").
-    Empty / NA → None.
+    Parsea un valor numérico con prefijo de escala (formato propio de
+    Mastercard) a Decimal.
+
+    Codificación: el primer dígito es el exponente, el resto de los dígitos
+    es la mantisa. Ejemplo: "212345" → exponente=2, mantisa=12345 →
+    Decimal("123.45"). Vacío/NA → None.
+
+    Args:
+        x: Valor crudo a convertir (string con prefijo de escala, o ya con
+            punto decimal).
+        out_scale: Si se especifica, redondea el resultado a esa cantidad de
+            decimales (ROUND_HALF_UP).
+
+    Returns:
+        Decimal convertido, o None si x es NA/vacío, tiene menos de 2 dígitos,
+        o no es numérico.
+
+    Ejemplo:
+        _to_scale_prefixed_decimal("212345")  # Decimal("123.45")
     """
     if pd.isna(x) or x == "":
         return None
@@ -198,10 +259,29 @@ def _to_dynamic_decimal(
     out_scale: int,
 ) -> Optional[Decimal]:
     """
-    Convert a digit-only amount string to Decimal using per-row currency decimals.
- 
-    Falls back to ``default_decimals`` when the row's decimals value is missing.
-    Supports an optional leading '-' sign.  Empty / NA → None.
+    Convierte un string numérico de monto a Decimal usando la cantidad de
+    decimales de la moneda de esa fila (per-row currency decimals) — usado
+    para columnas cuya escala depende del código de moneda transaccional
+    (DE_49/50/51), no de un valor fijo.
+
+    Usa default_decimals como fallback cuando el valor de decimals de la fila
+    está ausente. Soporta un signo '-' inicial opcional. Vacío/NA → None.
+
+    Args:
+        amount_str: Monto crudo (string de dígitos, con signo '-' opcional).
+        decimals: Cantidad de decimales de la moneda de esta fila (de
+            currency_map), o None/NA para usar default_decimals.
+        default_decimals: Decimales a usar si decimals es None/NA.
+        out_scale: Escala de salida a la que redondear el resultado
+            (ROUND_HALF_UP).
+
+    Returns:
+        Decimal convertido (con signo si aplica), o None si amount_str es
+        NA/vacío o no son solo dígitos.
+
+    Ejemplo:
+        _to_dynamic_decimal("12345", 2, default_decimals=2, out_scale=4)
+        # Decimal("123.4500")
     """
     if pd.isna(amount_str):
         return None
@@ -232,16 +312,34 @@ def _to_dynamic_decimal(
 
 
 def _dval(attr: dict) -> str:
-    """Deserialise a DynamoDB attribute dict to a plain stripped string."""
+    """
+    Deserializa un atributo de DynamoDB a un string plano recortado.
+
+    Args:
+        attr: Dict de atributo DynamoDB, ej. {"S": "1240"}.
+
+    Returns:
+        El valor como string, recortado de espacios. Cadena vacía si el
+        atributo no tiene ni "S" ni "N".
+
+    Ejemplo:
+        _dval({"S": " 1240 "})  # "1240"
+    """
     return str(attr.get("S") or attr.get("N") or "").strip()
  
  
 def _get_fields_rows() -> list[dict]:
     """
-    Return all rows from DYNAMO_TABLE_FIELDS, scanning DynamoDB only once.
- 
-    Uses Scan (dynamodb:Scan).  The table is small so a full scan is acceptable.
-    Result is cached at module level for the process lifetime.
+    Devuelve todas las filas de DYNAMO_TABLE_FIELDS, escaneando DynamoDB solo
+    una vez por ciclo de vida del proceso. Usa Scan; la tabla es pequeña, un
+    scan completo es aceptable. El resultado se cachea a nivel de módulo.
+
+    Returns:
+        Lista de items crudos de DynamoDB (dicts con el envelope de tipo de
+        cada atributo).
+
+    Ejemplo:
+        _get_fields_rows()  # [{'column_name': {'S': 'amount_transaction_de_4'}, ...}, ...]
     """
     global _fields_rows_cache
     if _fields_rows_cache:
@@ -265,19 +363,26 @@ def _get_fields_rows() -> list[dict]:
  
 def _load_field_defs(tag: str, *, with_file_cols: bool = False) -> pd.DataFrame:
     """
-    Build and return the field-def DataFrame for the requested variant.
- 
-    Constructs the DataFrame from the cached DynamoDB scan, prepends the
-    appropriate base columns, and caches the result by ``tag``.
- 
-    Parameters
-    ----------
-    tag:
-        Cache key — use ``"default"`` for 1644/1740 and ``"with_file_cols"``
-        for 1240/1442.
-    with_file_cols:
-        When True, appends file-level metadata columns (file_id, file_type,
-        file_processing_date) to the base set.
+    Construye y devuelve el DataFrame de definiciones de campo (dtype) para
+    la variante solicitada.
+
+    Arma el DataFrame desde el scan cacheado de DynamoDB, antepone las
+    columnas base correspondientes, y cachea el resultado por tag.
+
+    Args:
+        tag: Llave de caché — usar "default" para 1644/1740 y
+            "with_file_cols" para 1240/1442.
+        with_file_cols: Si es True, agrega las columnas de metadata a nivel
+            de archivo (file_id, file_type, file_processing_date) al set
+            base.
+
+    Returns:
+        DataFrame con columnas extract_name, data_type, float_decimals — las
+        columnas base (_BASE_COLS/_BASE_COLS_WITH_FILE_META) primero, ganan
+        en caso de duplicado con las de DynamoDB.
+
+    Ejemplo:
+        _load_field_defs("with_file_cols", with_file_cols=True)
     """
     if tag in _field_defs_cache:
         return _field_defs_cache[tag]
@@ -319,10 +424,17 @@ def _load_field_defs(tag: str, *, with_file_cols: bool = False) -> pd.DataFrame:
  
 def _get_currency_map() -> dict[str, int | None]:
     """
-    Return the currency code → decimal places mapping.
- 
-    Loads ``s3://{S3_BUCKET_REFERENCE}/currency/data.parquet`` on the first
-    call and caches the result for the process lifetime.
+    Devuelve el mapa código de moneda → cantidad de decimales.
+
+    Carga s3://{S3_BUCKET_REFERENCE}/currency/data.parquet en la primera
+    llamada y cachea el resultado para el ciclo de vida del proceso.
+
+    Returns:
+        Dict {código_numérico_moneda (3 dígitos, zero-padded): decimales o
+        None si currency_decimal_separator está vacío}.
+
+    Ejemplo:
+        _get_currency_map()  # {'840': 2, '392': 0, ...}
     """
     global _currency_map_cache
     if _currency_map_cache is not None:
@@ -358,44 +470,53 @@ def _cast_df(
     currency_decimals_map: Optional[dict[str, int | None]] = None,
 ) -> pd.DataFrame:
     """
-    Cast DataFrame columns according to metadata-driven type definitions.
- 
-    Parameters
-    ----------
-    df:
-        Input DataFrame from an extracted parquet file.
-    param:
-        Metadata table with columns ``extract_name``, ``data_type``, and
-        optionally ``float_decimals``.
-    date_format:
-        strptime format for ``date`` columns.  Default ``"%Y%m%d"``.
-    timestamp_format:
-        strptime format for ``timestamp`` columns.  If None, pandas infers.
-    default_decimal_scale:
-        Implied-decimal fallback when ``float_decimals`` is missing / NA.
-    conversion_rate_scale:
-        Output scale for scale-prefixed decimals (``float_decimals == -1``).
-    dynamic_decimal_out_scale:
-        Output scale for dynamic decimals (``float_decimals`` in {-2, -3, -4}).
-    currency_decimals_map:
-        Pre-built currency → decimals mapping.  Required when the DataFrame
-        contains dynamic-decimal columns.
- 
-    Returns
-    -------
-    pd.DataFrame
-        New DataFrame with cast columns in metadata-driven column order
-        (defined columns first, extra columns at the end).
- 
-    Notes
-    -----
-    Supported ``data_type`` values: ``int64``, ``string``, ``timestamp``,
-    ``date``, ``time``, ``decimal``.
- 
-    ``float_decimals`` flags for decimal columns:
-    - ``>= 0``    : implied decimals scale
-    - ``-1``      : scale-prefixed (conversion rates)
-    - ``-2/-3/-4``: dynamic implied decimals driven by DE_49/50/51 currency codes
+    Castea las columnas de un DataFrame según las definiciones de tipo
+    declaradas en DynamoDB (metadata-driven).
+
+    Tipos de data_type soportados: int64, string, timestamp, date, time,
+    decimal.
+
+    Flags de float_decimals para columnas decimal:
+      - >= 0    : escala de decimales implícitos fija
+      - -1      : formato scale-prefixed (tipos de cambio) — ver
+        _to_scale_prefixed_decimal
+      - -2/-3/-4: decimales dinámicos según el código de moneda de
+        DE_49/50/51 de cada fila — ver _to_dynamic_decimal. Requiere
+        currency_decimals_map.
+
+    string: además del cast, "pan_de_2" recibe una limpieza adicional
+    (cualquier carácter no numérico → '0', máscara de PAN parcial — mismo
+    patrón que account_number en el clean de Visa).
+
+    Al final reordena las columnas: las definidas en param primero (en su
+    orden), las no declaradas (extras) al final.
+
+    Args:
+        df: DataFrame de entrada, de un Parquet de extract.
+        param: Tabla de metadata con columnas extract_name, data_type, y
+            opcionalmente float_decimals.
+        date_format: Formato strptime para columnas date (default: "%Y%m%d").
+        timestamp_format: Formato strptime para columnas timestamp; si es
+            None, pandas infiere.
+        default_decimal_scale: Escala de decimales implícitos por defecto,
+            usada cuando float_decimals está ausente/NA.
+        conversion_rate_scale: Escala de salida para decimales
+            scale-prefixed (float_decimals == -1).
+        dynamic_decimal_out_scale: Escala de salida para decimales dinámicos
+            (float_decimals en {-2, -3, -4}).
+        currency_decimals_map: Mapa moneda→decimales ya construido. Requerido
+            si el DataFrame tiene columnas de decimal dinámico.
+
+    Returns:
+        Nuevo DataFrame con las columnas casteadas, en el orden
+        metadata-driven (columnas definidas primero, extras al final).
+
+    Raises:
+        ValueError: si hay columnas de decimal dinámico pero no se pasó
+            currency_decimals_map.
+
+    Ejemplo:
+        _cast_df(df, field_defs, currency_decimals_map=currency_map)
     """
     out = df.copy()
  
@@ -574,24 +695,30 @@ def _build_arrow_schema(
     timestamp_unit: str = "ns",
 ) -> pa.Schema:
     """
-    Build a PyArrow schema that matches the metadata-driven casting rules.
- 
-    Parameters
-    ----------
-    param:
-        Same metadata table passed to ``_cast_df``.
-    ordered_cols:
-        Final column order for the schema — should be ``list(df_cast.columns)``
-        so the schema exactly matches the parquet being written.
-        Columns present here but absent from metadata fall back to ``pa.string()``.
-    default_decimal_precision:
-        Precision for all ``pa.decimal128`` fields.
-    default_decimal_scale:
-        Scale fallback when ``float_decimals`` is missing / NA.
-    conversion_rate_scale:
-        Scale for scale-prefixed decimal fields (``float_decimals == -1``).
-    timestamp_unit:
-        Arrow timestamp unit (e.g. ``"ns"``).
+    Construye un schema PyArrow que coincide con las reglas de casteo
+    metadata-driven de _cast_df — usado para que el ParquetWriter escriba con
+    tipos físicos consistentes entre archivos y batches.
+
+    Args:
+        param: Misma tabla de metadata pasada a _cast_df.
+        ordered_cols: Orden final de columnas del schema — debe ser
+            list(df_cast.columns) para que el schema coincida exactamente con
+            el Parquet que se está escribiendo. Columnas presentes acá pero
+            ausentes en metadata caen a pa.string().
+        default_decimal_precision: Precisión para todos los campos
+            pa.decimal128 (default: 18).
+        default_decimal_scale: Escala de fallback cuando float_decimals está
+            ausente/NA.
+        conversion_rate_scale: Escala para campos decimal scale-prefixed
+            (float_decimals == -1).
+        timestamp_unit: Unidad de timestamp Arrow (default: "ns").
+
+    Returns:
+        pa.Schema con un campo por columna de ordered_cols, tipado según
+        data_type/float_decimals de param.
+
+    Ejemplo:
+        _build_arrow_schema(field_defs, ordered_cols=list(df_cast.columns))
     """
     has_scale = "float_decimals" in param.columns
     cols = ["extract_name", "data_type"] + (["float_decimals"] if has_scale else [])
@@ -657,11 +784,27 @@ def _build_arrow_schema(
  
 def _get_file_details(client_id: str, file_id: str) -> dict:
     """
-    Retrieve file metadata from the DynamoDB file_control table via get_item.
- 
-    Returns a dict with keys: brand_id, file_type, file_processing_date,
-    landing_file_name.  Raises ValueError if no record is found or the
-    client_id does not match.
+    Recupera la metadata de un archivo desde la tabla DynamoDB file_control,
+    vía get_item. No usada actualmente en el flujo principal del handler (que
+    arma file_details directamente desde el evento — ver paso 4 de
+    lambda_handler) — queda disponible para reprocesos manuales.
+
+    Args:
+        client_id: Código de cliente esperado, para validar que el registro
+            encontrado le pertenece.
+        file_id: Identificador del archivo (llave de partición de
+            file_control).
+
+    Returns:
+        Dict con brand_id, file_type, file_processing_date,
+        landing_file_name.
+
+    Raises:
+        ValueError: si no existe un registro para file_id, o si el
+            client_id del registro no coincide con el esperado.
+
+    Ejemplo:
+        _get_file_details("SBSA", "DD9D...")
     """
     response = DYNAMO.get_item(
         TableName=DYNAMO_TABLE_FILE_CONTROL,
@@ -691,9 +834,19 @@ def _get_file_details(client_id: str, file_id: str) -> dict:
 
 def _s3_prefix(client_id: str, subdir: str, file_details: dict) -> str:
     """
-    Build the S3 key prefix for a given client and subdirectory.
- 
-        {client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/
+    Construye el prefix de S3 key para un cliente y subdirectorio dados,
+    según el esquema de particionamiento del pipeline.
+
+    Args:
+        client_id: Código de cliente, ej. "SBSA".
+        subdir: Subdirectorio de staging, ej. "300_IPM_1240_EXT".
+        file_details: Dict con brand_id, file_type y file_processing_date.
+
+    Returns:
+        Prefix con barra final: "{client_id}/{brand_id}/{subdir}/file_type={file_type}/date={date}/".
+
+    Ejemplo:
+        _s3_prefix("SBSA", "400_IPM_1240_CLN", file_details)
     """
     parts = [
         client_id,
@@ -707,9 +860,18 @@ def _s3_prefix(client_id: str, subdir: str, file_details: dict) -> str:
  
 def _list_parquet_keys(prefix: str, file_id: str) -> list[str]:
     """
-    List S3 keys of parquet files under prefix whose filename starts with file_id.
- 
-    Paginates automatically and returns results sorted by filename.
+    Lista los S3 keys de Parquets bajo prefix cuyo nombre de archivo empieza
+    con file_id, paginando automáticamente.
+
+    Args:
+        prefix: Prefix de S3 donde buscar.
+        file_id: Prefijo del nombre de archivo a filtrar.
+
+    Returns:
+        Lista de keys que matchean, ordenada por nombre de archivo.
+
+    Ejemplo:
+        _list_parquet_keys("SBSA/MC/300_IPM_1240_EXT/file_type=IN/date=2026-02-18/", "DD9D...")
     """
     keys: list[str] = []
     paginator = S3.get_paginator("list_objects_v2")
@@ -726,17 +888,45 @@ def _list_parquet_keys(prefix: str, file_id: str) -> list[str]:
  
  
 def _read_parquet(key: str) -> pd.DataFrame:
-    """Download a parquet file from S3 and return it as a DataFrame."""
+    """
+    Descarga un Parquet de S3 y lo devuelve como DataFrame de pandas.
+
+    Args:
+        key: S3 key del Parquet a leer.
+
+    Returns:
+        DataFrame con el contenido del Parquet.
+
+    Ejemplo:
+        _read_parquet("SBSA/MC/300_IPM_1240_EXT/.../x.parquet")
+    """
     body = S3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
     return pd.read_parquet(io.BytesIO(body))
 
 
 def _align_df_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
     """
-    Select schema columns from df, coerce pandas dtypes to match Arrow types,
-    and return a pa.Table ready for ParquetWriter.write_table().
+    Selecciona las columnas del schema desde df, coacciona los dtypes de
+    pandas para que coincidan con los tipos Arrow, y devuelve una pa.Table
+    lista para ParquetWriter.write_table().
 
-    Called once per batch in the iter_batches loop — stateless and row-independent.
+    Se llama una vez por batch dentro del loop de iter_batches — sin estado,
+    independiente entre filas. Las columnas del schema ausentes en el chunk
+    actual (ej. un padre PDS que fue null en todas las filas de este Parquet
+    pero presente en uno anterior que armó el schema) se rellenan con nulls,
+    para que el schema se mantenga consistente entre todos los archivos de
+    salida.
+
+    Args:
+        df: DataFrame ya casteado (salida de _cast_df).
+        schema: Schema Arrow objetivo (de _build_arrow_schema).
+
+    Returns:
+        pa.Table con exactamente las columnas del schema, en su orden, y
+        tipos coaccionados (string/int64/int32/date32 según el campo).
+
+    Ejemplo:
+        _align_df_to_schema(df_cast, schema)
     """
     schema_cols = [f.name for f in schema]
     df_aligned = df[[c for c in schema_cols if c in df.columns]].copy()
@@ -766,10 +956,22 @@ def _align_df_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
 
 def _write_parquet_with_schema(df: pd.DataFrame, key: str, schema: pa.Schema) -> None:
     """
-    Serialise a DataFrame as parquet using a PyArrow schema and upload it to S3.
+    Serializa un DataFrame completo como Parquet usando un schema PyArrow y
+    lo sube a S3 (escritura no incremental — usada solo fuera del hot path
+    principal, que escribe con ParquetWriter en streaming). Solo se escriben
+    las columnas presentes tanto en df como en schema, garantizando un
+    archivo de salida schema-conformante.
 
-    Only columns present in both df and schema are written, guaranteeing a
-    schema-conformant output file.
+    Args:
+        df: DataFrame a escribir.
+        key: S3 key de destino.
+        schema: Schema Arrow a aplicar.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _write_parquet_with_schema(df, "SBSA/MC/400_IPM_1240_CLN/.../x.parquet", schema)
     """
     buf = io.BytesIO()
     pq.write_table(_align_df_to_schema(df, schema), buf, compression="snappy")
@@ -781,13 +983,27 @@ def _target_key(
     raw_key: str, target_prefix: str, mti: str, fc: str | None = None
 ) -> str:
     """
-    Derive the destination S3 key from the source key.
- 
-    Output filename:
-    - MTI 1644 with FC  →  {md5}_{file_idn}_{mti}_{fc}.parquet
-    - All others        →  {md5}_{file_idn}_{mti}.parquet
- 
-    Raises ValueError if the source filename does not match the expected pattern.
+    Deriva el S3 key de destino a partir del key de origen, cambiando el
+    nombre de archivo según el patrón esperado:
+      - MTI 1644 con Function Code (fuera de RAW): {md5}_{file_idn}_{mti}_{fc}.parquet
+      - Resto de los casos:                        {md5}_{file_idn}_{mti}.parquet
+
+    Args:
+        raw_key: S3 key de origen (dentro de una carpeta *_EXT).
+        target_prefix: Prefix de destino (carpeta *_CLN).
+        mti: MTI del archivo, ej. "1240" o "1644".
+        fc: Function Code (solo relevante para MTI 1644 fuera de RAW).
+
+    Returns:
+        S3 key completo de destino.
+
+    Raises:
+        ValueError: si el stem del archivo de origen no matchea ninguno de
+            los 2 patrones esperados.
+
+    Ejemplo:
+        _target_key("SBSA/MC/300_IPM_1644_EXT/.../HASH_FILEIDN25CHARS_1644_685.parquet",
+                    "SBSA/MC/400_IPM_1644_CLN/.../", mti="1644", fc="685")
     """
     stem = Path(raw_key).stem
     has_raw = any("raw" in part.lower() for part in raw_key.split("/"))
@@ -826,13 +1042,30 @@ def _clean_1644(
     content_hash: str = "",
 ) -> None:
     """
-    Clean MTI 1644 extracted parquet files.
- 
-    For each file: derive FC → skip unsupported FCs → read parquet → cast columns
-    → build Arrow schema → write cleaned parquet to S3 → free memory.
- 
-    The Arrow schema is rebuilt per file because different FCs can produce
-    different column sets.
+    Limpia y estandariza los Parquets MTI 1644 de un archivo, uno por
+    Function Code. Por cada Parquet: deriva el FC del nombre de archivo,
+    descarta FCs no soportados (VALID_FC_1644), procesa en streaming
+    (iter_batches), castea columnas (_cast_df) y escribe el resultado a
+    400_IPM_1644_CLN/{fc}.parquet.
+
+    El schema Arrow se reconstruye por archivo (no se reutiliza entre FCs)
+    porque cada Function Code puede producir un conjunto de columnas
+    distinto.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        origin_sub_dir: Subdirectorio de origen (default: "300_IPM_1644_EXT").
+        target_sub_dir: Subdirectorio de destino (default: "400_IPM_1644_CLN").
+        content_hash: MD5 del archivo origen (no usado directamente en esta
+            función — ya viene propagado como columna desde extract).
+
+    Returns:
+        None — escribe los Parquets limpios directamente a S3.
+
+    Ejemplo:
+        _clean_1644("SBSA", "DD9D...", file_details)
     """
     origin_prefix = _s3_prefix(client_id, origin_sub_dir, file_details)
     target_prefix = _s3_prefix(client_id, target_sub_dir, file_details)
@@ -913,14 +1146,39 @@ def _clean_standard(
     content_hash: str = "",
 ) -> None:
     """
-    Shared clean pipeline for MTIs 1240, 1442, and 1740.
- 
-    For each file: read parquet → cast columns → write cleaned parquet to S3
-    → free memory.
- 
-    The Arrow schema is built from the first file and reused for all subsequent
-    files in the batch, since all files within the same MTI share the same
-    column structure.
+    Pipeline de limpieza compartido para los MTIs 1240, 1442 y 1740. Por cada
+    Parquet del archivo: procesa en streaming (iter_batches), castea columnas
+    (_cast_df) y escribe el resultado a {target_sub_dir}/.
+
+    El schema Arrow se construye desde el primer batch del primer archivo y
+    se reutiliza para todos los archivos siguientes del mismo MTI dentro de
+    la misma invocación, ya que todos comparten la misma estructura de
+    columnas.
+
+    Args:
+        mti: MTI a procesar, ej. "1240".
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        origin_sub_dir: Subdirectorio de origen, ej. "300_IPM_1240_EXT".
+        target_sub_dir: Subdirectorio de destino, ej. "400_IPM_1240_CLN".
+        date_format: Formato strptime para columnas date (default: "%y%m%d").
+        timestamp_format: Formato strptime para columnas timestamp (default:
+            "%y%m%d%H%M%S").
+        field_defs_tag: Llave de caché para _load_field_defs ("default" o
+            "with_file_cols").
+        with_file_cols: Si True, agrega las columnas de metadata a nivel de
+            archivo al layout base (1240/1442).
+        content_hash: MD5 del archivo origen (no usado directamente en esta
+            función — ya viene propagado como columna desde extract).
+
+    Returns:
+        None — escribe los Parquets limpios directamente a S3.
+
+    Ejemplo:
+        _clean_standard("1240", "SBSA", "DD9D...", file_details,
+                         "300_IPM_1240_EXT", "400_IPM_1240_CLN",
+                         field_defs_tag="with_file_cols", with_file_cols=True)
     """
     origin_prefix = _s3_prefix(client_id, origin_sub_dir, file_details)
     target_prefix = _s3_prefix(client_id, target_sub_dir, file_details)
@@ -997,7 +1255,21 @@ def _clean_standard(
  
  
 def _clean_1240(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
-    """Clean MTI 1240: 300_IPM_1240_EXT → 400_IPM_1240_CLN."""
+    """
+    Wrapper de _clean_standard para MTI 1240: 300_IPM_1240_EXT → 400_IPM_1240_CLN.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        content_hash: MD5 del archivo origen.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _clean_1240("SBSA", "DD9D...", file_details)
+    """
     _clean_standard(
         "1240",
         client_id,
@@ -1012,7 +1284,21 @@ def _clean_1240(client_id: str, file_id: str, file_details: dict, content_hash: 
  
  
 def _clean_1442(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
-    """Clean MTI 1442: 300_IPM_1442_EXT → 400_IPM_1442_CLN."""
+    """
+    Wrapper de _clean_standard para MTI 1442: 300_IPM_1442_EXT → 400_IPM_1442_CLN.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        content_hash: MD5 del archivo origen.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _clean_1442("SBSA", "DD9D...", file_details)
+    """
     _clean_standard(
         "1442",
         client_id,
@@ -1027,7 +1313,21 @@ def _clean_1442(client_id: str, file_id: str, file_details: dict, content_hash: 
  
  
 def _clean_1740(client_id: str, file_id: str, file_details: dict, content_hash: str = "") -> None:
-    """Clean MTI 1740: 300_IPM_1740_EXT → 400_IPM_1740_CLN."""
+    """
+    Wrapper de _clean_standard para MTI 1740: 300_IPM_1740_EXT → 400_IPM_1740_CLN.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_details: Dict con brand_id, file_type, file_processing_date.
+        content_hash: MD5 del archivo origen.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _clean_1740("SBSA", "DD9D...", file_details)
+    """
     _clean_standard(
         "1740",
         client_id,
@@ -1060,13 +1360,22 @@ CLEANS: dict[str, Any] = {
  
 def _build_outputs_for_stepfunction(s3_urls: list[str]) -> list[dict]:
     """
-    Convert the list of full S3 URLs written during cleaning into the
-    structured array consumed by downstream Step Functions states.
- 
-    Input:  ["s3://bucket/SBSA/MC/400_IPM_1240_CLN/file_type=IN/date=.../xxx.parquet", ...]
-    Output: [{"mti": "1240", "s3_key": "SBSA/MC/400_IPM_1240_CLN/file_type=IN/date=.../xxx.parquet"}, ...]
- 
-    Mirrors mc_extract._build_outputs_for_stepfunction exactly.
+    Convierte la lista de URLs S3 completas escritas durante la limpieza en
+    el array estructurado que consumen los estados downstream de Step
+    Functions. Replica exactamente la lógica de
+    mc_extract._build_outputs_for_stepfunction.
+
+    Args:
+        s3_urls: Lista de URLs completas ("s3://bucket/key") de los Parquets
+            escritos.
+
+    Returns:
+        Lista de dicts {"mti": ..., "s3_key": ...}, con "mti"="UNKNOWN" si el
+        path no matchea el patrón esperado.
+
+    Ejemplo:
+        _build_outputs_for_stepfunction(["s3://bucket/SBSA/MC/400_IPM_1240_CLN/.../x.parquet"])
+        # [{'mti': '1240', 's3_key': 'SBSA/MC/400_IPM_1240_CLN/.../x.parquet'}]
     """
     result: list[dict] = []
     for url in s3_urls:
@@ -1090,57 +1399,74 @@ def _build_outputs_for_stepfunction(s3_urls: list[str]) -> list[dict]:
  
 def lambda_handler(event: dict, context: Any) -> dict:
     """
-    AWS Lambda entry point for the Mastercard clean stage.
- 
-    Receives the full Step Functions state as the event payload
-    (``Payload.$: "$"``).  Identity fields (client_id, file_id, …) are
-    present at the event root level; the extract outputs that drive MTI
-    detection live under ``$.clean_input.outputs`` as a list of
-    ``{"mti": "...", "s3_key": "..."}`` objects — the same structure that
-    mc_extract.py produces.
- 
-    Input event (flat, Step Functions contract)
-    -------------------------------------------
-    {
-        "client_id":    "SBSA",
-        "file_id":      "DD9D...",
-        "brand":        "MASTERCARD",
-        "brand_id":     "MC",
-        "file_type":    "IN",
-        "file_date":    "2026-02-18",
-        "content_hash": "...",
-        "filename":     "...",
-        "clean_input": {
+    Punto de entrada de la Lambda lmbd-mc-clean. Invocada por la Step
+    Function Mastercard tras lmbd-mc-extract. Recibe el estado completo de
+    Step Functions como payload (Payload.$: "$") — los campos de identidad
+    (client_id, file_id, ...) están en la raíz del evento, y los outputs de
+    extract que determinan qué MTIs procesar viven bajo
+    $.clean_input.outputs (misma estructura que produce mc_extract.py).
+    Deriva los MTIs a procesar desde esos outputs (fallback: todos los MTIs
+    registrados en CLEANS si no se puede derivar ninguno), arma file_details
+    directamente desde el evento (sin round-trip a DynamoDB), ejecuta el
+    clean de cada MTI con la función registrada en CLEANS, y recolecta los
+    paths reales escritos a 400_IPM_*_CLN para construir el payload de
+    salida — mismo contrato que mc_extract.py.
+
+    Args:
+        event: Payload de Step Functions con client_id, file_id, brand,
+            brand_id, file_type, file_date, content_hash, filename, y
+            clean_input.outputs (lista de outputs de extract):
+            ```
+            {
+                "client_id":    "SBSA",
+                "file_id":      "DD9D...",
+                "brand":        "MASTERCARD",
+                "brand_id":     "MC",
+                "file_type":    "IN",
+                "file_date":    "2026-02-18",
+                "content_hash": "...",
+                "filename":     "...",
+                "clean_input": {
+                    "outputs": [
+                        {"mti": "1240", "s3_key": "SBSA/MC/300_IPM_1240_EXT/…parquet"},
+                        {"mti": "1644", "s3_key": "SBSA/MC/300_IPM_1644_EXT/…parquet"},
+                        ...
+                    ],
+                    ...
+                },
+                ...
+            }
+            ```
+        context: Contexto de ejecución de Lambda; se usa
+            context.aws_request_id para logging.
+
+    Returns:
+        Dict con status ("SUCCESS" si se escribió al menos un output, "ERROR"
+        si no), total_outputs, total_records (siempre 0), outputs (lista
+        {"mti", "s3_key"} de los Parquets escritos) y los campos de identidad
+        heredados del evento. Lanza ValueError si falta S3_BUCKET,
+        client_id/file_id, o no se pudo derivar ningún MTI a procesar.
+        Ejemplo:
+        ```
+        {
+            "status":        "SUCCESS",
+            "total_outputs": <int>,
+            "total_records": 0,
             "outputs": [
-                {"mti": "1240", "s3_key": "SBSA/MC/300_IPM_1240_EXT/…parquet"},
-                {"mti": "1644", "s3_key": "SBSA/MC/300_IPM_1644_EXT/…parquet"},
+                {"mti": "1240", "s3_key": "SBSA/MC/400_IPM_1240_CLN/…parquet"},
+                {"mti": "1644", "s3_key": "SBSA/MC/400_IPM_1644_CLN/…parquet"},
                 ...
             ],
-            ...
-        },
-        ...
-    }
- 
-    Return (flat dict — aligned with mc_extract.py contract)
-    ---------------------------------------------------------
-    {
-        "status":        "SUCCESS" | "ERROR",
-        "total_outputs": <int>,
-        "total_records": 0,
-        "outputs": [
-            {"mti": "1240", "s3_key": "SBSA/MC/400_IPM_1240_CLN/…parquet"},
-            {"mti": "1644", "s3_key": "SBSA/MC/400_IPM_1644_CLN/…parquet"},
-            ...
-        ],
-        "client_id":     "SBSA",
-        "file_id":       "DD9D...",
-        "brand":         "MASTERCARD",
-        "brand_id":      "MC",
-        "file_type":     "IN",
-        "file_date":     "2026-02-18",
-        "content_hash":  "...",
-        "filename":      "...",
-    }
+            "client_id": "SBSA", "file_id": "DD9D...", "brand": "MASTERCARD",
+            "brand_id": "MC", "file_type": "IN", "file_date": "2026-02-18",
+            "content_hash": "...", "filename": "...",
+        }
+        ```
+
+    Ejemplo:
+        lambda_handler({'client_id': 'SBSA', 'file_id': 'DD9D...', 'brand_id': 'MC',
+                         'file_type': 'IN', 'file_date': '2026-02-18',
+                         'clean_input': {'outputs': [...]}}, context)
     """
     log.info("REQUEST_ID=%s", context.aws_request_id)
     log.info("EVENT=%s", json.dumps(event))

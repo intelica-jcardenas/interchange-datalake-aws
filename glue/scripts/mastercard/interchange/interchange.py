@@ -1,3 +1,68 @@
+"""
+interchange.py — Job real: itl-0004-itx-dev-intchg-02-glue-mc-interchange
+================================================================================
+Archivo:     glue/scripts/mastercard/interchange/interchange.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/mastercard/interchange.py
+
+Sexta etapa del pipeline Mastercard. Asigna tarifas IAR a las transacciones
+de los MTIs 1240 y 1442 (los MTIs 1644/1740 no tienen lógica de
+interchange, se excluyen explícitamente en main() — ver decisions.md →
+"Por qué mc-interchange NO contrasta contra MTI 1644"). Lee CLN
+(400_IPM_{mti}_CLN) + CAL (500_IPM_{mti}_CAL) + datos de referencia S3
+(currency/, exchange-rates-glue/, mc_rules/), evalúa el motor de reglas
+IAR contra cada transacción y calcula el fee resultante. Escribe a
+600_IPM_{mti}_ITX/, un único Parquet consolidado por archivo TXN/CAL
+(coalesce(1) + copia del part-file — ver write_single_parquet()).
+
+Motor de reglas (assign_rules_simple): en vez de un join naive contra
+todas las reglas activas, primero reduce mc_rules al universo necesario
+(prefilter_rules_needed — por jurisdiction/ird/vigencia), rankea las
+reglas candidatas por (region_country_code, intelica_id) con una llave
+determinística (rule_key, vía row_number sobre una Window ordenada — NO
+monotonically_increasing_id(), que es inestable entre shuffles, ver
+gotchas.md → "glue-mc-interchange: monotonically_increasing_id() inestable
+entre shuffles"), aplica un conjunto de condiciones simples (exact match,
+listas separadas por coma, rangos "100-200", negación "NOT:...", más una
+condición especial de monto con comparadores >=/<=/>/</=/between) y se
+queda con la regla de menor rule_key por transacción
+(Window.partitionBy(file_id, file_idn, ref_id) — llave de negocio estable,
+no un ID sintético).
+
+Cálculo del fee (calculate_mastercard_fee_pyspark): calculated_fee siempre
+queda en la moneda de la transacción (DE_49, trx_ccy) — rate_fixed/
+rate_min/rate_cap se convierten primero desde rate_currency (moneda de la
+regla IAR) a trx_ccy vía el tipo de cambio de exchange-rates-glue/, y
+luego fee = rate_variable * amount_trx + rate_fixed_trx, acotado entre
+[rate_min_trx, rate_cap_trx].
+
+Flujo (main → run_interchange_mti, por cada MTI transaccional en outputs):
+1. Listar los Parquets CLN/CAL del file_id (filtrados por prefijo, para no
+   reprocesar ejecuciones anteriores en la misma partición — ver gotcha
+   "glue-mc-interchange: filtra por file_id...")
+2. Por cada par TXN/CAL con el mismo stem: build_pre_eval_pyspark (join
+   TXN+CAL, resolución de tipos de cambio dinámicos por moneda objetivo)
+3. assign_rules_simple: asignar la regla IAR de mayor prioridad que
+   matchea
+4. calculate_mastercard_fee_pyspark: calcular el fee en trx_ccy
+5. Escribir el resultado final a 600_IPM_{mti}_ITX/
+
+Job Parameters:
+  --JOB_NAME               nombre del Glue Job
+  --S3_STAGING             s3://itl-0004-itx-dev-intchg-02-s3-staging
+  --S3_REFERENCE           s3://itl-0004-itx-dev-intchg-02-s3-reference
+  --client_id              ID del cliente (ej: "SBSA")
+  --file_id                ID del archivo (ej: "ABC123XYZ...")
+  --file_type              IN | OUT
+  --file_date              YYYY-MM-DD (fecha del archivo)
+  --outputs                JSON: [{"mti":"1240","s3_key":"staging/…"}, …]
+  --dynamodb_table_fields  tabla DynamoDB de campos Mastercard (layout CLN)
+
+Nota: aunque no está en la lista de argumentos requeridos, el ASL de
+itl-0004-itx-dev-intchg-02-sfn-mc también pasa --content_hash a este job;
+Glue lo ignora porque no está declarado en getResolvedOptions — ver
+decisions.md → "Caso particular — glue-mc-interchange recibe
+--content_hash pero no lo usa".
+"""
 import json
 import os
 import sys
@@ -34,6 +99,19 @@ from pyspark.sql.types import (
 )
  
 def log(msg: str) -> None:
+    """
+    Loguea un mensaje con el prefijo [ITX_MC_1240] a stdout (capturado por
+    CloudWatch vía el logging de Glue).
+
+    Args:
+        msg: Mensaje a loguear.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        log("Starting interchange job")
+    """
     print(f"[ITX_MC_1240] {msg}", flush=True)
 
 
@@ -42,12 +120,41 @@ def log(msg: str) -> None:
 # =============================================================================
  
 def normalize_s3(path: str) -> str:
+    """
+    Normaliza un URI "s3a://" a "s3://" (boto3 solo entiende "s3://";
+    "s3a://" es el esquema que usa Spark/Hadoop).
+
+    Args:
+        path: URI a normalizar.
+
+    Returns:
+        URI con el esquema "s3://", o el mismo path sin cambios si no
+        empezaba con "s3a://".
+
+    Ejemplo:
+        normalize_s3("s3a://bucket/key")  # "s3://bucket/key"
+    """
     if path.startswith("s3a://"):
         return "s3://" + path[len("s3a://"):]
     return path
  
  
 def parse_s3_uri(uri: str) -> Tuple[str, str]:
+    """
+    Separa un URI S3 en (bucket, key).
+
+    Args:
+        uri: URI S3 completo ("s3://" o "s3a://").
+
+    Returns:
+        Tupla (bucket, key).
+
+    Raises:
+        ValueError: si el URI no es un path S3 válido.
+
+    Ejemplo:
+        parse_s3_uri("s3://bucket/path/to/file.parquet")  # ("bucket", "path/to/file.parquet")
+    """
     uri = normalize_s3(uri)
     if not uri.startswith("s3://"):
         raise ValueError(f"Ruta no S3: {uri}")
@@ -57,6 +164,22 @@ def parse_s3_uri(uri: str) -> Tuple[str, str]:
  
  
 def list_s3_parquets(prefix_uri: str, region_name: str) -> List[str]:
+    """
+    Lista todos los archivos .parquet bajo un prefix S3, paginando
+    automáticamente.
+
+    Args:
+        prefix_uri: URI del prefix a listar ("s3://" o "s3a://" — el esquema
+            de los resultados respeta el del prefix recibido).
+        region_name: Región AWS del bucket.
+
+    Returns:
+        Lista de URIs completos ("{scheme}://{bucket}/{key}") de los
+        Parquets encontrados, ordenada alfabéticamente.
+
+    Ejemplo:
+        list_s3_parquets("s3://bucket/SBSA/MC/400_IPM_1240_CLN/file_type=IN/date=2026-02-18/", "eu-south-2")
+    """
     bucket, prefix = parse_s3_uri(prefix_uri)
     s3 = boto3.client("s3", region_name=region_name)
     paginator = s3.get_paginator("list_objects_v2")
@@ -72,6 +195,19 @@ def list_s3_parquets(prefix_uri: str, region_name: str) -> List[str]:
  
  
 def stem_from_uri(uri: str) -> str:
+    """
+    Extrae el nombre de archivo sin extensión (stem) de un URI/path.
+
+    Args:
+        uri: URI o path del archivo.
+
+    Returns:
+        Stem del archivo (sin directorio ni extensión).
+
+    Ejemplo:
+        stem_from_uri("s3://bucket/.../HASH_FILEIDN25CHARS_1240.parquet")
+        # "HASH_FILEIDN25CHARS_1240"
+    """
     return Path(uri.rstrip("/").split("/")[-1]).stem
  
  
@@ -80,6 +216,19 @@ def stem_from_uri(uri: str) -> str:
 # =============================================================================
  
 def _clean_scalar(value: Any) -> Any:
+    """
+    Convierte un valor Decimal de DynamoDB a int (si es un entero exacto) o
+    float. Cualquier otro tipo se devuelve sin cambios.
+
+    Args:
+        value: Valor a convertir.
+
+    Returns:
+        int, float, o el valor original sin cambios si no es Decimal.
+
+    Ejemplo:
+        _clean_scalar(Decimal('4.0'))  # 4
+    """
     if isinstance(value, Decimal):
         if value % 1 == 0:
             return int(value)
@@ -88,6 +237,22 @@ def _clean_scalar(value: Any) -> Any:
  
  
 def load_layout_from_dynamo(table_name: str, region_name: str) -> List[Dict[str, Any]]:
+    """
+    Escanea completa una tabla DynamoDB de layout de campos (mastercard_fields)
+    y devuelve sus items, con los valores Decimal ya normalizados a
+    int/float.
+
+    Args:
+        table_name: Nombre de la tabla DynamoDB a escanear.
+        region_name: Región AWS de la tabla.
+
+    Returns:
+        Lista de dicts, uno por item de la tabla (columnas como column_name,
+        data_type, length, float_decimals, etc.).
+
+    Ejemplo:
+        load_layout_from_dynamo("itl-0004-itx-dev-dynamo-mastercard_fields-02", "eu-south-2")
+    """
     log(f"[DYNAMO] loading layout table={table_name} region={region_name}")
  
     dynamodb = boto3.resource("dynamodb", region_name=region_name)
@@ -111,6 +276,30 @@ def load_layout_from_dynamo(table_name: str, region_name: str) -> List[Dict[str,
  
  
 def spark_type_from_layout(data_type: Any, length: Any = None, float_decimals: Any = None):
+    """
+    Traduce un data_type declarado en DynamoDB (string, int64, decimal, date,
+    timestamp, etc.) al tipo Spark SQL correspondiente.
+
+    Para decimal, deriva precisión y escala de length/float_decimals con
+    límites de seguridad (precisión máxima 38, y se amplía si scale >=
+    precision para evitar un DecimalType inválido).
+
+    Args:
+        data_type: Tipo declarado en DynamoDB (case-insensitive), ej.
+            "decimal", "int64", "string".
+        length: Longitud del campo, usada como precisión para decimal.
+        float_decimals: Cantidad de decimales, usada como escala para
+            decimal.
+
+    Returns:
+        Instancia de tipo Spark SQL (StringType, LongType, DoubleType,
+        DecimalType, DateType, TimestampType). Cualquier data_type no
+        reconocido cae a StringType.
+
+    Ejemplo:
+        spark_type_from_layout("decimal", length=10, float_decimals=4)
+        # DecimalType(10, 4)
+    """
     dt = str(data_type or "").strip().lower()
  
     if dt in {"string", "str", "varchar", "char"}:
@@ -156,6 +345,29 @@ def spark_type_from_layout(data_type: Any, length: Any = None, float_decimals: A
  
  
 def build_schema_from_layout(items: Iterable[Dict[str, Any]]) -> StructType:
+    """
+    Construye un StructType de Spark a partir de los items de layout de
+    DynamoDB, uno por column_name (duplicados de nombre se deduplican,
+    gana el último visto).
+
+    Fuerza date_and_time_local_transaction_de_12 a LongType en vez del tipo
+    que indicaría su data_type declarado — evita el error "Illegal Parquet
+    type: INT64 (TIMESTAMP(NANOS,false))" al leer con Spark, ya que ese
+    timestamp está escrito en nanosegundos y Spark no puede inferirlo
+    directamente; se lee como entero crudo y se deriva la fecha después (ver
+    derive_txn_date()). También agrega file_id/ref_id/file_idn como campos
+    técnicos mínimos si no vinieran ya en el layout, necesarios para los
+    joins entre CLN/CAL.
+
+    Args:
+        items: Lista de items de layout (de load_layout_from_dynamo).
+
+    Returns:
+        StructType con un StructField por column_name único.
+
+    Ejemplo:
+        build_schema_from_layout(layout_items)
+    """
     fields_by_name: Dict[str, StructField] = {}
  
     for item in items:
@@ -199,6 +411,22 @@ def build_schema_from_layout(items: Iterable[Dict[str, Any]]) -> StructType:
 # =============================================================================
  
 def read_parquet(spark: SparkSession, path: str, name: str) -> DataFrame:
+    """
+    Lee un directorio Parquet desde S3 sin schema explícito (Spark infiere
+    desde los datos). Usado para tablas de referencia (currency, mc_rules) y
+    CAL.
+
+    Args:
+        spark: Sesión de Spark activa.
+        path: Path S3 al directorio Parquet.
+        name: Nombre descriptivo de la fuente, solo para logging.
+
+    Returns:
+        DataFrame con el contenido del directorio.
+
+    Ejemplo:
+        read_parquet(spark, f"{s3_reference}/currency/", "REF currency")
+    """
     log(f"[READ] {name}: {path}")
     return spark.read.option("mergeSchema", "false").parquet(path)
 
@@ -235,6 +463,23 @@ def read_exchange_rates_glue(spark: SparkSession, s3_reference: str, brand: str,
 
  
 def read_txn_with_layout(spark: SparkSession, path: str, schema: StructType) -> DataFrame:
+    """
+    Lee el Parquet CLN de un MTI transaccional (1240/1442) con el schema
+    explícito derivado del layout de DynamoDB (build_schema_from_layout), en
+    vez de dejar que Spark infiera — evita el error de TIMESTAMP(NANOS) (ver
+    build_schema_from_layout).
+
+    Args:
+        spark: Sesión de Spark activa.
+        path: Path S3 al Parquet CLN a leer.
+        schema: Schema Spark ya construido (de build_schema_from_layout).
+
+    Returns:
+        DataFrame con el schema explícito aplicado.
+
+    Ejemplo:
+        read_txn_with_layout(spark, txn_path, txn_schema)
+    """
     log(f"[READ] TXN 1240 CLN with Dynamo schema: {path}")
     return (
         spark.read
@@ -245,6 +490,24 @@ def read_txn_with_layout(spark: SparkSession, path: str, schema: StructType) -> 
  
  
 def derive_txn_date(df: DataFrame, col_name: str):
+    """
+    Deriva una columna de fecha a partir de date_and_time_local_transaction,
+    que en el schema explícito quedó como LongType (nanosegundos desde
+    epoch) en vez de TimestampType — ver build_schema_from_layout().
+
+    Args:
+        df: DataFrame que contiene la columna.
+        col_name: Nombre de la columna (típicamente
+            "date_and_time_local_transaction").
+
+    Returns:
+        Expresión de columna DATE: si el dtype físico es bigint/long, la
+        interpreta como nanosegundos epoch y convierte; si ya es un tipo
+        fecha/timestamp, simplemente la castea con to_date().
+
+    Ejemplo:
+        work.withColumn("txn_date", derive_txn_date(work, "date_and_time_local_transaction"))
+    """
     dtype = dict(df.dtypes).get(col_name)
  
     if dtype in {"bigint", "long"}:
@@ -272,8 +535,43 @@ def build_pre_eval_pyspark(
     df_rules: DataFrame,
 ) -> DataFrame:
     """
+    Construye el DataFrame base de evaluación (PRE_EVAL) para un par TXN/CAL:
+    une CLN (schema explícito, ver read_txn_with_layout) con CAL por
+    (file_id, ref_id, file_idn), deriva txn_date, resuelve la moneda alfa de
+    la transacción por join contra currency, y normaliza todos los campos que
+    usará el motor de reglas (issuer_bin_8, acquirer_bin, jurisdiction, ird,
+    processing_code, etc.) con un fallback "BLANK" cuando el valor es null.
+
     Se lee TXN con schema Dynamo para evitar:
       Illegal Parquet type: INT64 (TIMESTAMP(NANOS,false))
+
+    Adicionalmente, resuelve el monto de la transacción convertido a cada
+    moneda de referencia que necesitan las reglas de monto (amount_transaction
+    en df_rules) — por cada moneda objetivo detectada dinámicamente, agrega
+    una columna amount_transaction_{ccy} con el monto ya convertido vía
+    exchange-rates-glue/, para que _amount_rule_condition() pueda evaluar
+    condiciones de monto en la moneda que la regla especifique.
+
+    Args:
+        spark: Sesión de Spark activa.
+        txn_path: Path S3 al Parquet CLN del MTI (par actual).
+        calc_path: Path S3 al Parquet CAL del MTI (par actual).
+        txn_schema: Schema explícito para leer TXN (de
+            build_schema_from_layout).
+        df_currency: DataFrame de referencia currency (código↔alfa).
+        df_exchange_rate: DataFrame de tipos de cambio (exchange-rates-glue,
+            ya filtrado/normalizado por read_exchange_rates_glue).
+        df_rules: DataFrame de reglas IAR (mc_rules), usado solo para
+            detectar qué monedas objetivo de monto se necesitan.
+
+    Returns:
+        DataFrame con una fila por transacción, listo para
+        assign_rules_simple().
+
+    Ejemplo:
+        build_pre_eval_pyspark(spark=spark, txn_path=txn_path, calc_path=calc_path,
+                                txn_schema=txn_schema, df_currency=df_currency,
+                                df_exchange_rate=df_exchange_rate, df_rules=df_rules)
     """
  
     txn = read_txn_with_layout(spark, txn_path, txn_schema).select(
@@ -420,16 +718,47 @@ def build_pre_eval_pyspark(
 
 
 def _blank_rule_condition(rule_col: str):
+    """
+    Determina si una columna de regla está "en blanco" (null, o su
+    representación string normalizada es "", "none", "nan" o "null") — una
+    regla en blanco no restringe el matching para ese campo.
+
+    Args:
+        rule_col: Nombre de la columna de regla a evaluar (referenciada como
+            columna Spark, ej. "r.processing_code").
+
+    Returns:
+        Expresión de columna booleana.
+
+    Ejemplo:
+        _blank_rule_condition("r.processing_code")
+    """
     s = F.lower(F.trim(F.col(rule_col).cast("string")))
     return F.col(rule_col).isNull() | s.isin("", "none", "nan", "null")
 
 
 def _norm_col(col_expr):
+    """
+    Normaliza una expresión de columna para comparación: recorta espacios,
+    elimina espacios internos, y pasa a mayúsculas.
+
+    Args:
+        col_expr: Expresión de columna Spark a normalizar.
+
+    Returns:
+        Expresión de columna normalizada.
+
+    Ejemplo:
+        _norm_col(F.col("processing_code"))  # "00" para " 00 "
+    """
     return F.upper(F.regexp_replace(F.trim(col_expr.cast("string")), " ", ""))
 
  
 def _simple_rule_condition(rule_col: str, work_col: str):
     """
+    Construye la condición de matching de un campo "simple" entre una regla y
+    el valor de la transacción.
+
     Soporta:
       - vacío/null => no restringe
       - A
@@ -441,6 +770,20 @@ def _simple_rule_condition(rule_col: str, work_col: str):
       - mezcla:
             00,20,40-49
             NOT:100-200,300,500-600
+
+    Args:
+        rule_col: Nombre de la columna en la regla (alias "r"), ej.
+            "processing_code".
+        work_col: Nombre de la columna equivalente en la transacción (alias
+            "w"), ej. "processing_code".
+
+    Returns:
+        Expresión de columna booleana: True si la regla está en blanco, o si
+        el valor de la transacción matchea alguno de los tokens (o ninguno,
+        si la regla usa NOT:).
+
+    Ejemplo:
+        _simple_rule_condition("processing_code", "processing_code")
     """
  
     raw = _norm_col(F.col(f"r.{rule_col}"))
@@ -463,6 +806,18 @@ def _simple_rule_condition(rule_col: str, work_col: str):
  
     def token_match(token_col):
  
+        """
+        Evalúa si el valor de la transacción matchea un token individual de la
+        regla — por igualdad exacta, o por pertenencia a un rango numérico
+        "low-high" si el token contiene un guión.
+
+        Args:
+            token_col: Expresión de columna con un token individual (ya
+                explotado de la lista separada por coma).
+
+        Returns:
+            Expresión de columna booleana.
+        """
         is_range = token_col.contains("-")
  
         start_val = F.split(token_col, "-").getItem(0)
@@ -508,6 +863,11 @@ def _simple_rule_condition(rule_col: str, work_col: str):
  
 def _amount_rule_condition(work_columns):
     """
+    Construye la condición de matching para reglas de monto de transacción
+    (amount_transaction), evaluada en la moneda que la propia regla
+    especifica (amount_transaction_currency), usando la columna dinámica
+    amount_transaction_{moneda} ya calculada en build_pre_eval_pyspark().
+
     Soporta amount_transaction:
       - vacío/null => no restringe
       - >=10,<=20
@@ -515,10 +875,21 @@ def _amount_rule_condition(work_columns):
       - <20
       - =15
       - between10and20
- 
+
     Usa la moneda de la regla:
       amount_transaction_currency = USD
       busca columna amount_transaction_usd
+
+    Args:
+        work_columns: Nombres de columna disponibles en el DataFrame de
+            transacciones (work.columns), para localizar las columnas
+            amount_transaction_{moneda} dinámicas.
+
+    Returns:
+        Expresión de columna booleana.
+
+    Ejemplo:
+        _amount_rule_condition(work.columns)
     """
  
     raw_amount = F.trim(F.col("r.amount_transaction").cast("string"))
@@ -583,10 +954,26 @@ def _amount_rule_condition(work_columns):
  
 def prefilter_rules_needed(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame:
     """
+    Reduce mc_rules al universo necesario antes del join principal, para no
+    evaluar reglas irrelevantes a gran escala.
+
     Reduce mc_rules al universo necesario:
       - region_country_code = jurisdiction
       - ird
       - valid_from / valid_until
+
+    Args:
+        df_eval: DataFrame de transacciones (salida de
+            build_pre_eval_pyspark), usado para extraer las combinaciones
+            únicas de (jurisdiction, ird, txn_date) presentes.
+        df_rules: DataFrame completo de reglas IAR (mc_rules).
+
+    Returns:
+        Subconjunto de df_rules cuyas (region_country_code, ird, vigencia)
+        matchean al menos una combinación presente en df_eval.
+
+    Ejemplo:
+        prefilter_rules_needed(df_eval, df_rules)
     """
     work_keys = (
         df_eval
@@ -623,13 +1010,39 @@ def prefilter_rules_needed(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame
 
 def assign_rules_simple(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame:
     """
-    Motor de reglas
- 
+    Motor de reglas: asigna a cada transacción la regla IAR de mayor
+    prioridad que matchea todas sus condiciones.
+
     Incluye:
-      - prefiltro de reglas candidatas
+      - prefiltro de reglas candidatas (prefilter_rules_needed)
       - join base por jurisdiction/ird/fechas
-      - condiciones simples
+      - condiciones simples (_simple_rule_condition/_amount_rule_condition)
       - ranking legacy por region_country_code + intelica_id
+
+    La llave de ranking (rule_key) se genera con row_number() sobre una
+    Window ordenada por (region_country_code, intelica_id) — determinística y
+    estable entre shuffles, a diferencia de una versión anterior que usaba
+    monotonically_increasing_id() y producía asignaciones de fee incorrectas
+    (count/amount correctos, solo el fee mal) porque ese ID no es estable
+    entre shuffles Spark (ver gotchas.md → "glue-mc-interchange:
+    monotonically_increasing_id() inestable entre shuffles"). El join final
+    entre transacción y regla ganadora usa (file_id, file_idn, ref_id) —
+    llave de negocio estable — en vez de un ID sintético, por el mismo
+    motivo.
+
+    Args:
+        df_eval: DataFrame de transacciones (salida de
+            build_pre_eval_pyspark).
+        df_rules: DataFrame completo de reglas IAR (mc_rules).
+
+    Returns:
+        DataFrame con una fila por transacción, con la regla asignada
+        (rule, region_country_code, intelica_id, rate_currency,
+        rate_variable, rate_fixed, rate_min, rate_cap, etc.) — rule=0 y
+        demás campos de regla null si ninguna regla matcheó.
+
+    Ejemplo:
+        assign_rules_simple(df_eval, df_rules)
     """
     rules_needed = prefilter_rules_needed(df_eval, df_rules)
     rules_needed_count = rules_needed.count()
@@ -824,13 +1237,23 @@ def calculate_mastercard_fee_pyspark(
     4. Aplicar restricciones (en trx_ccy):
        fee_final = min(rate_cap_trx, max(rate_min_trx, fee))
 
-    Resultado:
+    Args:
+        df_assign: DataFrame de transacciones con regla ya asignada (salida
+            de assign_rules_simple).
+        df_exchange_rate: DataFrame de tipos de cambio (exchange-rates-glue).
+        brand_fx_eval: Marca a filtrar en df_exchange_rate (default:
+            "MASTERCARD").
 
-    - calculated_fee
-      Fee en moneda de transaccion (DE_49), listo para escribir al ITX.
-    - fx_to_trx
-      Tipo de cambio utilizado: rate_ccy -> trx_ccy.
+    Returns:
+        df_assign con 3 columnas nuevas agregadas:
+        - calculated_fee: Fee en moneda de transaccion (DE_49), listo para
+          escribir al ITX.
+        - fx_to_trx: Tipo de cambio utilizado: rate_ccy -> trx_ccy.
+        - fee_preliminary: Fee antes de aplicar rate_min/rate_cap (para
+          debugging).
 
+    Ejemplo:
+        calculate_mastercard_fee_pyspark(df_assign, df_exchange_rate)
     """
 
     # ============================================================================
@@ -978,15 +1401,49 @@ def calculate_mastercard_fee_pyspark(
 # =============================================================================
  
 def is_s3_path(path: str) -> bool:
+    """
+    Detecta si un path es una ruta S3 ("s3://" o "s3a://").
+
+    Args:
+        path: Path a evaluar.
+
+    Returns:
+        True si empieza con "s3://" o "s3a://".
+
+    Ejemplo:
+        is_s3_path("s3a://bucket/key")  # True
+    """
     return path.startswith("s3://") or path.startswith("s3a://")
  
 def write_single_parquet(df: DataFrame, final_file_path: str, region_name: str) -> None:
     """
-    Escribe un único archivo .parquet por cada par TXN/CAL.
- 
+    Escribe un único archivo .parquet por cada par TXN/CAL, en vez de la
+    carpeta con part-*.parquet que Spark produce por defecto.
+
     Nota:
       Spark siempre escribe carpetas con part-*.parquet.
       Por eso escribimos en una carpeta temporal y luego movemos/copiamos el part.
+
+    Para S3: escribe a un prefix temporal único (coalesce(1) + write), copia
+    el único part-file al key final con copy_object, y borra el prefix
+    temporal completo. Para filesystem local: mismo patrón con shutil.move.
+
+    Args:
+        df: DataFrame a escribir (se fuerza a 1 solo part-file con
+            coalesce(1)).
+        final_file_path: Path final deseado (S3 o local), incluyendo el
+            nombre de archivo ".parquet".
+        region_name: Región AWS del bucket (solo relevante si es S3).
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: si no se encuentra ningún part-file tras escribir la
+            carpeta temporal.
+
+    Ejemplo:
+        write_single_parquet(df_fee_final, final_file, aws_region)
     """
     tmp_suffix = f"_tmp_{uuid.uuid4().hex}"
  
@@ -1071,13 +1528,36 @@ def build_output_file_path(
     target_subdir: str = "600_IPM_1240_ITX_PRE_EVAL",
 ) -> str:
     """
+    Construye el path de salida para un archivo de una etapa intermedia o
+    final del job.
+
     Ruta temporal para validar PRE_EVAL.
- 
+
     Local:
       /.../output/SBSA/MC/600_IPM_1240_ITX_PRE_EVAL/file_type=IN/date=YYYY-MM-DD/file.parquet
- 
+
     S3:
       s3a://bucket/.../SBSA/MC/600_IPM_1240_ITX_PRE_EVAL/file_type=IN/date=YYYY-MM-DD/file.parquet
+
+    Args:
+        output_base: Prefix base de salida (S3 o local).
+        client_id: Código de cliente.
+        file_type: "IN" u "OUT".
+        process_date: Fecha del archivo, formato "YYYY-MM-DD".
+        source_file_name: Stem del archivo TXN/CAL (identifica el par
+            procesado).
+        target_subdir: Subdirectorio de destino (default:
+            "600_IPM_1240_ITX_PRE_EVAL"; en el flujo real se pasa
+            "600_IPM_{mti}_ITX" u otro subdir de debug).
+
+    Returns:
+        Path completo de salida, incluyendo el nombre de archivo ".parquet".
+
+    Ejemplo:
+        build_output_file_path(output_base=s3_staging, client_id="SBSA",
+                                file_type="IN", process_date="2026-02-18",
+                                source_file_name="HASH_FILEIDN_1240",
+                                target_subdir="600_IPM_1240_ITX")
     """
     return (
         f"{output_base.rstrip('/')}/{client_id}/MC/{target_subdir}"
@@ -1102,6 +1582,10 @@ def run_interchange_mti(
     mti: str,
 ) -> None:
     """
+    Ejecuta el pipeline de interchange completo para un MTI de un archivo:
+    lee TXN/CAL, construye PRE_EVAL, asigna reglas, calcula el fee y escribe
+    el resultado final.
+
     Glue runner final:
       - Lee TXN 1240/1440 CLN
       - Lee CAL 1240/1440
@@ -1110,10 +1594,33 @@ def run_interchange_mti(
       - Calcula fee
       - Escribe SOLO el parquet final en:
         {s3_staging}/{client_id}/MC/600_IPM_{mti}_ITX/file_type={file_type}/date={file_date}/<source>.parquet
- 
+
     Solo procesa los archivos cuyo nombre comienza con file_id, evitando
     reprocesar parquets de otras ejecuciones anteriores en la misma partición
     de fecha (file_type=X/date=YYYY-MM-DD).
+
+    Args:
+        spark: Sesión de Spark activa.
+        s3_staging: Bucket/prefix base de staging.
+        s3_reference: Bucket/prefix base de reference.
+        client_id: Código de cliente.
+        file_id: Identificador del archivo a procesar (filtro de prefijo de
+            nombre de archivo).
+        file_type: "IN" u "OUT".
+        file_date: Fecha del archivo, formato "YYYY-MM-DD".
+        layout_table: Tabla DynamoDB de layout de campos Mastercard.
+        aws_region: Región AWS.
+        mti: MTI a procesar ("1240" o "1442").
+
+    Returns:
+        None — escribe el/los Parquet(s) finales directamente a S3. No hace
+        nada (log + return) si no hay archivos TXN o CAL para ese file_id.
+
+    Ejemplo:
+        run_interchange_mti(spark=spark, s3_staging=s3_staging, s3_reference=s3_reference,
+                             client_id="SBSA", file_id="ABC123...", file_type="IN",
+                             file_date="2026-02-18", layout_table=dynamo_table_fields,
+                             aws_region="eu-south-2", mti="1240")
     """
  
     txn_prefix =  (f"{s3_staging}/{client_id}/MC/400_IPM_{mti}_CLN/"f"file_type={file_type}/date={file_date}/")
@@ -1290,6 +1797,21 @@ def run_interchange_mti(
 # =============================================================================
 
 def main() -> None:
+    """
+    Punto de entrada del Glue job glue-mc-interchange. Resuelve los
+    argumentos del job, inicializa la sesión Spark/Glue con la configuración
+    de compatibilidad Parquet necesaria (timestamps en microsegundos,
+    nanosAsLong, vectorized reader deshabilitado), deriva la lista de MTIs
+    transaccionales a procesar desde --outputs (excluyendo 1644/1740, que no
+    tienen lógica de interchange) y ejecuta run_interchange_mti() para cada
+    uno.
+
+    Returns:
+        None. Llama a job.commit() y spark.stop() al finalizar.
+
+    Ejemplo:
+        main()  # invocado automáticamente al ejecutar el script como Glue job
+    """
     args = getResolvedOptions(
         sys.argv,
         [

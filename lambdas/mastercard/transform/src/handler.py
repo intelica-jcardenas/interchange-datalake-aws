@@ -1,34 +1,70 @@
 """
-Core de transformaciones auxiliares para Mastercard transform.
- 
-Dependency rules
-----------------
-Capa de LÓGICA PURA:
-- No instancia ni importa infraestructura en runtime.
-- Database se importa SOLO bajo TYPE_CHECKING (type hints); sin dependencia
-  en tiempo de ejecución.
-- No importa ningún módulo vecino (mc_extract, mc_extract_core).
-- Recibe los layout dicts (dict_de, dict_pds) como parámetros desde el
-  orquestador mc_transform.py, que es quien instancia Database y llama
-  load_layout_from_db.
-- Todas las constantes y helpers de configuración estática que necesita
-  se declaran directamente aquí (independencia total de módulos vecinos).
- 
-Contenido
----------
-1.  Tipos
-2.  Constantes de layout estáticas por MTI
-    2a. BASE_COLS_* y TUPLE_DE_PDS_LYT_*
-    2b. Constantes de negocio 1644
-    2c. get_base_cols_and_containers()
-3.  DB-driven layout loader
-    load_layout_from_db() / invalidate_layout_cache()
-4.  Fixed-width helpers
-5.  DE / subfield helpers
-6.  PDS helpers
-    6a. Helpers de parseo TLV
-    6b. Helpers de negocio 1644
-    6c. Pipelines PDS por MTI
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-transform
+================================================================================
+Archivo:     lambdas/mastercard/transform/src/handler.py
+
+Segunda etapa del pipeline Mastercard (tras interpreter). Procesa los
+Parquets RAW del interpreter (capa 100_IPM_{MTI}_RAW) por MTI — no es
+extracción de campos de negocio, es una etapa de preparación y
+estructuración previa al extract. Para cada MTI: carga el layout de DEs y
+PDS desde DynamoDB (mastercard_fields, configuration-driven), filtra las
+columnas DE relevantes, expande subcampos de ancho fijo y reordena
+columnas (subcampos junto a su DE padre), extrae y expande PDS (Private
+Data Subelements) desde DEs contenedores (DE_48, DE_62, DE_123, DE_124,
+DE_125) en formato TLV (4 chars tag + 3 chars length + value). El MTI
+1644 se divide además por Function Code (685/688/691) — cada FC tiene sus
+propios PDS tags. Escribe a s3-staging/200_IPM_{MTI}_TRA/.
+
+MTIs soportados: 1240, 1442, 1644 (dividido por FC 685/688/691), 1740.
+
+Estructura interna del módulo (contenido de handler.py):
+  1.  Tipos
+  2.  Constantes de layout estáticas por MTI
+      2a. BASE_COLS_* y TUPLE_DE_PDS_LYT_*
+      2b. Constantes de negocio 1644
+      2c. get_base_cols_and_containers()
+  3.  DB-driven layout loader (Database.get_layout_by_mti, caché por MTI)
+  4.  Fixed-width helpers
+  5.  DE / subfield helpers
+  6.  PDS helpers
+      6a. Helpers de parseo TLV
+      6b. Helpers de negocio 1644
+      6c. Pipelines PDS por MTI
+  7.  transform_ipm_{mti}() — un pipeline por MTI (algunos comparten
+      estructura, otros no — ver gotchas.md, solo 1240 tiene chunking
+      dinámico de memoria; 1442/1644/1740 cargan el Parquet completo)
+  8.  detect_available_mtis() — fallback si el evento no trae
+      interpreter_result.outputs
+  9.  lambda_handler()
+
+Riesgos conocidos (ver gotchas.md, sección "mc-transform"):
+  - Timeout con múltiples MTIs: los 4 MTIs se procesan secuencialmente en
+    una sola invocación; si todos están presentes puede superar el
+    Timeout=400s (config.json).
+  - Sin chunking en 1442/1740/1644: solo transform_ipm_1240 implementa
+    chunking dinámico; los otros 3 cargan el Parquet RAW completo en
+    memoria, riesgo de OOM en archivos grandes.
+  - DDB_MASTERCARD_FIELDS_TABLE no declarada en config.json/env-vars.json
+    — cae al valor hardcodeado en Database.__init__, se rompería en un
+    ambiente distinto a dev.
+
+Variables de entorno:
+  S3_STAGING_BUCKET      : bucket de staging (lectura RAW, escritura TRA)
+  S3_LANDING_BUCKET      : bucket de landing (no usado en el flujo normal)
+  S3_OPERATIONAL_BUCKET  : bucket operational (no usado en esta etapa)
+  S3_REFERENCE_BUCKET    : bucket de referencia (no usado en esta etapa)
+  DDB_CLIENT_TABLE       : tabla DynamoDB de clientes
+  DDB_FILE_CONTROL_TABLE : tabla DynamoDB de control de archivos
+  DDB_MASTERCARD_FIELDS_TABLE : tabla DynamoDB de layout DE/PDS (NO declarada
+                                 actualmente — ver "Riesgos conocidos")
+  ITX_LOG_LEVEL          : nivel de logging (default: INFO)
+
+Dependency rules (capa de lógica pura, dentro de este mismo archivo):
+  - Database se usa como infraestructura real (no solo type hints) porque
+    handler.py concentra tanto el core de transformaciones como el
+    entry-point Lambda en un único archivo.
+  - No importa ningún módulo vecino (mc_extract, mc_extract_core) — todas
+    las constantes y helpers de configuración estática se declaran acá.
 """
 
 from __future__ import annotations
@@ -80,6 +116,14 @@ class Database:
     """
  
     def __init__(self):
+        """
+        Inicializa el cliente DynamoDB y resuelve los nombres de las 3 tablas
+        que usa esta etapa (cliente, control de archivos, layout de campos)
+        desde variables de entorno, con defaults hardcodeados.
+
+        Returns:
+            None.
+        """
         self.dynamodb = boto3.resource("dynamodb")
  
         self.client_table_name = os.environ.get(
@@ -104,6 +148,27 @@ class Database:
         where: dict | None = None,
     ) -> pd.DataFrame:
  
+        """
+        Consulta un único item por llave exacta en las tablas "client" o
+        "file_control" y devuelve el resultado como DataFrame de una fila.
+
+        Args:
+            table_name: "client" o "file_control" (único soportado).
+            fields: Lista de nombres de atributo a extraer del item.
+            where: Dict con la llave de partición requerida ("client_id" para
+                "client", "file_id" para "file_control").
+
+        Returns:
+            DataFrame de una fila con las columnas de fields, o un DataFrame
+            vacío (mismas columnas, 0 filas) si no existe el item.
+
+        Raises:
+            ValueError: si falta la llave requerida en where, o si table_name
+                no es "client" ni "file_control".
+
+        Ejemplo:
+            db.read_records("client", ["local_currency_code"], where={"client_id": "SBSA"})
+        """
         where = where or {}
  
         if table_name == "client":
@@ -148,6 +213,27 @@ class Database:
         mti: str,
     ) -> tuple[dict, dict]:
  
+        """
+        Consulta en DynamoDB (tabla mastercard_fields) el layout de DEs y PDS
+        para un MTI dado, cacheado por MTI a nivel de módulo (_layout_cache) —
+        mismo patrón que _load_layout en otras Lambdas Mastercard (extract/
+        clean/interpreter).
+
+        Hace dos queries (KeyConditionExpression sobre type_record="DE" y
+        "PDS"), filtra cada item por type_mti (comparando contra la lista de
+        MTIs válidos separada por coma) y reconstruye dos dicts:
+          - subfield == 0  →  campo escalar: {"DE_4": 14}
+          - subfield != 0  →  campo con subcampos: {"DE_3": {"DE_3_1": 2, ...}}
+
+        Args:
+            mti: MTI a consultar, ej. "1240".
+
+        Returns:
+            Tupla (dict_de, dict_pds).
+
+        Ejemplo:
+            db.get_layout_by_mti("1240")  # ({'DE_3': {...}, 'DE_4': 14, ...}, {...})
+        """
         if mti in _layout_cache:
             return _layout_cache[mti]
  
@@ -250,9 +336,32 @@ class FileStorage:
     Layer = _Layer
  
     def __init__(self) -> None:
+        """
+        Inicializa el cliente S3.
+
+        Returns:
+            None.
+        """
         self.s3 = boto3.client("s3")
  
     def _get_bucket_by_layer(self, layer: _Layer) -> str:
+        """
+        Resuelve el nombre de bucket S3 real para una capa lógica (landing,
+        staging, operational, reference), leyendo la variable de entorno
+        correspondiente.
+
+        Args:
+            layer: Capa lógica (_Layer.LANDING/STAGING/OPERATIONAL/REFERENCE).
+
+        Returns:
+            Nombre de bucket S3.
+
+        Raises:
+            ValueError: si layer no tiene bucket configurado.
+
+        Ejemplo:
+            fs._get_bucket_by_layer(fs.Layer.STAGING)
+        """
         if layer == self.Layer.LANDING:
             return os.environ.get("S3_LANDING_BUCKET", "itl-0004-itx-dev-poc-02-landing")
  
@@ -268,6 +377,25 @@ class FileStorage:
         raise ValueError(f"No existe bucket configurado para layer={layer}")
 
     def _get_file_details(self, client_id: str, file_id: str):
+        """
+        Recupera la metadata de un archivo desde DynamoDB (file_control),
+        necesaria para construir los S3 keys (fecha de procesamiento, nombre de
+        archivo de landing).
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+
+        Returns:
+            Fila (pd.Series) con file_processing_date, landing_file_name,
+            file_type.
+
+        Raises:
+            ValueError: si no se encuentra el file_id en file_control.
+
+        Ejemplo:
+            fs._get_file_details("SBSA", "DD9D...")
+        """
         db = Database()
  
         df = db.read_records(
@@ -298,6 +426,32 @@ class FileStorage:
         filename: str | None = None,
     ) -> str:
  
+        """
+        Construye el S3 key para una capa/cliente/archivo dados, según el
+        esquema de particionamiento del pipeline. Landing y reference tienen
+        estructura distinta a staging/operational.
+
+        Args:
+            layer: Capa lógica de destino.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo (usado para consultar
+                file_control vía _get_file_details).
+            file_type: "IN" u "OUT" (solo relevante para staging/operational).
+            subdir: Subdirectorio de staging/operational, o prefix para
+                reference.
+            filename: Nombre de archivo (obligatorio para staging/operational y
+                reference).
+
+        Returns:
+            S3 key completo.
+
+        Raises:
+            ValueError: si layer es STAGING/OPERATIONAL y no se pasa filename.
+
+        Ejemplo:
+            fs._build_key(fs.Layer.STAGING, "SBSA", "DD9D...", "IN",
+                           subdir="200_IPM_1240_TRA", filename="x.parquet")
+        """
         file_details = self._get_file_details(client_id, file_id)
  
         processing_date = str(file_details["file_processing_date"])
@@ -324,6 +478,25 @@ class FileStorage:
         subdir: str,
     ) -> list[str]:
  
+        """
+        Lista los S3 keys de Parquets bajo el prefix de una capa/cliente/
+        subdirectorio/fecha, filtrando por nombre de archivo que empieza con
+        file_id.
+
+        Args:
+            layer: Capa lógica (típicamente STAGING).
+            client_id: Código de cliente.
+            file_id: Identificador del archivo (prefijo del nombre a filtrar).
+            file_type: "IN" u "OUT".
+            subdir: Subdirectorio a listar, ej. "100_IPM_1240_RAW".
+
+        Returns:
+            Lista de S3 keys que matchean.
+
+        Ejemplo:
+            fs.list_parquet_files(fs.Layer.STAGING, "SBSA", "DD9D...", "IN",
+                                    subdir="100_IPM_1240_RAW")
+        """
         bucket = self._get_bucket_by_layer(layer)
  
         file_details = self._get_file_details(client_id, file_id)
@@ -356,6 +529,22 @@ class FileStorage:
         file_type: str,
     ) -> tuple[str, str]:
  
+        """
+        Resuelve el bucket y key del archivo original en landing para un
+        cliente/archivo.
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            file_type: "IN" u "OUT" (no usado para landing, solo por firma
+                uniforme).
+
+        Returns:
+            Tupla (bucket, key).
+
+        Ejemplo:
+            fs.get_landing_object("SBSA", "DD9D...", "IN")
+        """
         bucket = self._get_bucket_by_layer(self.Layer.LANDING)
  
         key = self._build_key(
@@ -378,6 +567,26 @@ class FileStorage:
         filename: str = "data.parquet",
     ) -> str:
  
+        """
+        Serializa un DataFrame como Parquet a un archivo temporal en /tmp y lo
+        sube a S3 en la capa/subdirectorio indicados.
+
+        Args:
+            df: DataFrame a escribir.
+            layer: Capa lógica de destino.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            file_type: "IN" u "OUT".
+            subdir: Subdirectorio de destino.
+            filename: Nombre de archivo (default: "data.parquet").
+
+        Returns:
+            URI S3 completo del archivo escrito ("s3://bucket/key").
+
+        Ejemplo:
+            fs.write_parquet(df, fs.Layer.STAGING, "SBSA", "DD9D...", "IN",
+                               subdir="200_IPM_1644_TRA", filename="x_685.parquet")
+        """
         bucket = self._get_bucket_by_layer(layer)
  
         key = self._build_key(
@@ -416,6 +625,23 @@ class FileStorage:
         filename: str = "data.parquet",
     ) -> pd.DataFrame:
  
+        """
+        Descarga y lee un Parquet de S3 dado cliente/capa/subdirectorio/nombre
+        de archivo (construye el key internamente vía _build_key).
+
+        Args:
+            layer: Capa lógica de origen.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio de origen.
+            filename: Nombre de archivo (default: "data.parquet").
+
+        Returns:
+            DataFrame con el contenido del Parquet.
+
+        Ejemplo:
+            fs.read_parquet(fs.Layer.STAGING, "SBSA", "DD9D...", subdir="100_IPM_1240_RAW")
+        """
         bucket = self._get_bucket_by_layer(layer)
  
         key = self._build_key(
@@ -442,6 +668,22 @@ class FileStorage:
         columns: list[str] | None = None,
     ) -> pd.DataFrame:
  
+        """
+        Descarga y lee un Parquet de S3 por su key completo (sin construirlo
+        desde cliente/archivo) — usado en el hot path de transform_ipm_*, que ya
+        tiene el key resuelto por list_parquet_files.
+
+        Args:
+            layer: Capa lógica de origen.
+            key: S3 key completo del Parquet.
+            columns: Columnas a leer (None = todas).
+
+        Returns:
+            DataFrame con el contenido del Parquet.
+
+        Ejemplo:
+            fs.read_parquet_by_key(fs.Layer.STAGING, key)
+        """
         bucket = self._get_bucket_by_layer(layer)
  
         logging.info(f"Leyendo parquet: s3://{bucket}/{key}")
@@ -617,6 +859,28 @@ def build_expected_columns(
     dict_pds: dict,
 ) -> list[str]:
  
+    """
+    Construye la lista completa y determinística de columnas de salida
+    esperadas para un MTI, combinando las columnas base (renombradas según
+    rename_map), todas las columnas DE (incluyendo subcampos expandidos),
+    todas las columnas PDS (incluyendo subcampos), y las columnas de
+    metadata del pipeline (file_processing_date, file_id, content_hash).
+
+    Se usa para forzar el mismo schema de columnas en cada chunk/archivo
+    procesado, aunque un chunk particular no tenga todos los campos
+    presentes (ver align_chunk_to_expected_columns).
+
+    Args:
+        mti: MTI a procesar, ej. "1240".
+        dict_de: Layout de DEs (de Database.get_layout_by_mti).
+        dict_pds: Layout de PDS (de Database.get_layout_by_mti).
+
+    Returns:
+        Lista de nombres de columna, sin duplicados, en orden determinístico.
+
+    Ejemplo:
+        build_expected_columns("1240", dict_de, dict_pds)
+    """
     base_cols, _ = get_base_cols_and_containers(mti)
  
     rename_map = {
@@ -654,6 +918,25 @@ def align_chunk_to_expected_columns(
     expected_columns: list[str],
 ) -> pd.DataFrame:
  
+    """
+    Alinea un chunk al conjunto de columnas esperado: agrega como pd.NA las
+    columnas ausentes, descarta cualquier columna extra, y castea todas las
+    columnas a string excepto ref_id (Int64 nullable) — garantiza que el
+    schema Arrow sea idéntico entre todos los chunks/archivos escritos al
+    mismo ParquetWriter.
+
+    Args:
+        chunk: DataFrame del chunk actual.
+        expected_columns: Lista de columnas esperada (de
+            build_expected_columns).
+
+    Returns:
+        DataFrame con exactamente expected_columns, en ese orden, con los
+        tipos normalizados.
+
+    Ejemplo:
+        align_chunk_to_expected_columns(chunk, expected_columns)
+    """
     for col in expected_columns:
         if col not in chunk.columns:
             chunk[col] = pd.NA
@@ -1218,6 +1501,38 @@ def transform_ipm_1240(
     content_hash: str = "",
 ) -> None:
 
+    """
+    Pipeline de transform para MTI 1240 — el único de los 4 MTIs con
+    chunking dinámico de memoria (ver gotchas.md, "Sin chunking en MTIs
+    1442, 1740 y 1644").
+
+    Por cada Parquet RAW del archivo: lee, filtra a solo columnas DE
+    relevantes, calcula un chunk_size dinámico apuntando a ~500MB por chunk
+    (acotado entre 10,000 y 100,000 filas), y por cada chunk: expande
+    subcampos DE, reordena columnas, aplica PDS (DE_48/62/123/124/125),
+    renombra MSG_NO→ref_id y MTI→type_mti, agrega metadata
+    (file_processing_date, file_id, content_hash), alinea al schema esperado
+    y escribe al ParquetWriter local en /tmp. Al terminar todos los chunks
+    del archivo, sube el Parquet consolidado a
+    s3-staging/200_IPM_1240_TRA/.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_type: "IN" u "OUT".
+        context: Contexto de ejecución de Lambda (opcional, solo para
+            loguear tiempo restante entre archivos).
+        content_hash: MD5 del archivo origen, propagado como columna.
+
+    Returns:
+        None — escribe los Parquets directamente a S3.
+
+    Raises:
+        ValueError: si no se encuentran Parquets RAW para el file_id.
+
+    Ejemplo:
+        transform_ipm_1240("SBSA", "DD9D...", "IN", content_hash="AB12...")
+    """
     t_total = perf_counter()
     db = Database()
  
@@ -1509,6 +1824,28 @@ def transform_ipm_1442(
         content_hash: str = "",
 ) -> None:
  
+    """
+    Pipeline de transform para MTI 1442. A diferencia de transform_ipm_1240,
+    no implementa chunking dinámico — procesa cada Parquet RAW completo en
+    memoria (ver gotchas.md, riesgo de OOM en archivos grandes).
+
+    Por cada Parquet: lee, filtra a columnas DE, expande subcampos,
+    reordena, aplica PDS, renombra MSG_NO/MTI, agrega metadata, y escribe a
+    s3-staging/200_IPM_1442_TRA/.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_type: "IN" u "OUT".
+        context: Contexto de ejecución de Lambda (opcional).
+        content_hash: MD5 del archivo origen, propagado como columna.
+
+    Returns:
+        None — escribe los Parquets directamente a S3.
+
+    Ejemplo:
+        transform_ipm_1442("SBSA", "DD9D...", "IN", content_hash="AB12...")
+    """
     t_total = perf_counter()
     db = Database()
     
@@ -1620,6 +1957,36 @@ def transform_ipm_1644(
     content_hash: str = "",
 ) -> None:
  
+    """
+    Pipeline de transform para MTI 1644 — el único que se divide por
+    Function Code (685/688/691) en 3 outputs separados, ya que cada FC trae
+    un layout PDS distinto (ver apply_pds_for_mti_1644_split()). Procesa
+    cada Parquet RAW completo en memoria (sin chunking dinámico).
+
+    Por cada Parquet: lee, filtra a columnas DE, aplica el split PDS por FC
+    (apply_pds_for_mti_1644_split, que separa el DataFrame en hasta 3
+    sub-DataFrames), agrega metadata a cada uno que tenga filas, y escribe
+    cada FC no vacío como un archivo separado a s3-staging/200_IPM_1644_TRA/
+    (sufijo _685/_688/_691 en el nombre de archivo).
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_type: "IN" u "OUT".
+        context: Contexto de ejecución de Lambda (opcional, no usado en esta
+            función a diferencia de las otras 3).
+        content_hash: MD5 del archivo origen, propagado como columna.
+
+    Returns:
+        None — escribe hasta 3 Parquets por archivo directamente a S3 (uno
+        por Function Code presente).
+
+    Raises:
+        ValueError: si no se encuentran Parquets RAW para el file_id.
+
+    Ejemplo:
+        transform_ipm_1644("SBSA", "DD9D...", "IN", content_hash="AB12...")
+    """
     t_total = perf_counter()
     
     db = Database()
@@ -1710,6 +2077,27 @@ def transform_ipm_1740(
         content_hash: str = "",
 ) -> None:
     
+    """
+    Pipeline de transform para MTI 1740 (fee collection). Procesa cada
+    Parquet RAW completo en memoria (sin chunking dinámico).
+
+    Por cada Parquet: lee, filtra a columnas DE, expande subcampos,
+    reordena, aplica PDS, renombra MSG_NO/MTI, agrega metadata, y escribe a
+    s3-staging/200_IPM_1740_TRA/.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo origen.
+        file_type: "IN" u "OUT".
+        context: Contexto de ejecución de Lambda (opcional).
+        content_hash: MD5 del archivo origen, propagado como columna.
+
+    Returns:
+        None — escribe los Parquets directamente a S3.
+
+    Ejemplo:
+        transform_ipm_1740("SBSA", "DD9D...", "IN", content_hash="AB12...")
+    """
     t_total = perf_counter()
     db = Database()
     
@@ -1809,6 +2197,24 @@ def detect_available_mtis(
     file_type: str,
 ) -> list[str]:
  
+    """
+    Fallback usado cuando el evento no trae interpreter_result.outputs (o
+    no se pudo derivar ningún MTI válido de ahí): lista, para cada uno de
+    los 4 MTIs soportados, si existen Parquets RAW en staging para ese
+    client_id/file_id/file_type.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+        file_type: "IN" u "OUT".
+
+    Returns:
+        Lista de MTIs ("1240", "1442", "1644", "1740") que tienen al menos
+        un Parquet RAW presente.
+
+    Ejemplo:
+        detect_available_mtis("SBSA", "DD9D...", "IN")  # ["1240", "1644"]
+    """
     mtis = []
  
     for mti in ("1240", "1442", "1644", "1740"):
@@ -1835,6 +2241,34 @@ fs = FileStorage()
  
 def lambda_handler(event, context):
  
+    """
+    Punto de entrada de la Lambda lmbd-mc-transform. Invocada por la Step
+    Function Mastercard tras lmbd-mc-interpreter. Deriva los MTIs a procesar
+    desde interpreter_result.outputs (fallback: detect_available_mtis() si
+    el campo está ausente o no se puede derivar ningún MTI válido de ahí),
+    ejecuta el transform de cada MTI con la función registrada en TRANSFORMS,
+    y recolecta los paths reales escritos a 200_IPM_*_TRA para construir el
+    payload de salida — mismo contrato que mc_interpreter/mc_extract.
+
+    Args:
+        event: Payload de Step Functions con client_id, file_id, brand,
+            brand_id, file_type, file_date, content_hash, filename, y
+            interpreter_result.outputs (lista de outputs del interpreter,
+            {"mti": ..., "s3_key": ...}).
+        context: Contexto de ejecución de Lambda, propagado a cada
+            transform_ipm_* para loguear el tiempo restante entre archivos.
+
+    Returns:
+        Dict con status ("SUCCESS" si se escribió al menos un output, "ERROR"
+        si no), total_outputs, total_records (siempre 0), outputs (lista
+        {"mti", "s3_key"} de los Parquets escritos) y los campos de identidad
+        heredados del evento. Lanza ValueError si falta S3_STAGING_BUCKET,
+        client_id/file_id, o no se pudo derivar ningún MTI a procesar.
+
+    Ejemplo:
+        lambda_handler({'client_id': 'SBSA', 'file_id': 'DD9D...', 'file_type': 'IN',
+                         'interpreter_result': {'outputs': [...]}}, context)
+    """
     logging.info(f"EVENT={json.dumps(event)}")
  
     # ------------------------------------------------------------------

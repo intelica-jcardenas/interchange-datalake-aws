@@ -1,3 +1,36 @@
+"""
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-vi-clean
+================================================================================
+Archivo:     lambdas/visa/clean/src/handler.py
+
+Cuarta etapa del pipeline Visa (tras transform y extract). Normaliza y da
+formato final a los campos extraídos de cada tipo de record (BASEII, SMS,
+VSS_110/120/130/140), usando las definiciones de campo de la tabla DynamoDB
+`visa_fields` (columna `type_record` + GSI `type-record-index`). Castea cada
+columna a su tipo declarado (string/int/float/date), aplica las estrategias
+de parseo de fecha propias de Visa (`!YDDD`, `!YDDD_MAX`, `!MMDD`,
+`!YYYYDDD`) y limpia máscaras no numéricas de `account_number`. Procesa el
+Parquet de extract en streaming (`iter_batches` + `ParquetWriter`) para no
+cargar el archivo completo en memoria, y escribe el resultado a
+`s3-staging/300_*_cln_*/`. Este es el Parquet con los campos originales en
+su forma final correcta — la siguiente etapa (`glue-vi-calculate`) ya no
+toca estos valores, solo agrega columnas derivadas.
+
+Flujo:
+1. Por cada output de extract (uno por type_record): cargar definiciones de
+   campo desde DynamoDB
+2. Descargar el Parquet de extract a un buffer en memoria
+3. Iterar el Parquet en chunks (CLEAN_CHUNK_SIZE, default 400000 filas)
+4. Por chunk: limpiar cada columna según su tipo declarado
+5. Forzar timestamps a microsegundos (compatibilidad con Spark downstream)
+6. Escribir cada chunk al ParquetWriter en streaming
+7. Subir el Parquet consolidado a s3-staging
+
+Variables de entorno:
+  S3_BUCKET_STAGING          : bucket de staging (lectura de extract, escritura de clean)
+  DYNAMODB_FIELD_DEFINITION  : tabla de definición de campos Visa (default: itx-visa-fields)
+  CLEAN_CHUNK_SIZE           : filas por chunk de streaming (default: 400000)
+"""
 import os
 import json
 import logging
@@ -39,6 +72,22 @@ EBCDIC_OVERPUNCH_ALL = {
 # =============================================================================
 
 def _load_field_definitions(type_record: str) -> pd.DataFrame:
+    """
+    Consulta en DynamoDB (tabla `visa_fields`, GSI `type-record-index`) todas
+    las definiciones de campo para un `type_record` dado (ej. "draft", "sms",
+    "vss_110"), paginando con `LastEvaluatedKey` hasta agotar los resultados.
+
+    Args:
+        type_record: Tipo de record Visa a consultar, ej. "draft" para BASEII.
+
+    Returns:
+        DataFrame con una fila por campo definido (columnas `column_name`,
+        `column_type`, `date_format`, `float_decimals`, etc.), o un
+        DataFrame vacío si no hay definiciones para ese `type_record`.
+
+    Ejemplo:
+        _load_field_definitions("draft")  # DataFrame con ~90 campos BASEII
+    """
     table = dynamodb.Table(FIELD_DEF_TABLE)
     response = table.query(IndexName='type-record-index', KeyConditionExpression=Key('type_record').eq(type_record))
     items = response.get('Items', [])
@@ -53,6 +102,18 @@ def _load_field_definitions(type_record: str) -> pd.DataFrame:
     return df
 
 def _get_s3_file_object(s3_key: str) -> BytesIO:
+    """
+    Descarga un objeto de `S3_BUCKET_STAGING` completo a un buffer en memoria.
+
+    Args:
+        s3_key: Key del objeto dentro del bucket de staging.
+
+    Returns:
+        Buffer `BytesIO` con el contenido del objeto.
+
+    Ejemplo:
+        _get_s3_file_object("EBGR/VISA/200_baseii_ext_drafts/.../x.parquet")
+    """
     logger.info(f"Downloading into buffer: s3://{STAGING_BUCKET}/{s3_key}")
     response = s3.get_object(Bucket=STAGING_BUCKET, Key=s3_key)
     return BytesIO(response['Body'].read())
@@ -62,6 +123,31 @@ def _get_s3_file_object(s3_key: str) -> BytesIO:
 # =============================================================================
 
 def _parse_dates(date_series: pd.Series, date_format: str, file_date: str) -> pd.Series:
+    """
+    Convierte una Serie de strings crudos a fechas, según el `date_format`
+    declarado en DynamoDB para el campo. Además de los formatos estándar de
+    `datetime.strptime` (cualquier `date_format` que empiece con "%"),
+    soporta las convenciones propias de Visa `!MMDD`, `!YDDD`, `!YDDD_MAX`
+    y `!YYYYDDD` — cada una con su propia estrategia de reconstrucción de
+    año, documentada en el comentario inline de su rama correspondiente
+    más abajo en el código.
+
+    Args:
+        date_series: Serie de valores de fecha crudos (string).
+        date_format: Formato declarado en DynamoDB para el campo, ej.
+            "!YDDD".
+        file_date: Fecha del archivo en formato "YYYY-MM-DD", usada como
+            referencia para reconstruir el año y como fallback para
+            valores inválidos ("0000").
+
+    Returns:
+        Serie de `Timestamp` (o `NaT` para valores no parseables). Lanza
+        `NotImplementedError` si `date_format` no es ninguno de los
+        formatos soportados.
+
+    Ejemplo:
+        _parse_dates(pd.Series(['6004']), '!YDDD', '2026-01-03')  # 2026-01-04
+    """
     reference_date = datetime.strptime(file_date, "%Y-%m-%d")
     reference_date_ts = pd.Timestamp(reference_date)
     if date_format.startswith('%'):
@@ -133,21 +219,99 @@ def _parse_dates(date_series: pd.Series, date_format: str, file_date: str) -> pd
     raise NotImplementedError(f"Format not supported: {date_format}")
 
 def _clean_string(field_series: pd.Series) -> pd.Series:
+    """
+    Recorta espacios en blanco de una Serie de strings; los valores que
+    quedan vacíos tras el strip se reemplazan por un único espacio (nunca
+    string vacío), para no perder la columna como NaN en pasos posteriores.
+
+    Args:
+        field_series: Serie de valores string a limpiar.
+
+    Returns:
+        Serie con strings recortados, sin valores vacíos.
+
+    Ejemplo:
+        _clean_string(pd.Series(['  ABC ', '   ']))  # ['ABC', ' ']
+    """
     return field_series.str.strip().replace('', ' ')
 
 def _clean_integer(field_series: pd.Series) -> pd.Series:
+    """
+    Convierte una Serie a enteros nullable (`Int64`), tratando valores
+    nulos o no numéricos como 0.
+
+    Args:
+        field_series: Serie de valores a convertir.
+
+    Returns:
+        Serie de tipo `Int64` (entero nullable de pandas).
+
+    Ejemplo:
+        _clean_integer(pd.Series(['007', None]))  # [7, 0]
+    """
     return pd.to_numeric(field_series.fillna('0').astype(str).str.strip(), errors='coerce').fillna(0).astype('Int64')
 
 def _clean_float(field_series: pd.Series, float_decimals: int) -> pd.Series:
+    """
+    Convierte una Serie a float aplicando el divisor implícito de Visa
+    (`float_decimals`, cantidad de decimales implícitos en el campo de
+    ancho fijo) y traduciendo overpunch EBCDIC (signo codificado en el
+    último dígito) a su dígito numérico equivalente antes de parsear.
+
+    Args:
+        field_series: Serie de valores crudos (string de ancho fijo).
+        float_decimals: Cantidad de decimales implícitos a dividir, según
+            la definición de campo en DynamoDB.
+
+    Returns:
+        Serie de tipo float, con nulos/no numéricos tratados como 0.
+
+    Ejemplo:
+        _clean_float(pd.Series(['00123']), 2)  # [1.23]
+    """
     pre = field_series.fillna('0').astype(str)
     for char, digit in EBCDIC_OVERPUNCH_ALL.items():
         pre = pre.str.replace(char, digit, regex=False)
     return pd.to_numeric(pre.str.strip(), errors='coerce').fillna(0) / (10 ** float_decimals)
 
 def _clean_date(field_series: pd.Series, date_format: str, file_date: str) -> pd.Series:
+    """
+    Wrapper de `_parse_dates()` que primero normaliza la Serie a string
+    recortado antes de delegar el parseo.
+
+    Args:
+        field_series: Serie de valores de fecha crudos.
+        date_format: Formato declarado en DynamoDB para el campo.
+        file_date: Fecha del archivo en formato "YYYY-MM-DD".
+
+    Returns:
+        Serie de `Timestamp` resultante de `_parse_dates()`.
+
+    Ejemplo:
+        _clean_date(pd.Series(['6004']), '!YDDD', '2026-01-03')  # 2026-01-04
+    """
     return _parse_dates(field_series.astype(str).str.strip(), date_format, file_date)
 
 def _clean_field_values(field_series: pd.Series, field_def: Dict[str, Any], file_date: str) -> pd.Series:
+    """
+    Despacha la limpieza de una columna según su `column_type` declarado en
+    DynamoDB (`str`, `int`, `float`, `date`), aplicando la función de
+    limpieza correspondiente. Cualquier tipo no reconocido cae al
+    tratamiento de string.
+
+    Args:
+        field_series: Serie de valores crudos de la columna.
+        field_def: Definición del campo desde DynamoDB (`column_type`,
+            `float_decimals`, `date_format`, etc.).
+        file_date: Fecha del archivo en formato "YYYY-MM-DD", usada por la
+            limpieza de fechas.
+
+    Returns:
+        Serie limpia con el tipo correspondiente a `column_type`.
+
+    Ejemplo:
+        _clean_field_values(pd.Series(['00123']), {'column_type': 'int'}, '2026-01-03')  # [123]
+    """
     col_type = field_def.get('column_type', 'str')
     if col_type == 'str':
         return _clean_string(field_series)
@@ -160,6 +324,29 @@ def _clean_field_values(field_series: pd.Series, field_def: Dict[str, Any], file
     return _clean_string(field_series)
 
 def _clean_chunk(chunk_df: pd.DataFrame, field_defs_dict: dict, file_date: str):
+    """
+    Limpia todas las columnas de un chunk del Parquet de extract, una por
+    una, usando la definición de campo correspondiente. La columna
+    `record` (identificador de fila, no un campo de negocio) se preserva
+    sin transformar. `account_number` recibe además una limpieza
+    específica: cualquier carácter no numérico (máscaras `*`/`?` de PAN
+    parcial) se reemplaza por `'0'`, replicando el comportamiento del
+    legacy. Las columnas sin definición en DynamoDB, o cuya limpieza
+    falla, quedan como string sin normalizar — nunca se descarta una
+    columna del chunk.
+
+    Args:
+        chunk_df: DataFrame con el chunk crudo leído de extract.
+        field_defs_dict: Definiciones de campo indexadas por `column_name`.
+        file_date: Fecha del archivo en formato "YYYY-MM-DD".
+
+    Returns:
+        Tupla `(DataFrame limpio, cantidad de columnas limpiadas
+        exitosamente)`.
+
+    Ejemplo:
+        _clean_chunk(chunk_df, field_defs_dict, '2026-01-03')  # (df_limpio, 42)
+    """
     cleaned_fields = []
     fields_cleaned = 0
 
@@ -192,6 +379,38 @@ def _clean_chunk(chunk_df: pd.DataFrame, field_defs_dict: dict, file_date: str):
 
 def clean_output(output: Dict, file_date: str, client_id: str, brand: str,
                  file_type: str, content_hash: str) -> Optional[Dict]:
+    """
+    Limpia un output de extract (un `type_record` de un archivo, ej. BASEII
+    o VSS_120) de punta a punta: carga las definiciones de campo, descarga
+    el Parquet de extract, lo procesa en streaming por chunks de
+    `CLEAN_CHUNK_SIZE` filas (`iter_batches` + `ParquetWriter`, para no
+    cargar el archivo completo en memoria), fuerza los timestamps a
+    microsegundos (compatibilidad con `spark.read.parquet()` downstream) y
+    sube el Parquet consolidado a `s3-staging/300_*_cln_*/`.
+
+    Args:
+        output: Dict de un output de extract, con `output_type`, `s3_key`
+            y `records`.
+        file_date: Fecha del archivo en formato "YYYY-MM-DD".
+        client_id: Código del cliente (no usado para lógica, solo
+            trazabilidad).
+        brand: Marca del archivo ("VISA"), no usado para lógica, solo
+            trazabilidad.
+        file_type: "IN" u "OUT", no usado para lógica, solo trazabilidad.
+        content_hash: MD5 del archivo origen, no usado para lógica en esta
+            función (se propaga vía el `record` heredado del extract).
+
+    Returns:
+        Dict con el resultado de la limpieza (`output_type`, `s3_key`,
+        `records`, `fields_cleaned`, `total_columns`), o `None` si el
+        `output_type` no está en `OUTPUT_TYPE_CONFIG` o no hay
+        definiciones de campo para su `type_record`. Relanza cualquier
+        excepción tras loguearla.
+
+    Ejemplo:
+        clean_output({'output_type': 'BASEII', 's3_key': '...', 'records': 1000},
+                      '2026-01-03', 'EBGR', 'VISA', 'IN', 'AB12...')
+    """
     out_type = output.get('output_type')
     in_key = output.get('s3_key')
     in_records = output.get('records', 0)
@@ -300,6 +519,31 @@ def clean_output(output: Dict, file_date: str, client_id: str, brand: str,
 # =============================================================================
 
 def lambda_handler(event, context):
+    """
+    Punto de entrada de la Lambda `lmbd-vi-clean`. Invocada por la Step
+    Function Visa tras `lmbd-vi-extract`. Recorre todos los outputs de
+    extract recibidos en el evento, limpia cada uno con `clean_output()`
+    de forma independiente (un fallo en un output no aborta los demás) y
+    agrega el resultado en un único payload de salida para la siguiente
+    etapa (`glue-vi-calculate`).
+
+    Args:
+        event: Payload de Step Functions con `client_id`, `file_id`,
+            `brand`, `file_type`, `file_date`, `content_hash` y `outputs`
+            (lista de outputs de extract a limpiar).
+        context: Contexto de ejecución de Lambda (no usado).
+
+    Returns:
+        Dict con `status` ("SUCCESS", "PARTIAL_SUCCESS" o "ERROR"),
+        `total_outputs`, `total_records`, `total_fields_cleaned`, la lista
+        `outputs` con el resultado de cada limpieza exitosa, y `errors`
+        con el detalle de los outputs que fallaron.
+
+    Ejemplo:
+        lambda_handler({'client_id': 'EBGR', 'file_id': '...', 'brand': 'VISA',
+                         'file_type': 'IN', 'file_date': '2026-01-03',
+                         'content_hash': '...', 'outputs': [...]}, None)
+    """
     logger.info("=" * 70)
     logger.info("ITX CLEAN LAMBDA - START (WITH CHUNKING)")
     logger.info("=" * 70)

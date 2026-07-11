@@ -1,7 +1,19 @@
 """
-Lambda Router - itl-0004-itx-dev-intchg-02-lmbd-router
-===========================
-Trigger: S3 Event Notification cuando llega un archivo a Landing.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-router
+================================================================================
+Archivo:     lambdas/router/src/handler.py
+
+Punto de entrada del pipeline de interchange. Se dispara por un evento S3
+ObjectCreated cuando llega un archivo nuevo al bucket de landing. Extrae el
+client_id del path, clasifica el archivo contra los patrones regex
+configurados en DynamoDB (file_pattern), calcula su MD5 en streaming para
+detectar duplicados o nuevas versiones del mismo archivo, extrae la fecha de
+negocio del contenido (con lógica distinta según sea Visa, Mastercard, IAR o
+ARDEF) y registra el archivo en DynamoDB (file_control). Según la
+clasificación, despacha el archivo a la siguiente etapa: la Step Function de
+Visa o de Mastercard para el flujo transaccional normal (IN/OUT), directamente
+a las Lambdas de reglas (vi-ardef / mc-iar) sin pasar por Step Functions, o a
+la Lambda de descompresión (unzip) si el archivo es un ZIP.
 
 Flujo:
 1. Parsear evento S3 → bucket/key
@@ -9,21 +21,22 @@ Flujo:
 3. Detectar si es ZIP → delegar a itx-unzip asincrónicamente
 4. Cargar patrones de DynamoDB
 5. Clasificar archivo con regex
-6. Extraer fecha del header (solo 50 bytes, sin descargar todo)
+6. Extraer fecha del header (solo 50 bytes para Visa; lectura completa
+   para Mastercard bloqueado — ver extraer_fecha_mc)
 7. Calcular MD5 en streaming (sin cargar todo el archivo en memoria)
 8. Verificar duplicado en DynamoDB
 9. Registrar en DynamoDB
-10. Iniciar Step Functions
+10. Iniciar Step Functions (o invocar Lambda directa para ARDEF/IAR)
 
 Variables de entorno:
-  S3_BUCKET_LANDING            : bucket de landing
-  DYNAMODB_TABLE_FILE_CONTROL  : tabla de control (default: itx-file-control)
-  DYNAMODB_TABLE_FILE_PATTERN  : tabla de patrones (default: itx-file-pattern)
-  STEP_FUNCTION_VI_ARN         : ARN de la Step Function Visa
-  STEP_FUNCTION_MASTERCARD_ARN : ARN de la Step Function Mastercard
-  VISA_ARDEF_FUNCTION_NAME     : ARN de la Lambda Visa ARDEF
-  MASTERCARD_IAR_FUNCTION_NAME : ARN de la Lambda Mastercard IAR
-  UNZIP_FUNCTION_NAME          : nombre de la Lambda unzip (default: itx-unzip)
+  S3_BUCKET_LANDING             : bucket de landing
+  DYNAMODB_TABLE_FILE_CONTROL   : tabla de control (default: itx-file-control)
+  DYNAMODB_TABLE_FILE_PATTERN   : tabla de patrones (default: itx-file-pattern)
+  STEP_FUNCTION_VI_ARN          : ARN de la Step Function Visa
+  STEP_FUNCTION_MC_ARN          : ARN de la Step Function Mastercard
+  VISA_ARDEF_FUNCTION_NAME      : ARN/nombre de la Lambda Visa ARDEF
+  MASTERCARD_IAR_FUNCTION_NAME  : ARN/nombre de la Lambda Mastercard IAR
+  UNZIP_FUNCTION_NAME           : nombre de la Lambda unzip (default: itx-unzip)
 """
 
 import os
@@ -75,6 +88,17 @@ BRAND_ID_MAP = {
 # =============================================================================
 def validar_configuracion():
     
+    """
+    Verifica que todas las variables de entorno requeridas por el router
+    estén configuradas antes de procesar cualquier evento — Step Function
+    ARNs, Lambda ARNs (ARDEF/IAR/unzip) y nombres de tabla DynamoDB.
+
+    Returns:
+        None. Lanza ValueError si falta alguna variable requerida.
+
+    Ejemplo:
+        validar_configuracion()  # raise ValueError si falta STEP_FUNCTION_VI_ARN
+    """
     required_env_vars = {
         'STEP_FUNCTION_VI_ARN': STEP_FUNCTION_VI_ARN,
         'STEP_FUNCTION_MC_ARN' : STEP_FUNCTION_MC_ARN,
@@ -101,15 +125,27 @@ def validar_configuracion():
 # =============================================================================
 
 def _is_zip_file(filename: str) -> bool:
-    """Detecta si el archivo es un ZIP por su extensión."""
+    """
+    Detecta si el archivo es un ZIP por su extensión.
+
+    Args:
+        filename: Nombre del archivo a evaluar.
+
+    Returns:
+        True si el nombre termina en ".zip" (case-insensitive).
+
+    Ejemplo:
+        _is_zip_file("VISA260416.ZIP")  # True
+    """
     return filename.lower().endswith('.zip')
 
 
 def _extraer_fecha_de_zip(filename: str) -> str:
     """
-    Extrae la fecha del nombre del archivo ZIP.
-    Soporta dos formatos presentes en los clientes:
+    Extrae la fecha de negocio a partir del nombre del archivo ZIP, antes de
+    descomprimirlo, para poder invocar la Lambda de unzip con esa fecha.
 
+    Soporta dos formatos presentes en los clientes:
       YYYYMMDD: 20260416visaout.zip → 2026-04-16
                 20260416mcin.zip    → 2026-04-16
       YYMMDD:   MAST260416.zip      → 2026-04-16
@@ -119,6 +155,15 @@ def _extraer_fecha_de_zip(filename: str) -> str:
       1. Buscar YYYYMMDD primero (8 dígitos) — más específico
       2. Si no → buscar YYMMDD (6 dígitos)
       3. Si no → fecha actual como fallback
+
+    Args:
+        filename: Nombre del archivo ZIP, ej. "VISA260416.zip".
+
+    Returns:
+        Fecha en formato "YYYY-MM-DD", o la fecha actual si no se pudo extraer.
+
+    Ejemplo:
+        _extraer_fecha_de_zip("20260416visaout.zip")  # "2026-04-16"
     """
     fecha_default = datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -162,6 +207,20 @@ def _handle_zip(
       - El unzip puede tardar varios minutos (ZIPs de 1-2GB)
       - Los archivos extraídos dispararán el router nuevamente
         via S3 Event automáticamente → paralelismo gratis
+
+    Args:
+        bucket: Bucket S3 donde está el ZIP (landing).
+        key: Key del ZIP dentro del bucket.
+        client_id: Código de cliente, extraído del path.
+        file_date: Fecha de negocio ya extraída del nombre del ZIP
+            (_extraer_fecha_de_zip), propagada al payload de unzip.
+
+    Returns:
+        Dict con 'file', 'status'='DELEGATED_TO_UNZIP', 'file_date' — no es
+        el resultado final del procesamiento, solo confirma que se delegó.
+
+    Ejemplo:
+        _handle_zip(bucket, "EBGR/VISA260416.zip", "EBGR", "2026-04-16")
     """
     payload = {
         'client_id':      client_id,
@@ -194,8 +253,21 @@ def _handle_zip(
 
 def generar_file_id(client_id: str, filename: str) -> str:
     """
-    Genera un ID determinista basado en el nombre del archivo.
-    Mismo archivo siempre produce el mismo ID → permite detectar duplicados.
+    Genera un ID determinista basado en el nombre del archivo — el mismo
+    archivo (mismo client_id + filename + fecha en el nombre) siempre produce
+    el mismo file_id, lo que permite detectar duplicados por nombre en
+    verificar_duplicado().
+
+    Args:
+        client_id: Código de cliente.
+        filename: Nombre del archivo (se busca una fecha de 8 dígitos dentro
+            del nombre; si no hay, usa el literal "NODATE").
+
+    Returns:
+        MD5 en hexadecimal, mayúsculas, de "{client_id}|{filename}|{fecha}".
+
+    Ejemplo:
+        generar_file_id("EBGR", "VS.EBGR.TC00.20260103.001.txt")
     """
     match = re.search(r"(\d{8})", filename)
     fecha = match.group(1) if match else "NODATE"
@@ -205,8 +277,22 @@ def generar_file_id(client_id: str, filename: str) -> str:
 
 def generar_file_id_unico(client_id: str, filename: str, content_hash: str) -> str:
     """
-    Genera un ID nuevo cuando llega el mismo archivo con contenido diferente.
-    Incorpora el content_hash para garantizar unicidad.
+    Genera un file_id nuevo cuando llega el mismo nombre de archivo con
+    contenido diferente (mismo generar_file_id pero content_hash distinto al
+    ya registrado) — incorpora el content_hash para garantizar unicidad entre
+    versiones del mismo archivo.
+
+    Args:
+        client_id: Código de cliente.
+        filename: Nombre del archivo.
+        content_hash: MD5 del contenido del archivo (se usan los primeros 16
+            caracteres).
+
+    Returns:
+        MD5 en hexadecimal, mayúsculas, de "{client_id}|{filename}|{content_hash[:16]}".
+
+    Ejemplo:
+        generar_file_id_unico("EBGR", "VS.EBGR.TC00.20260103.001.txt", "AB12CD34...")
     """
     texto = f"{client_id}|{filename}|{content_hash[:16]}"
     return hashlib.md5(texto.encode()).hexdigest().upper()
@@ -227,6 +313,18 @@ def calcular_content_hash(bucket: str, key: str) -> str:
          (el ETag es el MD5 cuando no hay multipart upload).
       2. Si el ETag tiene el sufijo "-N" (multipart), calcular MD5 en streaming
          leyendo chunks de 1MB. Nunca hay más de 1MB en RAM.
+
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo.
+
+    Returns:
+        MD5 en hexadecimal, mayúsculas. Cadena vacía si falla el cálculo (el
+        caller debe usar file_id como fallback — ver el paso correspondiente
+        de lambda_handler).
+
+    Ejemplo:
+        calcular_content_hash(bucket, "EBGR/VS.EBGR.TC00.20260103.001.txt")
     """
     try:
         # Obtener metadata sin descargar el archivo
@@ -264,6 +362,19 @@ def obtener_file_size(bucket: str, key: str, event_size: int = 0) -> int:
     """
     Obtiene el tamaño del archivo. Usa el evento S3 como fallback
     para evitar un request extra si el evento ya trae el dato.
+
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo.
+        event_size: Tamaño ya reportado por el evento S3 (0 si no viene o es
+            desconocido).
+
+    Returns:
+        Tamaño en bytes (event_size si es > 0, sino un head_object; 0 si
+        falla).
+
+    Ejemplo:
+        obtener_file_size(bucket, key, event_size=104857600)  # 104857600
     """
     if event_size > 0:
         return event_size
@@ -283,6 +394,16 @@ def convertir_fecha_juliana(texto_juliano: str) -> Optional[str]:
     """
     Convierte formato YYDDD a YYYY-MM-DD.
     YY = año (00-99), DDD = día del año (001-365).
+
+    Args:
+        texto_juliano: String de 5 dígitos (YYDDD) a convertir.
+
+    Returns:
+        Fecha en formato "YYYY-MM-DD", o None si texto_juliano no tiene
+        exactamente 5 dígitos o no es una fecha juliana válida.
+
+    Ejemplo:
+        convertir_fecha_juliana("26004")  # "2026-01-04"
     """
     if not texto_juliano or not texto_juliano.isdigit() or len(texto_juliano) != 5:
         return None
@@ -295,7 +416,7 @@ def convertir_fecha_juliana(texto_juliano: str) -> Optional[str]:
 
 def extraer_fecha(bucket: str, key: str) -> str:
     """
-    Extrae la fecha de procesamiento del header del archivo CTF.
+    Extrae la fecha de procesamiento del header del archivo CTF (Visa).
 
     Lee solo los primeros 50 bytes (Range request) para no descargar
     el archivo completo. Funciona para archivos CTF 168 y VMS 170 chars.
@@ -304,6 +425,18 @@ def extraer_fecha(bucket: str, key: str) -> str:
       CTF 168: posición 8:13 de la línea
       VMS 170: idem, pero la línea tiene 2 bytes extra al inicio (pos 2-4)
                → ajustamos leyendo desde la posición 10:15
+
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo Visa CTF.
+
+    Returns:
+        Fecha en formato "YYYY-MM-DD", o la fecha actual (UTC) como fallback
+        si el header es demasiado corto o no se pudo detectar la fecha
+        juliana en ninguna de las 2 posiciones probadas.
+
+    Ejemplo:
+        extraer_fecha(bucket, "EBGR/VS.EBGR.TC00.20260103.001.txt")
     """
     fecha_default = datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -333,9 +466,26 @@ def extraer_fecha(bucket: str, key: str) -> str:
 
 def extraer_fecha_iar(bucket: str, key: str) -> str:
     """
-    Extrae la fecha de procesamiento del header de un archivo IAR en S3.
-    Retorna:
-        str: fecha en formato YYYY-MM-DD
+    Extrae la fecha de procesamiento del header de un archivo IAR
+    (Mastercard) en S3, leyendo solo los primeros 100 bytes. El primer
+    registro viene precedido por 4 bytes de longitud (big-endian); según la
+    longitud decodificada del registro (27 u 80 caracteres) la fecha está en
+    una posición y formato distintos.
+
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo IAR.
+
+    Returns:
+        Fecha en formato "YYYY-MM-DD".
+
+    Raises:
+        ValueError: si no se puede leer la longitud del primer registro, la
+            longitud es inválida, el header está incompleto, o su longitud
+            decodificada no es 27 ni 80 caracteres (formato desconocido).
+
+    Ejemplo:
+        extraer_fecha_iar(bucket, "EBGR/IAR.EBGR.20260103.txt")
     """
     encoding: str = "latin1"
     
@@ -385,8 +535,20 @@ def extraer_fecha_ardef(bucket: str, key:str) -> str: # POR TESTEAR
     posición 23-31: fecha en formato YYYYMMDD (ardef_header_date)
     posición 63-67: número de versión
 
-    Si hay varias líneas de cabecera (distintas versiones), retorna 
+    Si hay varias líneas de cabecera (distintas versiones), retorna
     la fecha de la versión más alta - mismo criterio que vi_interpreter.
+
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo ARDEF.
+
+    Returns:
+        Fecha en formato "YYYY-MM-DD", o la fecha actual (UTC) como fallback
+        si no se encuentra ningún header ARDEF válido en los primeros 32KB o
+        la fecha detectada no es parseable.
+
+    Ejemplo:
+        extraer_fecha_ardef(bucket, "EBGR/ARDEF.EBGR.20260103.txt")
     """
     fecha_default = datetime.utcnow().strftime("%Y-%m-%d")
     CHUNK_BYTES = 32 * 1024 # 32Kb
@@ -479,7 +641,22 @@ _MC_DE_SPEC: Dict[int, Dict] = {
 
 
 def _mc_to_bool(val) -> bool:
-    """Convierte un valor DynamoDB (bool/int/str) a bool."""
+    """
+    Convierte un valor DynamoDB (bool/int/str) a bool.
+
+    Args:
+        val: Valor a convertir — puede ser None, bool, o cualquier tipo
+            convertible a string (ej. "true", "1", "y", "yes", "t").
+
+    Returns:
+        True si val es bool True, o su representación string (lowercase,
+        strip) está en {'true','1','y','yes','t'}; False en cualquier otro
+        caso, incluido None.
+
+    Ejemplo:
+        _mc_to_bool("TRUE")  # True
+        _mc_to_bool(None)    # False
+    """
     if val is None:
         return False
     if isinstance(val, bool):
@@ -492,6 +669,17 @@ def _mc_decode_digits(raw: bytes, is_ebcdic: bool) -> str:
     Decodifica bytes de dígitos a string.
     ASCII  : bytes 0x30-0x39 → '0'-'9'
     EBCDIC : bytes 0xF0-0xF9 → '0'-'9'
+
+    Args:
+        raw: Bytes crudos a decodificar (dígitos numéricos).
+        is_ebcdic: True si los bytes están en EBCDIC, False si son ASCII/latin-1.
+
+    Returns:
+        String decodificado; los bytes EBCDIC fuera de rango 0xF0-0xF9 se
+        representan como '?'.
+
+    Ejemplo:
+        _mc_decode_digits(b'\xf1\xf2\xf3', is_ebcdic=True)  # "123"
     """
     if is_ebcdic:
         return ''.join(
@@ -506,6 +694,22 @@ def _mc_unblock_chunk(data: bytes, payload_size: int = 1012, sep_size: int = 2) 
     Desbloquea un chunk en formato 1014 bytes/bloque:
         [1012 bytes payload][2 bytes separador] …
     Replica unblock_1014() de mc_interpreter_handler sobre bytes ya cargados.
+    A diferencia de _mc_unblock_full, siempre descarta 2 bytes de separador
+    sin verificar que sean válidos — ver decisions.md → "Por qué el router
+    extrae la fecha MC descargando el archivo completo" para el problema que
+    esto causaba y por qué extraer_fecha_mc() usa _mc_unblock_full en su
+    lugar.
+
+    Args:
+        data: Bytes del archivo bloqueado.
+        payload_size: Tamaño del payload por bloque (default: 1012).
+        sep_size: Tamaño del separador por bloque (default: 2).
+
+    Returns:
+        Bytes desbloqueados (payloads concatenados, sin separadores).
+
+    Ejemplo:
+        _mc_unblock_chunk(data)
     """
     out = bytearray()
     pos = 0
@@ -525,9 +729,20 @@ def _mc_unblock_full(data: bytes, payload_size: int = 1012, sep_size: int = 2) -
     bytes quedan como parte del payload del siguiente bloque, evitando que el
     stream quede desalineado en archivos con separadores no estándar.
 
-    Separadores válidos: b"\\x40\\x40" (EBCDIC space), b"\\x20\\x20" (ASCII space),
-    b"\\x00\\x00" (null), b"" (vacío — no ocurre en archivos reales pero lo acepta
+    Separadores válidos: b"\x40\x40" (EBCDIC space), b"\x20\x20" (ASCII space),
+    b"\x00\x00" (null), b"" (vacío — no ocurre en archivos reales pero lo acepta
     el interpreter original).
+
+    Args:
+        data: Bytes del archivo bloqueado completo.
+        payload_size: Tamaño del payload por bloque (default: 1012).
+        sep_size: Tamaño del separador por bloque (default: 2).
+
+    Returns:
+        Bytes desbloqueados (payloads concatenados, sin separadores).
+
+    Ejemplo:
+        _mc_unblock_full(data)
     """
     valid_seps = (b"\x40\x40", b"\x20\x20", b"\x00\x00", b"")
     stream = io.BytesIO(data)
@@ -548,6 +763,16 @@ def _mc_parse_bitmap_fields(bitmap: bytes) -> List[int]:
     """
     Devuelve la lista de DEs presentes según el bitmap.
     Bit más significativo (MSB) primero → campo 1, 2, … 128.
+
+    Args:
+        bitmap: Bytes del bitmap primario (8 bytes) o primario+secundario (16
+            bytes) de un mensaje ISO-8583.
+
+    Returns:
+        Lista de números de DE presentes (1-indexados), en orden ascendente.
+
+    Ejemplo:
+        _mc_parse_bitmap_fields(bitmap_bytes)  # [2, 3, 4, ...]
     """
     fields: List[int] = []
     for i, byte in enumerate(bitmap):
@@ -562,6 +787,16 @@ def _mc_decode_de48(raw: bytes, is_ebcdic: bool) -> Optional[str]:
     Decodifica los bytes crudos de DE48 a string para parseo de PDS tags.
     ASCII  → latin-1
     EBCDIC → cp500
+
+    Args:
+        raw: Bytes crudos del DE48.
+        is_ebcdic: True si el mensaje está en EBCDIC.
+
+    Returns:
+        String decodificado, o None si la decodificación falla.
+
+    Ejemplo:
+        _mc_decode_de48(raw_bytes, is_ebcdic=True)
     """
     try:
         return raw.decode('cp500' if is_ebcdic else 'latin-1', errors='replace')
@@ -573,8 +808,20 @@ def _mc_extract_pds(pds_blob: str, target_tag: str) -> Optional[str]:
     """
     Extrae el valor de un tag PDS del blob DE48.
     Replica extract_pds_value_48_105() de mc_interpreter_handler.
- 
+
     Estructura PDS: [4 chars tag][3 chars longitud][datos …]
+
+    Args:
+        pds_blob: String decodificado del DE48 (secuencia de sub-elementos
+            PDS en formato TLV).
+        target_tag: Tag PDS a buscar, ej. "0105".
+
+    Returns:
+        Valor del tag encontrado, o None si no está presente o el blob está
+        corrupto (longitud declarada excede el blob).
+
+    Ejemplo:
+        _mc_extract_pds(pds_blob, "0105")  # file_idn
     """
     if not pds_blob:
         return None
@@ -602,13 +849,25 @@ def _mc_try_parse_1644_695(payload: bytes, is_ebcdic: bool) -> Optional[str]:
     """
     Para un payload de MTI 1644, intenta extraer file_dt si el mensaje es el
     trailer (function_code == "695").
- 
+
     Replica la lógica de add_headers_fields_697() en mc_interpreter_handler:
       1. Separar bitmap + body (mismo que split_mti_bitmap_body)
       2. Parsear DEs del body hasta DE48 siguiendo _MC_DE_SPEC
       3. DE24 → function_code → confirmar que sea "695"
       4. DE48 → decodificar → PDS tag "0105" → file_idn
       5. Retornar file_idn[3:9]  (= file_dt, formato YYMMDD)
+
+    Args:
+        payload: Bytes del mensaje completo (MTI de 4 bytes + bitmap + body).
+        is_ebcdic: True si el mensaje está en EBCDIC.
+
+    Returns:
+        file_dt en formato YYMMDD (6 caracteres), o None si el payload es
+        demasiado corto, no es function_code=695, o no se pudo extraer
+        file_idn del DE48.
+
+    Ejemplo:
+        _mc_try_parse_1644_695(payload, is_ebcdic=True)  # "260103"
     """
     # Separar bitmap y body (MTI ya conocido = 4 bytes del inicio)
     if len(payload) < 12:
@@ -687,11 +946,11 @@ def _mc_scan_for_695(data: bytes) -> Optional[str]:
     """
     Escanea un buffer de bytes buscando el PRIMER mensaje MTI 1644 con
     function_code 695 (trailer de archivo).
- 
+
     Se detiene en cuanto encuentra el primer trailer válido: todos los trailers
     de un mismo archivo comparten el mismo file_dt, por lo que no tiene sentido
     seguir escaneando si ya se encontró uno.
- 
+
     Estrategia de alineación:
       El buffer puede comenzar a mitad de un mensaje (leemos desde el final del
       archivo), por lo que buscamos linealmente posiciones donde:
@@ -699,8 +958,16 @@ def _mc_scan_for_695(data: bytes) -> Optional[str]:
         - Los 4 bytes siguientes sean dígitos ASCII o EBCDIC (MTI válido)
       Una vez en un límite válido, avanzamos de mensaje en mensaje con el
       prefijo de longitud.
- 
-    Retorna el file_dt (YYMMDD) del PRIMER 695 encontrado, o None.
+
+    Args:
+        data: Bytes del archivo (desbloqueado si aplica) a escanear.
+
+    Returns:
+        file_dt (YYMMDD) del primer trailer 695 encontrado, o None si no se
+        encontró ninguno.
+
+    Ejemplo:
+        _mc_scan_for_695(data)  # "260103" o None
     """
     n   = len(data)
     pos = 0
@@ -773,14 +1040,29 @@ def extraer_fecha_mc(
       Para archivos bloqueados (file_block=True):
         Aplica _mc_unblock_full() que replica exactamente unblock_1014() del
         mc_interpreter_handler, incluyendo valid_seps pushback. Esto es necesario
-        porque archivos con separadores no estándar (distintos de \\x40\\x40) generan
+        porque archivos con separadores no estándar (distintos de \x40\x40) generan
         desalineación de mensajes si se usa _mc_unblock_chunk() (que siempre salta
         2 bytes sin verificar). La desalineación hace que _mc_scan_for_695() no
-        encuentre el trailer 695 aunque exista en el archivo.
+        encuentre el trailer 695 aunque exista en el archivo — ver decisions.md →
+        "Por qué el router extrae la fecha MC descargando el archivo completo"
+        para el detalle completo de esta decisión (revertida desde un esquema de
+        lectura en chunks).
 
-    Parámetros:
-      file_block      : de clasificacion['file_block']      (patrón DynamoDB)
-      interpreter_fix : de clasificacion['interpreter_fix'] (documentado; no afecta el escaneo)
+    Args:
+        bucket: Bucket S3 donde está el archivo.
+        key: Key del archivo Mastercard IPM.
+        file_block: Si el archivo viene bloqueado en bloques de 1014 bytes
+            (de clasificacion['file_block'], patrón DynamoDB).
+        interpreter_fix: De clasificacion['interpreter_fix'] (documentado; no
+            afecta el escaneo de fecha).
+
+    Returns:
+        Fecha en formato "YYYY-MM-DD", o la fecha actual (UTC) como fallback
+        si el archivo está vacío, falla la descarga, o no se encuentra ningún
+        trailer 695.
+
+    Ejemplo:
+        extraer_fecha_mc(bucket, key, file_block=True, interpreter_fix=True)
     """
     fecha_default = datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -848,8 +1130,20 @@ def extraer_fecha_mc(
 
 def cargar_patrones(customer_code: str = None) -> List[Dict]:
     """
-    Carga patrones de clasificación desde DynamoDB.
+    Carga patrones de clasificación desde DynamoDB (tabla file_pattern).
     Filtra por customer_code o 'ALL', ordenados por prioridad.
+
+    Args:
+        customer_code: Código de cliente a filtrar (además de los patrones
+            'ALL', genéricos para cualquier cliente); si es None, no filtra
+            por cliente.
+
+    Returns:
+        Lista de patrones activos (is_active=1), ordenados por priority
+        ascendente, o lista vacía si no hay ninguno o falla la consulta.
+
+    Ejemplo:
+        cargar_patrones("EBGR")  # [{'pattern_id': ..., 'file_format': ..., ...}, ...]
     """
     try:
         table    = dynamodb.Table(TABLE_FILE_PATTERN)
@@ -889,6 +1183,20 @@ def clasificar_archivo(filename: str, patrones: List[Dict]) -> Optional[Dict]:
     """
     Aplica los patrones regex en orden de prioridad.
     Retorna la clasificación del primer match, o None.
+
+    Args:
+        filename: Nombre del archivo a clasificar.
+        patrones: Lista de patrones ya cargados y ordenados por prioridad
+            (ver cargar_patrones).
+
+    Returns:
+        Dict con brand, direction, file_type, customer_code, pattern_id,
+        file_block, interpreter_fix del primer patrón cuyo regex matchea
+        filename; o None si ninguno matchea.
+
+    Ejemplo:
+        clasificar_archivo("VS.EBGR.TC00.20260103.001.txt", patrones)
+        # {'brand': 'VISA', 'direction': 'IN', 'file_type': 'BASEII', ...}
     """
     for patron in patrones:
         regex = patron.get("file_format", "")
@@ -920,12 +1228,23 @@ def clasificar_archivo(filename: str, patrones: List[Dict]) -> Optional[Dict]:
 
 def verificar_duplicado(file_id: str, content_hash: str) -> Tuple[str, Optional[str]]:
     """
-    Verifica si el archivo ya fue procesado.
-    
+    Verifica si el archivo ya fue procesado, comparando su content_hash
+    contra el registro existente en DynamoDB (file_control) por file_id.
+
+    Args:
+        file_id: Identificador determinista del archivo (ver generar_file_id).
+        content_hash: MD5 del contenido actual del archivo.
+
     Returns:
-      ("nuevo", None)            → nunca visto
-      ("duplicado", file_id)     → mismo nombre Y mismo contenido → ignorar
-      ("version_nueva", file_id) → mismo nombre, distinto contenido → reprocesar
+        Tupla (estado, file_id_existente):
+          ("nuevo", None)            → nunca visto
+          ("duplicado", file_id)     → mismo nombre Y mismo contenido → ignorar
+          ("version_nueva", file_id) → mismo nombre, distinto contenido → reprocesar
+        Ante cualquier error de DynamoDB, retorna ("nuevo", None) como
+        fallback conservador.
+
+    Ejemplo:
+        verificar_duplicado(file_id, content_hash)  # ("duplicado", file_id)
     """
     try:
         table    = dynamodb.Table(TABLE_FILE_CONTROL)
@@ -956,8 +1275,28 @@ def registrar_archivo(
     content_hash: str, clasificacion: Dict, file_date: str
 ) -> bool:
     """
-    Crea el registro inicial del archivo en DynamoDB.
+    Crea el registro inicial del archivo en DynamoDB (tabla file_control).
     Estado inicial: PENDING.
+
+    Args:
+        file_id: Identificador del archivo (llave de partición).
+        client_id: Código de cliente.
+        filename: Nombre del archivo original.
+        bucket: Bucket S3 de landing.
+        s3_key: Key del archivo en landing.
+        file_size: Tamaño del archivo en bytes.
+        content_hash: MD5 del contenido del archivo.
+        clasificacion: Dict de clasificación (de clasificar_archivo), usado
+            para derivar brand_id y file_type.
+        file_date: Fecha de negocio del archivo, en formato "YYYY-MM-DD".
+
+    Returns:
+        True si el registro se creó exitosamente, False si falló (se loguea
+        el error, no se relanza).
+
+    Ejemplo:
+        registrar_archivo(file_id, "EBGR", filename, bucket, key, 104857600,
+                           content_hash, clasificacion, "2026-01-03")
     """
     try:
         table = dynamodb.Table(TABLE_FILE_CONTROL)
@@ -997,6 +1336,20 @@ def actualizar_estado(file_id: str, estado: str, error: str = None):
     """
     Actualiza el estado de procesamiento en DynamoDB.
     Estados: PENDING → PROCESSING → COMPLETED | FAILED
+
+    Args:
+        file_id: Identificador del archivo (llave de partición).
+        estado: Nuevo estado ("PROCESSING", "COMPLETED", "FAILED", etc. — se
+            normaliza a mayúscula).
+        error: Mensaje de error a registrar (solo relevante si estado es
+            "FAILED"); se trunca a 500 caracteres.
+
+    Returns:
+        None. Cualquier error de DynamoDB se loguea, no se relanza.
+
+    Ejemplo:
+        actualizar_estado(file_id, "PROCESSING")
+        actualizar_estado(file_id, "FAILED", "Timeout en Step Function")
     """
     try:
         table   = dynamodb.Table(TABLE_FILE_CONTROL)
@@ -1038,11 +1391,37 @@ def start_process(
     file_date: str, content_hash: str
 ) -> str:
     """
-    Inicia la ejecución de los procesos con toda la metadata del archivo.
+    Inicia la ejecución de los procesos con toda la metadata del archivo,
+    despachando según direction/brand: ARDEF/IAR invocan una Lambda directa
+    (async, sin Step Functions — ver decisions.md → "Por qué ARDEF e IAR no
+    usan Step Functions"), VISA/MASTERCARD inician la Step Function
+    correspondiente.
 
     El content_hash se usa downstream para nombrar los archivos Parquet.
     NUNCA debe ser vacío: si calcular_content_hash falla, el caller
     debe pasar file_id como fallback antes de llegar aquí.
+
+    Args:
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+        filename: Nombre del archivo original.
+        bucket: Bucket S3 de landing.
+        s3_key: Key del archivo en landing.
+        clasificacion: Dict de clasificación (de clasificar_archivo).
+        file_date: Fecha de negocio del archivo, en formato "YYYY-MM-DD".
+        content_hash: MD5 del contenido del archivo (nunca vacío).
+
+    Returns:
+        Referencia al proceso iniciado: el executionArn de la Step Function
+        (VISA/MASTERCARD), o "LAMBDA:{nombre}:{request_id}" (ARDEF/IAR).
+
+    Raises:
+        ValueError: si la combinación brand/direction no tiene un proceso
+            configurado.
+
+    Ejemplo:
+        start_process("EBGR", file_id, filename, bucket, key, clasificacion,
+                      "2026-01-03", content_hash)
     """
     direction = clasificacion['direction'].upper()
     brand = clasificacion['brand'].upper()
@@ -1117,8 +1496,31 @@ def start_process(
 
 def lambda_handler(event, context):
     """
-    Procesa eventos S3 de llegada de archivos a Landing.
-    Un evento puede contener múltiples records (batch de S3).
+    Punto de entrada de la Lambda lmbd-router. Se dispara por eventos S3
+    ObjectCreated en el bucket de landing — un evento puede contener múltiples
+    records (batch de S3), procesados independientemente (un fallo en un
+    record no aborta los demás).
+
+    Por cada record: extrae client_id/filename del path, delega a itx-unzip
+    si es un ZIP, carga y aplica los patrones de clasificación, genera el
+    file_id, calcula el content_hash en streaming, extrae la fecha de negocio
+    (lógica distinta por IAR/ARDEF/Visa/Mastercard), verifica duplicados
+    contra DynamoDB, registra el archivo (estado PENDING → PROCESSING) y
+    despacha el procesamiento (start_process).
+
+    Args:
+        event: Evento S3 con event['Records'], cada uno con
+            record['s3']['bucket']['name'] y record['s3']['object']['key'].
+        context: Contexto de ejecución de Lambda (no usado).
+
+    Returns:
+        Dict con statusCode=200 y body (JSON) con la lista results — un dict
+        por record procesado, con status en {"DELEGATED_TO_UNZIP", "STARTED",
+        "SKIPPED", "ERROR"} y detalles según el caso.
+
+    Ejemplo:
+        lambda_handler({'Records': [{'s3': {'bucket': {'name': '...'},
+                         'object': {'key': 'EBGR/VS.EBGR.TC00.20260103.001.txt'}}}]}, None)
     """
     logger.info("=== ITX Router Lambda ===")
     logger.info(f"Event: {json.dumps(event)}")

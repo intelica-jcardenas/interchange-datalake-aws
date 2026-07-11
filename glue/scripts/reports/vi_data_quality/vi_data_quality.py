@@ -1,83 +1,81 @@
-# =============================================================================
-# VI-DATA-QUALITY-BASEII (PySpark) - AWS Glue Job
-# =============================================================================
-# Módulo   : Data Quality – VISA BaseII (Transaccional)
-# Etapa    : 1 de 2 – Solo parte transaccional (BaseII)
-# Pendiente: Etapa 2 – Parte de liquidación (VSS 130), pendiente de validación.
-#
-# DESCRIPCIÓN FUNCIONAL
-# ─────────────────────
-# Replica en PySpark (AWS Glue 4.0) la lógica del Standard 1.0 implementada
-# en la función PostgreSQL get_visa_validation_results_baseii().
-#
-# Lee los parquets BaseII del bucket Operational (que ya contienen datos
-# fusionados de las etapas CLN + CAL + ITX), aplica filtros de condiciones
-# de validación y tablas de referencia, y genera un parquet de resumen
-# agrupado con métricas de calidad de datos transaccional VISA.
-#
-# EQUIVALENCIA Standard 1.0 → Standard 2.0
-# ──────────────────────────────────────────
-#   dh_visa_transaction                     → operational/{client}/VISA/baseii_drafts/
-#   dh_visa_transaction_calculated_field    → mismo parquet BaseII (campos _cln embebidos)
-#   dh_visa_interchange (T3)                → mismo parquet BaseII (campos _itx embebidos)
-#   T3.calculated_value                     → interchange_fee_amount_itx
-#   T3.fee_currency                         → interchange_fee_currency
-#   M3.fee_descriptor (m_interchange_rules) → interchange_fee_descriptor (pre-calculado)
-#   m_visa_business_transaction_type (M1)   → reference/visa_business_transaction_type/
-#   m_visa_business_transaction_cycle (M2)  → reference/visa_business_transaction_cycle/
-#   dh_exchange_rate (X1, X2)              → reference/exchange-rates-glue/ (Hive: brand=/exchange_date=)
-#   t_customer                              → DynamoDB: itl-0004-itx-dev-dynamo-client-02
-#   t_control_file (SBSA hash filter)       → DynamoDB: itl-0004-itx-dev-dynamo-file_control-02
-#   validation.validation_conditions        → reference/validation_conditions/data.parquet
-#
-# PARÁMETROS DE ENTRADA (Glue Job Arguments)
-# ────────────────────────────────────────────
-#   --client_id                   Un cliente o varios separados por coma: "EBGR" | "EBGR,SBSA"
-#   --issuer_acquirer_indicator   Un modo o ambos separados por coma: "A" | "I" | "A,I"
-#                                   · A → Acquirer (file_type=OUT)
-#                                   · I → Issuer   (file_type=IN)
-#   --start_date                  YYYY-MM-DD (inicio del rango a procesar)
-#   --end_date                    YYYY-MM-DD (fin del rango a procesar)
-#   --operational_bucket          itl-0004-itx-dev-intchg-02-s3-operational
-#   --reference_bucket            itl-0004-itx-dev-intchg-02-s3-reference
-#   --analytics_bucket            itl-0004-itx-dev-intchg-02-s3-analytics
-#   --dynamodb_table_client       itl-0004-itx-dev-dynamo-client-02
-#   --dynamodb_table_file_control itl-0004-itx-dev-dynamo-file_control-02
-#
-#   --brand_local_override        (OPCIONAL) Fuerza un único valor de brand_local para
-#                                   todos los clientes del run. Solo se respeta si el
-#                                   cliente tiene 'hash_file_filter' configurado en
-#                                   validation_conditions. Si el cliente no lo tiene,
-#                                   el override se ignora con un WARNING en el log y se
-#                                   usa el comportamiento estándar ('default').
-#                                   Valores válidos: brand | local
-#                                   Ejemplo de uso manual/selectivo para SBSA:
-#                                     solo brand → --brand_local_override brand
-#                                     solo local → --brand_local_override local
-#                                   Si NO se pasa este parámetro, los valores a iterar
-#                                   se leen desde validation_conditions
-#                                   (vc_condition_type='brand_local_values').
-#                                   Clientes sin fila configurada usan ['default'].
-#
-# OUTPUT PARQUET
-# ──────────────
-#   Un Parquet por client_id:
-#   s3://{analytics_bucket}/{client_id}/reports/tst_{client_id}_data_quality.parquet
-#   Columnas: app_processing_date, data_source, file_source, app_customer_code,
-#             business_mode, jurisdiction, settlement_currency, reversal_indicator,
-#             trx_type, trx_cycle, fee_descriptor, report_currency_code,
-#             trx_count, trx_amt, itx_amt
-#
-# NOTAS IMPORTANTES
-# ─────────────────
-#   · SMS (get_visa_validation_results_sms): NO aplica. Confirmado que no se
-#     invoca en el store procedure de Standard 1.0 y no existe en Standard 2.0.
-#   · iqa_setcur: NO aplica para VI/BaseII/validation. Siempre se usa la lógica
-#     default (settlement_report_currency_code vs local_currency_code).
-#   · WHERE conditions (base_ii_restriction): la tabla validation_conditions no
-#     contiene condiciones WHERE para VI/BaseII/validation actualmente. Se lee y
-#     loguea por extensibilidad, pero no se aplica ningún filtro adicional.
-# =============================================================================
+"""
+vi_data_quality.py — Job real: itl-0004-itx-dev-intchg-02-glue-vi-data-quality
+================================================================================
+Archivo:     glue/scripts/reports/vi_data_quality/vi_data_quality.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/vi_data_quality.py
+
+Data Quality – VISA BaseII (Transaccional). Etapa 1 de 2 – Solo parte
+transaccional (BaseII).
+Pendiente: Etapa 2 – Parte de liquidación (VSS 130), pendiente de validación.
+Aún no integrado a ningún Step Function (ver CLAUDE.md → tabla de Glue
+Jobs) — smoke test OK (2026-07-08), sin ejecución en producción.
+
+Replica en PySpark (AWS Glue 4.0) la lógica del Standard 1.0 implementada
+en la función PostgreSQL get_visa_validation_results_baseii().
+
+Lee los parquets BaseII del bucket Operational (que ya contienen datos
+fusionados de las etapas CLN + CAL + ITX), aplica filtros de condiciones
+de validación y tablas de referencia, y genera un parquet de resumen
+agrupado con métricas de calidad de datos transaccional VISA.
+
+Equivalencia Standard 1.0 → Standard 2.0:
+  dh_visa_transaction                     → operational/{client}/VISA/baseii_drafts/
+  dh_visa_transaction_calculated_field    → mismo parquet BaseII (campos _cln embebidos)
+  dh_visa_interchange (T3)                → mismo parquet BaseII (campos _itx embebidos)
+  T3.calculated_value                     → interchange_fee_amount_itx
+  T3.fee_currency                         → interchange_fee_currency
+  M3.fee_descriptor (m_interchange_rules) → interchange_fee_descriptor (pre-calculado)
+  m_visa_business_transaction_type (M1)   → reference/visa_business_transaction_type/
+  m_visa_business_transaction_cycle (M2)  → reference/visa_business_transaction_cycle/
+  dh_exchange_rate (X1, X2)               → reference/exchange-rates-glue/ (Hive: brand=/exchange_date=)
+  t_customer                              → DynamoDB: itl-0004-itx-dev-dynamo-client-02
+  t_control_file (SBSA hash filter)       → DynamoDB: itl-0004-itx-dev-dynamo-file_control-02
+  validation.validation_conditions        → reference/validation_conditions/data.parquet
+
+Job Parameters:
+  --client_id                   Un cliente o varios separados por coma: "EBGR" | "EBGR,SBSA"
+  --issuer_acquirer_indicator   Un modo o ambos separados por coma: "A" | "I" | "A,I"
+                                   · A → Acquirer (file_type=OUT)
+                                   · I → Issuer   (file_type=IN)
+  --start_date                  YYYY-MM-DD (inicio del rango a procesar)
+  --end_date                    YYYY-MM-DD (fin del rango a procesar)
+  --operational_bucket          itl-0004-itx-dev-intchg-02-s3-operational
+  --reference_bucket            itl-0004-itx-dev-intchg-02-s3-reference
+  --analytics_bucket            itl-0004-itx-dev-intchg-02-s3-analytics
+  --dynamodb_table_client       itl-0004-itx-dev-dynamo-client-02
+  --dynamodb_table_file_control itl-0004-itx-dev-dynamo-file_control-02
+  --brand_local_override        (OPCIONAL) Fuerza un único valor de brand_local para
+                                   todos los clientes del run. Solo se respeta si el
+                                   cliente tiene 'hash_file_filter' configurado en
+                                   validation_conditions. Si el cliente no lo tiene,
+                                   el override se ignora con un WARNING en el log y se
+                                   usa el comportamiento estándar ('default').
+                                   Valores válidos: brand | local
+                                   Ejemplo de uso manual/selectivo para SBSA:
+                                     solo brand → --brand_local_override brand
+                                     solo local → --brand_local_override local
+                                   Si NO se pasa este parámetro, los valores a iterar
+                                   se leen desde validation_conditions
+                                   (vc_condition_type='brand_local_values').
+                                   Clientes sin fila configurada usan ['default'].
+
+Salida:
+  Un Parquet por client_id:
+  s3://{analytics_bucket}/{client_id}/reports/tst_{client_id}_data_quality.parquet
+  Columnas: app_processing_date, data_source, file_source, app_customer_code,
+            business_mode, jurisdiction, settlement_currency, reversal_indicator,
+            trx_type, trx_cycle, fee_descriptor, report_currency_code,
+            trx_count, trx_amt, itx_amt
+
+Notas importantes:
+  · SMS (get_visa_validation_results_sms): NO aplica. Confirmado que no se
+    invoca en el store procedure de Standard 1.0 y no existe en Standard 2.0.
+  · iqa_setcur: NO aplica para VI/BaseII/validation. Siempre se usa la lógica
+    default (settlement_report_currency_code vs local_currency_code).
+  · WHERE conditions (base_ii_restriction): la tabla validation_conditions no
+    contiene condiciones WHERE para VI/BaseII/validation actualmente. Se lee y
+    loguea por extensibilidad, pero no se aplica ningún filtro adicional.
+"""
 
 import sys
 from awsglue.utils import getResolvedOptions
@@ -1283,6 +1281,27 @@ def aggregate_vss_results(df: DataFrame) -> DataFrame:
 # =============================================================================
 
 def main():
+    """
+    Punto de entrada del Glue job glue-vi-data-quality. Resuelve los
+    argumentos del job (incluyendo las listas multi-valor client_id e
+    issuer_acquirer_indicator, y el parámetro opcional
+    brand_local_override leído directamente de sys.argv), carga las
+    tablas de referencia comunes (validation_conditions,
+    visa_business_transaction_type, visa_business_transaction_cycle,
+    exchange rates) y, para cada combinación de cliente ×
+    issuer_acquirer_indicator × brand_local, ejecuta el pipeline BaseII
+    (equivalente a get_visa_validation_results_baseii()) y el pipeline
+    VSS (equivalente a get_visa_validation_results_vss()), acumulando los
+    resultados parciales. Al final de cada cliente, une todos los
+    parciales y escribe un único Parquet de resumen a
+    s3://{analytics_bucket}/{client_id}/reports/tst_{client_id}_data_quality.parquet.
+
+    Returns:
+        None. Llama a job.commit() al finalizar.
+
+    Ejemplo:
+        main()  # invocado automáticamente al ejecutar el script como Glue job
+    """
     args = getResolvedOptions(sys.argv, [
         "JOB_NAME",
         "client_id",

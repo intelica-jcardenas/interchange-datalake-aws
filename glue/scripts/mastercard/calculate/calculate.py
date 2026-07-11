@@ -1,45 +1,61 @@
-# =============================================================================
-# calculate.py — AWS Glue Job: Mastercard IPM Calculate
-# =============================================================================
-# Glue Job: itl-0004-itx-dev-intchg-02-glue-mc-calculate
-# Glue 4.0 | Spark 3.3 | Python 3 | Worker G.1X x2
-#
-# Adapta mc_calculate.py para AWS Glue, reemplazando:
-#   - SQLite  (Database)       →  DynamoDB  (boto3)
-#   - Filesystem (FileStorage) →  S3        (Spark + boto3)
-#   - DuckDB enrichers         →  PySpark / Spark SQL
-#
-# Lógica de negocio preservada al 100%:
-#   PASO 2+3+4  →  calculate_pre2()          (range-join IAR con bucket-prefix)
-#   PASO 5      →  calculate_ex_rate()        (exchange rates desde S3 Hive)
-#   PASO 7      →  calculate_settlement_report()
-#   PASO FINAL  →  calculate_final_fields()   (ensamble + jurisdiction_assigned)
-#   EXCLUDE     →  build_lookup_691_spark() + apply_exclude_flag()
-#
-# Job Parameters (siempre presentes):
-#   --S3_REFERENCE         s3://itl-0004-itx-dev-intchg-02-s3-reference
-#   --S3_STAGING           s3://itl-0004-itx-dev-intchg-02-s3-staging
-#
-# Job Parameters (pasados por el orquestador en cada ejecución):
-#   --client_id            ID del cliente  (ej: "CLIENT01")
-#   --file_id              ID del archivo  (ej: "ABC123XYZ...")
-#   --file_type            IN | OUT
-#   --file_date            YYYY-MM-DD  (fecha del archivo, para IAR y exchange_rate)
-#   --outputs              JSON: [{"mti":"1240","s3_key":"staging/…"}, …]
-#   --dynamodb_table_client  tabla DynamoDB de clientes
-#   --s3_key_1644_cln      path en staging del folder 400_IPM_1644_CLN  (para lookup 691)
-#
-# Estructura S3 esperada:
-#   [S3_REFERENCE]/country/data.parquet
-#   [S3_REFERENCE]/region/data.parquet
-#   [S3_REFERENCE]/currency/data.parquet
-#   [S3_REFERENCE]/mastercard_brand_product/data.parquet
-#   [S3_REFERENCE]/mastercard_iar/historic_data.parquet   ← PROVISIONAL
-#   [S3_REFERENCE]/exchange-rates-glue/brand=Mastercard/exchange_date=YYYY-MM-DD/*.parquet
-#
-#   [S3_STAGING]/{s3_key_input}/…_1240.parquet            ← CLN input
-#   [S3_STAGING]/{s3_key_output}/…_1240.parquet           ← CAL output
-# =============================================================================
+"""
+calculate.py — Job real: itl-0004-itx-dev-intchg-02-glue-mc-calculate
+================================================================================
+Archivo:     glue/scripts/mastercard/calculate/calculate.py
+Glue 4.0 | Spark 3.3 | Python 3 | Worker G.1X x2
+
+Quinta etapa del pipeline Mastercard. Calcula los campos derivados
+necesarios para la tarificación IAR a partir del CLN: cruce de rangos IAR
+(business_mode, jurisdiction), tipos de cambio (exchange-rates-glue),
+settlement report, y ensamble final con jurisdiction_assigned. Lee CLN
+desde s3-staging/400_IPM_{mti}_CLN/, escribe CAL a
+s3-staging/500_IPM_{mti}_CAL/.
+
+Adapta mc_calculate.py (prototipo local) para AWS Glue, reemplazando:
+  - SQLite  (Database)       →  DynamoDB  (boto3)
+  - Filesystem (FileStorage) →  S3        (Spark + boto3)
+  - DuckDB enrichers         →  PySpark / Spark SQL
+
+Lógica de negocio preservada al 100% respecto al prototipo:
+  PASO 2+3+4  →  calculate_pre2()          (range-join IAR con bucket-prefix)
+  PASO 5      →  calculate_ex_rate()        (exchange rates desde S3 Hive)
+  PASO 7      →  calculate_settlement_report()
+  PASO FINAL  →  calculate_final_fields()   (ensamble + jurisdiction_assigned)
+  EXCLUDE     →  build_lookup_691_spark() + apply_exclude_flag()
+
+El schema CLN se construye dinámicamente desde DynamoDB
+(build_cln_schema_from_dynamodb) en vez de estar hardcodeado, igual
+patrón que glue-mc-interchange (evita el error de TIMESTAMP(NANOS) al
+inferir schema).
+
+Job Parameters (siempre presentes):
+  --S3_REFERENCE         s3://itl-0004-itx-dev-intchg-02-s3-reference
+  --S3_STAGING           s3://itl-0004-itx-dev-intchg-02-s3-staging
+
+Job Parameters (pasados por el orquestador en cada ejecución):
+  --client_id              ID del cliente  (ej: "CLIENT01")
+  --file_id                ID del archivo  (ej: "ABC123XYZ...")
+  --file_type              IN | OUT
+  --file_date              YYYY-MM-DD  (fecha del archivo, para IAR y exchange_rate)
+  --outputs                JSON: [{"mti":"1240","s3_key":"staging/…"}, …]
+  --dynamodb_table_client  tabla DynamoDB de clientes
+  --dynamodb_table_fields  tabla DynamoDB de campos Mastercard (layout CLN)
+  --content_hash           MD5 del archivo origen (propagado a CAL, ver
+                              decisions.md → "Por qué se agrega
+                              content_hash en el pipeline Mastercard")
+  --s3_key_1644_cln        path en staging del folder 400_IPM_1644_CLN (para lookup 691)
+
+Estructura S3 esperada:
+  [S3_REFERENCE]/country/data.parquet
+  [S3_REFERENCE]/region/data.parquet
+  [S3_REFERENCE]/currency/data.parquet
+  [S3_REFERENCE]/mastercard_brand_product/data.parquet
+  [S3_REFERENCE]/mastercard_iar/historic_data.parquet   ← PROVISIONAL
+  [S3_REFERENCE]/exchange-rates-glue/brand=Mastercard/exchange_date=YYYY-MM-DD/*.parquet
+
+  [S3_STAGING]/{s3_key_input}/…_1240.parquet            ← CLN input
+  [S3_STAGING]/{s3_key_output}/…_1240.parquet           ← CAL output
+"""
 
 from __future__ import annotations
  
@@ -625,6 +641,16 @@ def calculate_pre2(
  
     # ── Client BINs ───────────────────────────────────────────────────────────
     def _split_bins(val: str) -> list[str]:
+        """
+        Convierte una lista de BINs separada por coma (de DynamoDB client)
+        en una lista de strings recortados, descartando entradas vacías.
+
+        Args:
+            val: String de BINs separados por coma, ej. "411111,422222".
+
+        Returns:
+            Lista de BINs recortados, ej. ["411111", "422222"].
+        """
         return [b.strip() for b in str(val).split(",") if b.strip()]
  
     issuing_bins_6 = _split_bins(client_data.get("issuing_bins_6_digits", ""))
@@ -838,6 +864,17 @@ def calculate_ex_rate(
  
     # ── Numeric codes para settlement y local (desde currency lookup) ─────────
     def _resolve_currency_numeric(alpha_code: str) -> Optional[int]:
+        """
+        Resuelve el código numérico ISO de una moneda a partir de su
+        código alfabético, vía lookup contra currency_df.
+
+        Args:
+            alpha_code: Código alfabético de moneda, ej. "USD".
+
+        Returns:
+            Código numérico ISO como int, o None si alpha_code está vacío
+            o no se encuentra en currency_df (se loguea un warning).
+        """
         if not alpha_code:
             return None
         row = (
@@ -1552,6 +1589,21 @@ def process_file(
 # =============================================================================
  
 def main():
+    """
+    Punto de entrada del Glue job glue-mc-calculate. Resuelve los
+    argumentos del job, carga los datos del cliente (DynamoDB) y
+    construye el schema CLN dinámico desde DynamoDB para cada MTI
+    transaccional presente en --outputs, y ejecuta el pipeline de cálculo
+    completo (calculate_pre2 → calculate_ex_rate →
+    calculate_settlement_report → calculate_final_fields, más el lookup
+    691/exclude flag) por cada MTI, vía process_file().
+
+    Returns:
+        None. Llama a job.commit() al finalizar.
+
+    Ejemplo:
+        main()  # invocado automáticamente al ejecutar el script como Glue job
+    """
     args = getResolvedOptions(sys.argv, [
         "JOB_NAME",
         "S3_REFERENCE",

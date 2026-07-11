@@ -1,3 +1,54 @@
+"""
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-exchange-rates
+================================================================================
+Archivo:     lambdas/mastercard/exchange-rates/src/handler.py
+
+Scrapea tipos de cambio históricos de Mastercard consultando la API pública
+del conversor de moneda (mccom-services/currency-conversions/conversion-rates),
+que no tiene equivalente oficial documentado — a diferencia de Visa, Mastercard
+no expone una fuente oficial de tipos de cambio históricos. La API aplica
+rate-limiting/bloqueo agresivo por IP, por lo que el scraping rota proxies
+(ProxyManager) y espacia requests (PAUSE_MIN/PAUSE_MAX). Escribe a
+`exchange-rates/brand=Mastercard/exchange_date=YYYY-MM-DD/` en s3-reference
+— fuente cruda (solo códigos alfabéticos), enriquecida después con códigos
+numéricos por el job glue-exchange-rates a `exchange-rates-glue/` (fuente
+oficial del pipeline, ver decisions.md → "Por qué se migró la fuente de
+tipo de cambio").
+
+Arquitectura orquestador/worker/consolidador encadenada (evita el timeout
+de 900s de un único Lambda al scrapear miles de pares de moneda por día):
+  - orchestrator: valida fechas, arma la lista completa de pares de moneda,
+    la divide en NUM_CHUNKS y dispara el primer worker (async) por cada
+    fecha del rango.
+  - worker: procesa un chunk de pares con un pool de hilos
+    (ThreadPoolExecutor, MAX_WORKERS), usando ProxyManager para rotar
+    proxies y banear los que fallan; guarda su resultado como un Parquet
+    temporal en S3 y se auto-invoca (async) para el siguiente chunk —
+    hasta agotar los chunks, momento en que dispara el consolidador.
+  - consolidator: une todos los Parquets temporales de una fecha en un
+    único Parquet final y borra los temporales.
+
+Flujo:
+1. orchestrator: generar rango de fechas, cargar pares de moneda, borrar
+   Parquets existentes de esas fechas, dividir en chunks, invocar worker 0
+2. worker: cargar y validar proxies, dividir su chunk en sub-chunks (uno
+   por hilo), scrapear cada par con reintentos/backoff, guardar chunk
+   temporal en S3, invocar el siguiente worker (o el consolidador si era
+   el último chunk)
+3. consolidator: leer todos los chunks temporales de la fecha, concatenar,
+   escribir el Parquet final, borrar los temporales
+
+Variables de entorno:
+  S3_BUCKET      : bucket de referencia (default: itl-0004-itx-dev-intchg-02-s3-reference)
+  S3_PREFIX      : prefix de salida (default: exchange-rates/brand=Mastercard)
+  FUNCTION_NAME  : nombre de esta Lambda, usado para auto-invocarse en la cadena worker→worker→consolidator
+  BEGIN_DATE     : fecha de inicio del scraping si no viene en el evento (default: hoy UTC)
+  END_DATE       : fecha de fin del scraping si no viene en el evento (default: hoy UTC)
+
+Archivos de recursos (deployment package, no en DynamoDB):
+  resources/currencies.json      : catálogo de monedas (commiteado)
+  resources/proxy_settings.json  : credenciales de proxy (NO commiteado, en .gitignore)
+"""
 import io
 import os
 import json
@@ -68,12 +119,25 @@ DATE_FORMAT_FILE = "%Y%m%d"
 
 class ProxyManager:
     """
-    Thread-safe proxy pool manager.
-    Tracks failure counts globally across all threads so that a proxy
-    getting errors from different threads still accumulates toward the ban threshold.
+    Pool de proxies thread-safe para el scraping de Mastercard. Centraliza el
+    estado de fallas para que todos los hilos (ThreadPoolExecutor) cuenten
+    hacia el mismo límite de baneo — un proxy que falla en distintos hilos
+    igual acumula fallas hacia PROXY_BAN_AFTER, en vez de resetear el contador
+    por hilo.
     """
 
     def __init__(self, proxies: list[dict]):
+        """
+        Inicializa el pool a partir de la lista de proxies ya cargados,
+        descartando cualquiera que no venga con status="active".
+
+        Args:
+            proxies: Lista de dicts {"proxy": url, "status": "active"|...},
+                típicamente el resultado de validate_proxies().
+
+        Returns:
+            None.
+        """
         self._lock = threading.Lock()
         self._pool = [
             {"proxy": p["proxy"], "status": "active", "fails": 0}
@@ -82,11 +146,33 @@ class ProxyManager:
         ]
 
     def get_active(self) -> list[dict]:
+        """
+        Devuelve una copia de los proxies actualmente activos.
+
+        Returns:
+            Lista de dicts de proxy con status == "active".
+
+        Ejemplo:
+            proxy_manager.get_active()  # [{'proxy': 'http://...', 'status': 'active', 'fails': 0}, ...]
+        """
         with self._lock:
             return [p for p in self._pool if p["status"] == "active"]
 
     def pick(self, index: int) -> dict | None:
-        """Round-robin selection over active proxies only."""
+        """
+        Selecciona un proxy activo por round-robin, indexado por `index`
+        (típicamente el índice del par de moneda dentro del sub-chunk del hilo).
+
+        Args:
+            index: Índice a partir del cual elegir (se aplica módulo la cantidad
+                de proxies activos).
+
+        Returns:
+            Dict del proxy elegido, o None si no hay ningún proxy activo.
+
+        Ejemplo:
+            proxy_manager.pick(3)  # {'proxy': 'http://...', 'status': 'active', 'fails': 0}
+        """
         with self._lock:
             active = [p for p in self._pool if p["status"] == "active"]
             if not active:
@@ -95,8 +181,17 @@ class ProxyManager:
 
     def report_failure(self, proxy: dict) -> None:
         """
-        Increments the failure counter for a proxy.
-        Bans it globally once PROXY_BAN_AFTER consecutive failures are reached.
+        Incrementa el contador de fallas de un proxy y lo banea globalmente
+        (status→"inactive") si alcanza PROXY_BAN_AFTER fallas consecutivas.
+
+        Args:
+            proxy: Dict del proxy que falló (mismo objeto retornado por pick()).
+
+        Returns:
+            None.
+
+        Ejemplo:
+            proxy_manager.report_failure(proxy)
         """
         with self._lock:
             proxy["fails"] += 1
@@ -109,13 +204,38 @@ class ProxyManager:
                 )
 
     def report_success(self, proxy: dict) -> None:
-        """Resets the failure counter on a successful request."""
+        """
+        Resetea el contador de fallas de un proxy tras una request exitosa.
+
+        Args:
+            proxy: Dict del proxy que tuvo éxito.
+
+        Returns:
+            None.
+
+        Ejemplo:
+            proxy_manager.report_success(proxy)
+        """
         with self._lock:
             proxy["fails"] = 0
 
     @staticmethod
     def _mask_proxy_url(url: str) -> str:
-        """Masks credentials in proxy URL for safe logging."""
+        """
+        Enmascara las credenciales embebidas en una URL de proxy
+        (user:pass@host) para poder loguearla sin exponerlas.
+
+        Args:
+            url: URL completa del proxy, con o sin credenciales.
+
+        Returns:
+            URL con las credenciales reemplazadas por ***:***, o "***" si no se
+            pudo parsear.
+
+        Ejemplo:
+            ProxyManager._mask_proxy_url("http://user:pass@1.2.3.4:8080")
+            # "http://***:***@1.2.3.4:8080"
+        """
         try:
             if "@" in url:
                 protocol = url.split("://")[0]
@@ -127,10 +247,22 @@ class ProxyManager:
 
     @property
     def total(self) -> int:
+        """
+        Cantidad total de proxies en el pool (activos + baneados).
+
+        Returns:
+            Entero con el tamaño total del pool.
+        """
         return len(self._pool)
 
     @property
     def active_count(self) -> int:
+        """
+        Cantidad de proxies actualmente activos (no baneados).
+
+        Returns:
+            Entero con la cantidad de proxies activos.
+        """
         with self._lock:
             return sum(1 for p in self._pool if p["status"] == "active")
 
@@ -141,7 +273,20 @@ class ProxyManager:
 
 
 def load_proxy_settings() -> list[dict]:
-    """Loads active proxy list from the deployment package proxy_settings.json."""
+    """
+    Carga la lista de proxies activos desde el archivo del deployment
+    package resources/proxy_settings.json (no versionado en git, contiene
+    credenciales reales — ver decisions.md → "Por qué lmbd-mc-exchange-rates
+    se reescribió con scraping vía proxies").
+
+    Returns:
+        Lista de dicts de proxy con status == "active", o lista vacía si el
+        archivo no existe o no se pudo parsear (se loguea el error, no se
+        relanza).
+
+    Ejemplo:
+        load_proxy_settings()  # [{'proxy': 'http://user:pass@host:port', 'status': 'active'}, ...]
+    """
     try:
         with open("resources/proxy_settings.json", "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -160,8 +305,21 @@ def load_proxy_settings() -> list[dict]:
 
 def validate_proxies(proxies: list[dict]) -> list[dict]:
     """
-    Validates ALL proxies concurrently against Mastercard before starting the worker.
-    Discards any proxy that fails, times out, or returns non-200, logging the exact error.
+    Valida TODOS los proxies concurrentemente contra la API de Mastercard
+    antes de iniciar el worker, para no perder tiempo de scraping real con
+    proxies caídos. Descarta cualquier proxy que falle, dé timeout, o
+    responda con un status distinto de 200.
+
+    Args:
+        proxies: Lista de dicts de proxy a validar (típicamente el resultado
+            de load_proxy_settings()).
+
+    Returns:
+        Lista de dicts de proxy que pasaron la validación (subconjunto de
+        proxies), o lista vacía si proxies está vacía.
+
+    Ejemplo:
+        validate_proxies(load_proxy_settings())  # solo los proxies que respondieron 200
     """
     if not proxies:
         return []
@@ -180,6 +338,20 @@ def validate_proxies(proxies: list[dict]) -> list[dict]:
     }
 
     def check_proxy(proxy_dict: dict) -> dict | None:
+        """
+        Prueba un único proxy contra la API de Mastercard con una consulta de
+        prueba (USD→EUR), devolviéndolo solo si responde 200 con contenido.
+
+        Args:
+            proxy_dict: Dict de un proxy a probar.
+
+        Returns:
+            El mismo proxy_dict si la prueba fue exitosa, o None si falló, dio
+            timeout, o respondió con un status/código de error.
+
+        Ejemplo:
+            check_proxy({'proxy': 'http://...', 'status': 'active'})
+        """
         proxy_url = proxy_dict["proxy"]
         # Enmascaramos la credencial para un log seguro
         safe_url = ProxyManager._mask_proxy_url(proxy_url)
@@ -229,7 +401,18 @@ def validate_proxies(proxies: list[dict]) -> list[dict]:
 
 
 def fetch_currency_list() -> list[list[str]] | str:
-    """Loads the currency cross matrix from the local currencies.json file."""
+    """
+    Carga el catálogo de monedas desde resources/currencies.json (commiteado
+    en el repo) y arma todos los pares posibles origen≠destino (matriz
+    cruzada completa).
+
+    Returns:
+        Lista de pares [from_currency, to_currency], o el string "error" si
+        no se pudo cargar/parsear el archivo (se loguea el error).
+
+    Ejemplo:
+        fetch_currency_list()  # [['USD', 'EUR'], ['USD', 'GBP'], ...]
+    """
     try:
         with open("resources/currencies.json", "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -252,7 +435,25 @@ def fetch_currency_list() -> list[list[str]] | str:
 
 
 def generate_date_range(begin_date_str: str, end_date_str: str) -> list[str]:
-    """Returns a list of dates in MM/DD/YYYY format between two YYYY-MM-DD dates."""
+    """
+    Genera la lista de fechas (en formato de salida MM/DD/YYYY, el que
+    espera la API de Mastercard) entre dos fechas de entrada YYYY-MM-DD,
+    inclusive.
+
+    Args:
+        begin_date_str: Fecha de inicio en formato "YYYY-MM-DD".
+        end_date_str: Fecha de fin en formato "YYYY-MM-DD".
+
+    Returns:
+        Lista de fechas en formato "MM/DD/YYYY".
+
+    Raises:
+        ValueError: si alguna de las fechas no tiene el formato esperado.
+
+    Ejemplo:
+        generate_date_range("2026-01-01", "2026-01-03")
+        # ["01/01/2026", "01/02/2026", "01/03/2026"]
+    """
     try:
         begin = datetime.strptime(begin_date_str, DATE_FORMAT_INPUT)
         end = datetime.strptime(end_date_str, DATE_FORMAT_INPUT)
@@ -271,8 +472,20 @@ def generate_date_range(begin_date_str: str, end_date_str: str) -> list[str]:
 
 def split_into_chunks(items: list, num_chunks: int) -> list[list]:
     """
-    Splits a list into N evenly distributed chunks.
-    Remainder items are spread one-by-one across the first chunks.
+    Divide una lista en N chunks lo más parejos posible — el resto
+    (remainder) se reparte de a uno entre los primeros chunks, para que
+    ningún chunk tenga más de 1 elemento de diferencia respecto a los demás.
+
+    Args:
+        items: Lista a dividir (pares de moneda, o sub-chunks dentro de un
+            worker).
+        num_chunks: Cantidad de chunks a generar.
+
+    Returns:
+        Lista de num_chunks listas, con los elementos de items repartidos.
+
+    Ejemplo:
+        split_into_chunks([1, 2, 3, 4, 5], 2)  # [[1, 2, 3], [4, 5]]
     """
     try:
         chunk_size, remainder = divmod(len(items), num_chunks)
@@ -297,9 +510,19 @@ def split_into_chunks(items: list, num_chunks: int) -> list[list]:
 
 def delete_existing_parquets(date_str: str) -> int:
     """
-    Deletes all parquet files under the S3 prefix for a given date.
-    Used to clean up stale files before reprocessing.
-    Returns the number of deleted objects.
+    Borra todos los Parquets bajo el prefix S3 de una fecha dada, antes de
+    reprocesarla — evita mezclar chunks de una corrida anterior con la nueva.
+
+    Args:
+        date_str: Fecha en formato "YYYY-MM-DD", usada para construir el
+            prefix {S3_PREFIX}/exchange_date={date_str}/.
+
+    Returns:
+        Cantidad de objetos borrados (0 si no había ninguno). Relanza
+        cualquier excepción tras loguearla.
+
+    Ejemplo:
+        delete_existing_parquets("2026-01-03")  # 10
     """
     prefix = f"{S3_PREFIX}/exchange_date={date_str}/"
     try:
@@ -333,9 +556,27 @@ def delete_existing_parquets(date_str: str) -> int:
 
 def save_chunk_to_s3(records: list[dict], date_str: str, chunk_id: int) -> str:
     """
-    Serializes exchange rate records into a parquet file and uploads it to S3.
-    Skips records with missing fx_rate values.
-    Returns the S3 key of the saved file.
+    Serializa los registros de tipo de cambio de un chunk a Parquet y lo
+    sube a S3 como archivo temporal (temp_chunks/), a la espera de que el
+    consolidador los una. Descarta los registros con fx_rate vacío (pares
+    que fallaron el scraping) antes de escribir.
+
+    Args:
+        records: Lista de dicts {from_currency, to_currency, fx_rate,
+            creation_timestamp} del chunk (puede incluir registros fallidos
+            con fx_rate="").
+        date_str: Fecha en formato "YYYY-MM-DD".
+        chunk_id: Número de chunk (1-indexado), usado en el nombre del
+            archivo.
+
+    Returns:
+        S3 key del archivo temporal escrito (aunque no haya registros
+        válidos, en cuyo caso no se sube nada pero igual se retorna el key
+        calculado).
+
+    Ejemplo:
+        save_chunk_to_s3(records, "2026-01-03", 1)
+        # "exchange-rates/brand=Mastercard/exchange_date=2026-01-03/temp_chunks/20260103_chunk_1.parquet"
     """
     file_date = datetime.strptime(date_str, DATE_FORMAT_INPUT).strftime(
         DATE_FORMAT_FILE
@@ -392,8 +633,23 @@ def save_chunk_to_s3(records: list[dict], date_str: str, chunk_id: int) -> str:
 
 def invoke_next_worker(date: str, chunks: list, chunk_index: int) -> None:
     """
-    Invokes the next worker in the chain asynchronously.
-    Does nothing if chunk_index is out of range (chain is complete).
+    Invoca asincrónicamente (fire-and-forget) al siguiente eslabón de la
+    cadena: el próximo worker si quedan chunks por procesar, o el
+    consolidador si chunk_index ya superó la cantidad de chunks — así se
+    evita el timeout de un único Lambda procesando todos los pares de moneda
+    de una fecha.
+
+    Args:
+        date: Fecha en formato "MM/DD/YYYY" (formato interno de la cadena).
+        chunks: Lista completa de chunks de pares de moneda.
+        chunk_index: Índice del próximo chunk a procesar. Si es >= len(chunks),
+            se invoca el consolidador en su lugar.
+
+    Returns:
+        None. Relanza cualquier excepción de la invocación tras loguearla.
+
+    Ejemplo:
+        invoke_next_worker("01/03/2026", chunks, chunk_index=1)
     """
     if chunk_index >= len(chunks):
         logger.info("[invoke_next_worker] All chunks processed. Invoking consolidator...")
@@ -447,8 +703,32 @@ def process_sub_chunk(
     proxy_manager: ProxyManager,
 ) -> list[dict]:
     """
-    Processes a batch of currency pairs inside a single thread.
-    Uses ProxyManager for thread-safe proxy rotation and global failure tracking.
+    Procesa un sub-chunk de pares de moneda dentro de un único hilo,
+    reutilizando una sola sesión HTTP (curl_cffi, impersonando Chrome 120
+    para evadir fingerprinting básico). Por cada par: elige un proxy por
+    round-robin (ProxyManager.pick), hace la consulta, reporta éxito/falla
+    al ProxyManager, y espacia cada request con una pausa aleatoria
+    (PAUSE_MIN–PAUSE_MAX) para no gatillar rate-limiting. Ante HTTP 403/429
+    (bloqueo) o error de red (timeout/reset/aborted/connect), banea el
+    proxy usado; ante cualquier otro fallo, el par queda con fx_rate="" sin
+    reintentarse en esta pasada.
+
+    Args:
+        date: Fecha en formato "MM/DD/YYYY" (formato interno de la cadena).
+        sub_chunk: Lista de pares [from_currency, to_currency] a scrapear en
+            este hilo.
+        worker_id: Número de hilo dentro del worker (solo para logging).
+        proxy_manager: Pool de proxies compartido entre todos los hilos del
+            worker.
+
+    Returns:
+        Lista de dicts {from_currency, to_currency, fx_rate,
+        creation_timestamp}, uno por cada par de sub_chunk (con fx_rate=""
+        para los que fallaron).
+
+    Ejemplo:
+        process_sub_chunk("01/03/2026", [["USD", "EUR"]], 1, proxy_manager)
+        # [{'from_currency': 'USD', 'to_currency': 'EUR', 'fx_rate': 0.92, ...}]
     """
     date_str = datetime.strptime(date, DATE_FORMAT_OUTPUT).strftime(DATE_FORMAT_INPUT)
     thread_records = []
@@ -558,11 +838,24 @@ def process_sub_chunk(
 
 def run_orchestrator(begin_date: str, end_date: str) -> dict:
     """
-    Orchestrator role:
-    - Loads and validates proxies
-    - Fetches the full currency pair list
-    - Deletes existing parquet files for each date before reprocessing
-    - Kicks off the worker chain (chunk_index=0)
+    Rol orquestador de la cadena: valida el rango de fechas, arma la lista
+    completa de pares de moneda, borra los Parquets existentes de cada fecha
+    (para no mezclar con una corrida anterior) y dispara la cadena de
+    workers (chunk_index=0) para cada fecha del rango, de forma
+    asincrónica.
+
+    Args:
+        begin_date: Fecha de inicio en formato "YYYY-MM-DD".
+        end_date: Fecha de fin en formato "YYYY-MM-DD".
+
+    Returns:
+        Dict con statusCode, mode="orchestrator", chains (cantidad de
+        fechas/cadenas iniciadas), total_pairs y dates. Relanza cualquier
+        excepción tras loguearla.
+
+    Ejemplo:
+        run_orchestrator("2026-01-01", "2026-01-03")
+        # {'statusCode': 200, 'mode': 'orchestrator', 'chains': 3, 'total_pairs': 380, ...}
     """
     logger.info(f"[ORCHESTRATOR] Starting | begin={begin_date} | end={end_date}")
 
@@ -607,11 +900,28 @@ def run_orchestrator(begin_date: str, end_date: str) -> dict:
 
 def run_worker(date: str, chunks: list, chunk_index: int) -> dict:
     """
-    Worker role:
-    - Loads and initializes the ProxyManager for this execution
-    - Splits its chunk into sub-chunks, one per thread
-    - Processes all pairs and saves results to S3
-    - Invokes the next worker in the chain
+    Rol worker de la cadena: procesa un único chunk de pares de moneda para
+    una fecha. Carga y valida los proxies (nueva validación en cada
+    invocación, porque cada worker es una ejecución de Lambda distinta),
+    divide su chunk en sub-chunks (uno por hilo, hasta MAX_WORKERS hilos
+    concurrentes vía ThreadPoolExecutor), junta los resultados de todos los
+    hilos, los sube a S3 como Parquet temporal (save_chunk_to_s3), e invoca
+    al siguiente worker de la cadena (o al consolidador si era el último
+    chunk).
+
+    Args:
+        date: Fecha en formato "MM/DD/YYYY" (formato interno de la cadena).
+        chunks: Lista completa de chunks de pares de moneda para esta fecha.
+        chunk_index: Índice del chunk que le toca procesar a este worker
+            (0-indexado).
+
+    Returns:
+        Dict con statusCode, mode="worker", chunk_id, records_ok,
+        records_skip y s3_key. Relanza cualquier excepción tras loguearla.
+
+    Ejemplo:
+        run_worker("01/03/2026", chunks, chunk_index=0)
+        # {'statusCode': 200, 'mode': 'worker', 'chunk_id': 1, 'records_ok': 36, ...}
     """
     chunk_id = chunk_index + 1
     pairs = chunks[chunk_index]
@@ -683,11 +993,23 @@ def run_worker(date: str, chunks: list, chunk_index: int) -> dict:
 
 def run_consolidator(date: str) -> dict:
     """
-    Consolidator role:
-    - Reads all parquet chunks from the temp_chunks directory for a given date.
-    - Concatenates them into a single PyArrow table.
-    - Saves the unified parquet file to the final S3 path.
-    - Deletes the temporary chunks.
+    Rol consolidador de la cadena: une todos los Parquets temporales de una
+    fecha (temp_chunks/) en un único Parquet final, y borra los temporales
+    tras escribirlo — última etapa de la cadena
+    orquestador→worker(s)→consolidador.
+
+    Args:
+        date: Fecha en formato "MM/DD/YYYY" (formato interno de la cadena).
+
+    Returns:
+        Dict con statusCode, mode="consolidator", date, total_records y
+        final_file; o {"statusCode": 200, "message": "No data to
+        consolidate"} si no había chunks temporales que consolidar. Relanza
+        cualquier excepción tras loguearla.
+
+    Ejemplo:
+        run_consolidator("01/03/2026")
+        # {'statusCode': 200, 'mode': 'consolidator', 'total_records': 380, ...}
     """
     date_str = datetime.strptime(date, DATE_FORMAT_OUTPUT).strftime(DATE_FORMAT_INPUT)
     file_date = datetime.strptime(date, DATE_FORMAT_OUTPUT).strftime(DATE_FORMAT_FILE)
@@ -762,6 +1084,31 @@ def run_consolidator(date: str) -> dict:
 
 def lambda_handler(event: dict, context) -> dict:
     # logger.info(f"[lambda_handler] RAW EVENT: {json.dumps(event)}")
+    """
+    Punto de entrada de la Lambda lmbd-mc-exchange-rates. Despacha según el
+    campo mode del evento al rol correspondiente de la cadena
+    orquestador/worker/consolidador — la primera invocación (disparada
+    externamente, ej. por un scheduler) es siempre mode="orchestrator"; las
+    siguientes (worker, consolidator) se auto-invocan entre sí de forma
+    asincrónica (ver invoke_next_worker).
+
+    Args:
+        event: Payload con mode ("orchestrator", "worker" o "consolidator")
+            y los campos específicos de cada rol — begin_date/end_date
+            (orchestrator, opcionales, default BEGIN_DATE/END_DATE),
+            date+chunks+chunk_index (worker), date (consolidator).
+        context: Contexto de ejecución de Lambda (no usado).
+
+    Returns:
+        Dict de resultado del rol invocado (ver run_orchestrator, run_worker,
+        run_consolidator). Lanza ValueError si mode no es ninguno de los tres
+        válidos, o KeyError si falta un campo requerido para el modo (date,
+        chunks).
+
+    Ejemplo:
+        lambda_handler({'mode': 'orchestrator', 'begin_date': '2026-01-01',
+                         'end_date': '2026-01-03'}, context)
+    """
     mode = event.get("mode", "orchestrator")
     logger.info(f"[lambda_handler] Event received | mode={mode}")
 

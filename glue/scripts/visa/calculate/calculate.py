@@ -5,6 +5,59 @@
 # Soporta: BASEII (drafts), SMS (messages), VSS (settlement 110/120/130/140)
 # =============================================================================
  
+"""
+calculate.py — Job real: itl-0004-itx-dev-intchg-02-glue-vi-calculate
+================================================================================
+Archivo:     glue/scripts/visa/calculate/calculate.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/visa/calculate.py
+
+Cuarta etapa del pipeline Visa. Calcula los campos derivados necesarios
+para la tarificación de interchange a partir del CLN (clean): tipo de
+transacción, ciclo, país/región del emisor (cruzando con el ARDEF vigente
+a la fecha del archivo), jurisdiction (on-us/off-us/intraregional/
+interregional), moneda de settlement, timeliness, entre otros. Soporta
+los 3 tipos de record del pipeline Visa: BASEII (drafts, 30 campos), SMS
+(messages, 27 campos) y VSS (settlement 110/120/130/140, 2 campos). Lee
+CLN desde s3-staging/300_*/, escribe CAL a s3-staging/400_*/. Se usa Glue
+(PySpark) y no Lambda por la complejidad de las lógicas y el volumen de
+datos — ver decisions.md → "Por qué Glue y no Lambda para Calculate e
+Interchange".
+
+El ARDEF (rangos de BINes y reglas Visa) se carga y filtra 100% en Spark
+(sin toPandas(), para soportar ejecución concurrente sin colapsar la
+memoria del driver — ver decisions.md → "Por qué el diseño es
+configuration-driven"). El join contra ARDEF (join_with_ardef) usa
+bucketing por prefijo de 3 dígitos del número de cuenta para convertir un
+range-join costoso en un broadcast hash join exacto por prefijo + rango,
+reduciendo el tiempo de ejecución de minutos a segundos.
+
+BASEII y SMS comparten la mayoría de la lógica de negocio (jurisdiction,
+timeliness, joins ARDEF/country/currency) con variantes de columna fuente
+por marca de record (ej. account_number vs card_number) — cada campo
+calculado tiene una función `_draft`/`_sms` separada cuando la lógica
+difiere.
+
+Flujo (por cada output del archivo, vía process_output):
+1. Cargar el CLN del output (BASEII/SMS/VSS_xxx)
+2. BASEII/SMS: join con ARDEF, calcular campos directos, campos con
+   coalesce/string manipulation, lógica condicional (business_mode,
+   business_transaction_type/cycle, reversal_indicator), joins con
+   country/currency, jurisdiction + jurisdiction_assigned +
+   settlement_report_currency_code, timeliness
+   VSS: vss_report_type + vss_aggregation_level (jerarquía de rollup)
+3. Escribir el CAL resultante a s3-staging/400_*/
+
+Job Parameters:
+  --JOB_NAME               nombre del Glue Job
+  --reference_bucket       bucket s3-reference
+  --staging_bucket         bucket s3-staging
+  --client_id              ID del cliente, ej. "EBGR"
+  --file_id                ID del archivo
+  --file_type              IN | OUT
+  --file_date              YYYY-MM-DD (fecha del archivo, usada para filtrar el ARDEF vigente)
+  --outputs                JSON: [{"output_type": "BASEII", "s3_key": "staging/…"}, …]
+  --dynamodb_table_client  tabla DynamoDB de clientes (local_currency_code, BINs, etc.)
+"""
 import sys
 import json
 from datetime import datetime, date
@@ -47,7 +100,20 @@ def log_error(message: str):
 # =============================================================================
 
 def load_reference_table(bucket: str, table_name: str) -> DataFrame:
-    """Carga una tabla de referencia desde S3."""
+    """
+    Carga una tabla de referencia desde S3.
+
+    Args:
+        bucket: Bucket S3 de referencia.
+        table_name: Nombre de la tabla (subdirectorio bajo el bucket), ej.
+            "country", "currency".
+
+    Returns:
+        DataFrame con el contenido de {table_name}/data.parquet.
+
+    Ejemplo:
+        load_reference_table(reference_bucket, "country")
+    """
     path = f"s3://{bucket}/{table_name}/data.parquet"
     log_info(f"Loading reference table: {path}")
     return spark.read.parquet(path)
@@ -55,9 +121,31 @@ def load_reference_table(bucket: str, table_name: str) -> DataFrame:
  
 def load_visa_ardef(reference_bucket: str, file_date: date) -> DataFrame:
     """
-    Carga y prepara el ARDEF de Visa filtrado para la fecha del archivo.
-    Procesado 100% en Spark — sin toPandas() para soportar ejecución concurrente
-    sin colapso de memoria en el driver.
+    Carga y prepara el ARDEF de Visa (rangos de BINes y reglas), filtrado a
+    los rangos vigentes para la fecha del archivo. Procesado 100% en Spark —
+    sin toPandas() para soportar ejecución concurrente sin colapso de memoria
+    en el driver.
+
+    Pasos (ver comentarios inline numerados en el código para el detalle de
+    cada uno): filtrar por delete_indicator, convertir effective_date/
+    valid_until a DateType, filtrar por vigencia contra file_date, castear
+    las llaves de rango a numérico, deduplicar por table_key y por
+    low_key_for_range (quedándose con la versión más reciente), eliminar
+    rangos solapados, seleccionar los campos necesarios, renombrar
+    product_id→ardef_product_id (evita colisión en joins) y cachear el
+    resultado (se usa múltiples veces en calculate_baseii_fields/
+    calculate_sms_fields).
+
+    Args:
+        reference_bucket: Bucket S3 de referencia.
+        file_date: Fecha del archivo, usada para filtrar los rangos ARDEF
+            vigentes a esa fecha.
+
+    Returns:
+        DataFrame ARDEF filtrado, deduplicado y cacheado.
+
+    Ejemplo:
+        load_visa_ardef(reference_bucket, date(2026, 1, 3))
     """
     path = f"s3://{reference_bucket}/visa_ardef/data.parquet"
     log_info(f"Loading ARDEF from: {path}")
@@ -150,7 +238,18 @@ def load_visa_ardef(reference_bucket: str, file_date: date) -> DataFrame:
  
  
 def load_country_table(reference_bucket: str) -> DataFrame:
-    """Carga la tabla de países."""
+    """
+    Carga la tabla de países.
+
+    Args:
+        reference_bucket: Bucket S3 de referencia.
+
+    Returns:
+        DataFrame con columnas country_code, visa_region_code.
+
+    Ejemplo:
+        load_country_table(reference_bucket)
+    """
     country = load_reference_table(reference_bucket, "country")
     return country.select(
         F.col("country_code"),
@@ -159,7 +258,18 @@ def load_country_table(reference_bucket: str) -> DataFrame:
  
  
 def load_currency_table(reference_bucket: str) -> DataFrame:
-    """Carga la tabla de monedas."""
+    """
+    Carga la tabla de monedas.
+
+    Args:
+        reference_bucket: Bucket S3 de referencia.
+
+    Returns:
+        DataFrame con columnas currency_numeric_code, currency_alphabetic_code.
+
+    Ejemplo:
+        load_currency_table(reference_bucket)
+    """
     currency = load_reference_table(reference_bucket, "currency")
     return currency.select(
         F.col("currency_numeric_code"),
@@ -172,7 +282,23 @@ def load_currency_table(reference_bucket: str) -> DataFrame:
 # =============================================================================
  
 def get_client_data(client_id: str, dynamodb_table_client: str) -> dict:
-    """Obtiene metadatos del cliente desde DynamoDB."""
+    """
+    Obtiene metadatos del cliente desde DynamoDB (tabla client).
+
+    Args:
+        client_id: Código de cliente, ej. "EBGR".
+        dynamodb_table_client: Nombre de la tabla DynamoDB de clientes.
+
+    Returns:
+        Dict con client_id, client_name, local_currency_code,
+        settlement_currency_code, report_currency_code,
+        issuing_bins_6_digits, issuing_bins_8_digits, acquiring_bins,
+        customer_country — o un dict vacío si no existe el cliente (se
+        loguea el error, no se relanza).
+
+    Ejemplo:
+        get_client_data("EBGR", "itl-0004-itx-dev-dynamo-client-02")
+    """
     dynamodb = boto3.resource('dynamodb')
     table = dynamodb.Table(dynamodb_table_client)
     
@@ -204,8 +330,30 @@ def get_client_data(client_id: str, dynamodb_table_client: str) -> dict:
  
 def join_with_ardef(df: DataFrame, ardef: DataFrame, account_column: str = "account_number") -> DataFrame:
     """
-    Range join hiper-optimizado en PySpark usando Bucketing por prefijos.
+    Range join hiper-optimizado en PySpark usando bucketing por prefijos.
     Reduce el tiempo de ejecución de minutos a segundos.
+
+    Deriva un prefijo de 3 dígitos del número de cuenta (account_9 / 10^6) y
+    del rango ARDEF (explotando cada rango en una fila por cada prefijo que
+    abarca), fuerza un broadcast hash join exacto por ese prefijo, y dentro
+    del bucket verifica el rango exacto (>=low_key_for_range,
+    <=table_key). Tras el join, deduplica por record en caso de que un mismo
+    número de cuenta caiga en más de un rango dentro del mismo bucket
+    (se queda con el de ardef_country no-nulo).
+
+    Args:
+        df: DataFrame CLN a enriquecer (BASEII o SMS).
+        ardef: DataFrame ARDEF ya cargado (de load_visa_ardef).
+        account_column: Nombre de la columna con el número de cuenta/tarjeta
+            a usar para el join (default: "account_number"; SMS pasa
+            "card_number").
+
+    Returns:
+        df con las columnas de ARDEF agregadas (left join — filas sin match
+        quedan con esas columnas en null).
+
+    Ejemplo:
+        join_with_ardef(df, ardef, "account_number")
     """
     # 1. Crear account_9 (Limpiar asteriscos y tomar los primeros 9 dígitos)
     df = df.withColumn(
@@ -257,7 +405,18 @@ def join_with_ardef(df: DataFrame, ardef: DataFrame, account_column: str = "acco
 # =============================================================================
  
 def load_parquet_safe(path: str) -> DataFrame:
-    """Carga un archivo Parquet."""
+    """
+    Carga un archivo Parquet y loguea la cantidad de records leídos.
+
+    Args:
+        path: Path S3 completo al Parquet o directorio Parquet.
+
+    Returns:
+        DataFrame con el contenido leído.
+
+    Ejemplo:
+        load_parquet_safe("s3://bucket/EBGR/VISA/300_baseii_cln_drafts/.../x.parquet")
+    """
     df = spark.read.parquet(path)
     count = df.count()
     log_info(f"  Loaded {count:,} records from {path}")
@@ -265,7 +424,19 @@ def load_parquet_safe(path: str) -> DataFrame:
  
  
 def save_parquet(df: DataFrame, path: str):
-    """Guarda DataFrame como Parquet."""
+    """
+    Guarda un DataFrame como un único Parquet (coalesce(1)) en la ruta dada.
+
+    Args:
+        df: DataFrame a escribir.
+        path: Path S3 de destino.
+
+    Returns:
+        None.
+
+    Ejemplo:
+        save_parquet(result_df, "s3://bucket/EBGR/VISA/400_baseii_cal_drafts/.../x.parquet")
+    """
     df.coalesce(1).write.mode("overwrite").parquet(path)
     log_info(f"  Saved to {path}")
 
@@ -275,42 +446,144 @@ def save_parquet(df: DataFrame, path: str):
 # =============================================================================
  
 def calc_ardef_country(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna ardef_country del ARDEF (ya unida por join_with_ardef) a
+    calc_ardef_country.
+
+    Args:
+        df: DataFrame con la columna ardef_country ya presente (post-join
+            con ARDEF).
+
+    Returns:
+        df con la columna calc_ardef_country agregada.
+    """
     return df.withColumn("calc_ardef_country", F.col("ardef_country"))
  
  
 def calc_b2b_program_id(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna b2b_program_id del ARDEF a calc_b2b_program_id.
+
+    Args:
+        df: DataFrame con la columna b2b_program_id ya presente (post-join
+            con ARDEF).
+
+    Returns:
+        df con la columna calc_b2b_program_id agregada.
+    """
     return df.withColumn("calc_b2b_program_id", F.col("b2b_program_id"))
  
  
 def calc_fast_funds(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna fast_funds del ARDEF a calc_fast_funds.
+
+    Args:
+        df: DataFrame con la columna fast_funds ya presente (post-join con
+            ARDEF).
+
+    Returns:
+        df con la columna calc_fast_funds agregada.
+    """
     return df.withColumn("calc_fast_funds", F.col("fast_funds"))
  
  
 def calc_funding_source(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna account_funding_source del ARDEF a calc_funding_source.
+
+    Args:
+        df: DataFrame con la columna account_funding_source ya presente
+            (post-join con ARDEF).
+
+    Returns:
+        df con la columna calc_funding_source agregada.
+    """
     return df.withColumn("calc_funding_source", F.col("account_funding_source"))
  
  
 def calc_issuer_country(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna country del ARDEF (país del emisor) a calc_issuer_country.
+
+    Args:
+        df: DataFrame con la columna country ya presente (post-join con
+            ARDEF).
+
+    Returns:
+        df con la columna calc_issuer_country agregada.
+    """
     return df.withColumn("calc_issuer_country", F.col("country"))
  
  
 def calc_nnss_indicator(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna nnss_indicator del ARDEF a calc_nnss_indicator.
+
+    Args:
+        df: DataFrame con la columna nnss_indicator ya presente (post-join
+            con ARDEF).
+
+    Returns:
+        df con la columna calc_nnss_indicator agregada.
+    """
     return df.withColumn("calc_nnss_indicator", F.col("nnss_indicator"))
  
  
 def calc_product_id_ardef(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna ardef_product_id (renombrada en load_visa_ardef para
+    evitar colisión) a calc_product_id.
+
+    Args:
+        df: DataFrame con la columna ardef_product_id ya presente (post-join
+            con ARDEF).
+
+    Returns:
+        df con la columna calc_product_id agregada.
+    """
     return df.withColumn("calc_product_id", F.col("ardef_product_id"))
  
  
 def calc_product_subtype(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna product_subtype del ARDEF a calc_product_subtype.
+
+    Args:
+        df: DataFrame con la columna product_subtype ya presente (post-join
+            con ARDEF).
+
+    Returns:
+        df con la columna calc_product_subtype agregada.
+    """
     return df.withColumn("calc_product_subtype", F.col("product_subtype"))
  
  
 def calc_technology_indicator(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna technology_indicator del ARDEF a calc_technology_indicator.
+
+    Args:
+        df: DataFrame con la columna technology_indicator ya presente
+            (post-join con ARDEF).
+
+    Returns:
+        df con la columna calc_technology_indicator agregada.
+    """
     return df.withColumn("calc_technology_indicator", F.col("technology_indicator"))
  
  
 def calc_travel_indicator(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna travel_indicator del ARDEF a calc_travel_indicator.
+
+    Args:
+        df: DataFrame con la columna travel_indicator ya presente (post-join
+            con ARDEF).
+
+    Returns:
+        df con la columna calc_travel_indicator agregada.
+    """
     return df.withColumn("calc_travel_indicator", F.col("travel_indicator"))
 
 
@@ -319,6 +592,21 @@ def calc_travel_indicator(df: DataFrame) -> DataFrame:
 # =============================================================================
  
 def calc_issuer_bin_8(df: DataFrame, account_column: str = "account_number") -> DataFrame:
+    """
+    Deriva issuer_bin_8: primeros 8 dígitos de la cuenta/tarjeta, con
+    asteriscos de máscara reemplazados por '0'.
+
+    Args:
+        df: DataFrame de entrada.
+        account_column: Columna con el número de cuenta/tarjeta (default:
+            "account_number"; SMS pasa "card_number").
+
+    Returns:
+        df con la columna calc_issuer_bin_8 agregada.
+
+    Ejemplo:
+        calc_issuer_bin_8(df, "account_number")
+    """
     return df.withColumn(
         "calc_issuer_bin_8",
         F.regexp_replace(F.col(account_column), "\\*", "0").substr(1, 8)
@@ -329,6 +617,15 @@ def calc_authorization_code_valid_draft(df: DataFrame) -> DataFrame:
     """
     authorization_code_valid para BASEII/draft.
     INVALID si termina en 'x' o si últimos 5 chars están en lista específica.
+
+    Args:
+        df: DataFrame con la columna authorization_code.
+
+    Returns:
+        df con la columna calc_authorization_code_valid ("VALID"/"INVALID").
+
+    Ejemplo:
+        calc_authorization_code_valid_draft(df)
     """
     invalid_suffixes = [" ", "0000", "00000", "0000n", "0000p", "0000y"]
     
@@ -345,7 +642,18 @@ def calc_authorization_code_valid_draft(df: DataFrame) -> DataFrame:
  
  
 def calc_authorization_code_valid_sms(df: DataFrame) -> DataFrame:
-    """authorization_code_valid para SMS usando authorization_id_resp._code"""
+    """
+    authorization_code_valid para SMS usando authorization_id_resp._code
+
+    Args:
+        df: DataFrame con la columna authorization_id_resp_code.
+
+    Returns:
+        df con la columna calc_authorization_code_valid ("VALID"/"INVALID").
+
+    Ejemplo:
+        calc_authorization_code_valid_sms(df)
+    """
     invalid_suffixes = [" ", "0000", "00000", "0000n", "0000p", "0000y"]
     col_name = "authorization_id_resp_code"
     
@@ -362,7 +670,19 @@ def calc_authorization_code_valid_sms(df: DataFrame) -> DataFrame:
  
  
 def calc_business_application_id(df: DataFrame) -> DataFrame:
-    """Coalesce de business_application_id_fl, _cr, _ft"""
+    """
+    Coalesce de business_application_id_fl, _cr, _ft
+
+    Args:
+        df: DataFrame con las columnas business_application_id_fl/_cr/_ft.
+
+    Returns:
+        df con la columna calc_business_application_id (primer valor no
+        vacío entre las 3 variantes).
+
+    Ejemplo:
+        calc_business_application_id(df)
+    """
     return df.withColumn(
         "calc_business_application_id",
         F.coalesce(
@@ -374,7 +694,18 @@ def calc_business_application_id(df: DataFrame) -> DataFrame:
  
  
 def calc_business_format_code(df: DataFrame) -> DataFrame:
-    """Coalesce de business_format_code_cr, _fl, _ft, _df, _pd, _sd, _sp"""
+    """
+    Coalesce de business_format_code_cr, _fl, _ft, _df, _pd, _sd, _sp
+
+    Args:
+        df: DataFrame con las 7 variantes de business_format_code.
+
+    Returns:
+        df con la columna calc_business_format_code (primer valor no vacío).
+
+    Ejemplo:
+        calc_business_format_code(df)
+    """
     return df.withColumn(
         "calc_business_format_code",
         F.coalesce(
@@ -390,7 +721,18 @@ def calc_business_format_code(df: DataFrame) -> DataFrame:
  
  
 def calc_message_reason_code(df: DataFrame) -> DataFrame:
-    """Coalesce de message_reason_code_df, _sd, _sp"""
+    """
+    Coalesce de message_reason_code_df, _sd, _sp
+
+    Args:
+        df: DataFrame con las 3 variantes de message_reason_code.
+
+    Returns:
+        df con la columna calc_message_reason_code (primer valor no vacío).
+
+    Ejemplo:
+        calc_message_reason_code(df)
+    """
     return df.withColumn(
         "calc_message_reason_code",
         F.coalesce(
@@ -402,7 +744,19 @@ def calc_message_reason_code(df: DataFrame) -> DataFrame:
  
  
 def calc_network_identification_code(df: DataFrame) -> DataFrame:
-    """Coalesce de network_identification_code_df, _sd, _sp"""
+    """
+    Coalesce de network_identification_code_df, _sd, _sp
+
+    Args:
+        df: DataFrame con las 3 variantes de network_identification_code.
+
+    Returns:
+        df con la columna calc_network_identification_code (primer valor no
+        vacío).
+
+    Ejemplo:
+        calc_network_identification_code(df)
+    """
     return df.withColumn(
         "calc_network_identification_code",
         F.coalesce(
@@ -414,7 +768,18 @@ def calc_network_identification_code(df: DataFrame) -> DataFrame:
  
  
 def calc_type_of_purchase(df: DataFrame) -> DataFrame:
-    """Coalesce de type_of_purchase_fl, _ft"""
+    """
+    Coalesce de type_of_purchase_fl, _ft
+
+    Args:
+        df: DataFrame con las 2 variantes de type_of_purchase.
+
+    Returns:
+        df con la columna calc_type_of_purchase (primer valor no vacío).
+
+    Ejemplo:
+        calc_type_of_purchase(df)
+    """
     return df.withColumn(
         "calc_type_of_purchase",
         F.coalesce(
@@ -425,7 +790,19 @@ def calc_type_of_purchase(df: DataFrame) -> DataFrame:
  
  
 def calc_surcharge_amount(df: DataFrame) -> DataFrame:
-    """MAX de surcharge_amount_df, _sd, _sp"""
+    """
+    MAX de surcharge_amount_df, _sd, _sp
+
+    Args:
+        df: DataFrame con las 3 variantes de surcharge_amount.
+
+    Returns:
+        df con la columna calc_surcharge_amount (double, máximo de las 3,
+        tratando null como 0.0).
+
+    Ejemplo:
+        calc_surcharge_amount(df)
+    """
     return df.withColumn(
         "calc_surcharge_amount",
         F.greatest(
@@ -444,6 +821,21 @@ def calc_business_mode_draft(df: DataFrame, file_type: str) -> DataFrame:
     """
     business_mode para BASEII/draft.
     Basado en draft_code y file_type.
+
+    Nota: usa literales en MAYÚSCULA ("ACQUIRING"/"ISSUING") — a diferencia
+    de Mastercard, que usa minúscula para el mismo concepto (ver gotchas.md →
+    "business_mode: MAYÚSCULA en Visa, minúscula en Mastercard").
+
+    Args:
+        df: DataFrame con la columna draft_code.
+        file_type: "IN" u "OUT" — invierte el mapeo acquiring/issuing según
+            la dirección del archivo.
+
+    Returns:
+        df con la columna calc_business_mode ("ACQUIRING"/"ISSUING"/"").
+
+    Ejemplo:
+        calc_business_mode_draft(df, "IN")
     """
     acquiring_codes_out = ["05", "25", "06", "26", "07", "27"]
     issuing_codes_out = ["15", "35", "16", "36", "17", "37"]
@@ -465,7 +857,18 @@ def calc_business_mode_draft(df: DataFrame, file_type: str) -> DataFrame:
 
 
 def calc_business_mode_sms(df: DataFrame) -> DataFrame:
-    """business_mode para SMS basado en issuer_acquirer_indicator."""
+    """
+    business_mode para SMS basado en issuer_acquirer_indicator.
+
+    Args:
+        df: DataFrame con la columna issuer_acquirer_indicator.
+
+    Returns:
+        df con la columna calc_business_mode ("ACQUIRING"/"ISSUING"/"").
+
+    Ejemplo:
+        calc_business_mode_sms(df)
+    """
     return df.withColumn(
         "calc_business_mode",
         F.when(F.col("issuer_acquirer_indicator") == "A", F.lit("ACQUIRING"))
@@ -478,6 +881,20 @@ def calc_business_transaction_type_draft(df: DataFrame, file_type: str) -> DataF
     """
     business_transaction_type para BASEII/draft.
     Lógica compleja basada en draft_code, MCC, usage_code, etc.
+
+    Args:
+        df: DataFrame con draft_code, merchant_category_code, usage_code,
+            special_condition_indicator_merchant_draft_indicator,
+            draft_code_qualifier_0.
+        file_type: "IN" u "OUT" — la lógica de purchase/ATM/cash difiere
+            según dirección.
+
+    Returns:
+        df con la columna calc_business_transaction_type (int; 255 si
+        ninguna condición matchea).
+
+    Ejemplo:
+        calc_business_transaction_type_draft(df, "IN")
     """
     purchase_codes = ["05", "15", "25", "35"]
     cash_codes     = ["06", "16", "26", "36"]
@@ -519,6 +936,16 @@ def calc_business_transaction_cycle_draft(df: DataFrame) -> DataFrame:
     """
     business_transaction_cycle para BASEII/draft.
     Lógica basada en draft_code (transaction_code) y usage_code.
+
+    Args:
+        df: DataFrame con draft_code y usage_code.
+
+    Returns:
+        df con la columna calc_business_transaction_cycle (int; 255 si
+        ninguna condición matchea).
+
+    Ejemplo:
+        calc_business_transaction_cycle_draft(df)
     """
     purchase_codes  = ["05", "06", "07"]
     reversal_codes  = ["15", "16", "17", "35", "36", "37"]
@@ -551,7 +978,24 @@ def calc_business_transaction_cycle_draft(df: DataFrame) -> DataFrame:
 
 
 def calc_business_transaction_type_sms(df: DataFrame) -> DataFrame:
-    """business_transaction_type para SMS."""
+    """
+    business_transaction_type para SMS.
+
+    Clasifica según combinación de request_message_type/response_code
+    (éxito/rechazo), processing_code, pos_condition_code y
+    merchant's_type (MCC).
+
+    Args:
+        df: DataFrame con request_message_type, response_code,
+            processing_code, pos_condition_code, `merchant's_type`.
+
+    Returns:
+        df con la columna calc_business_transaction_type (int, o NULL si
+        ninguna condición matchea).
+
+    Ejemplo:
+        calc_business_transaction_type_sms(df)
+    """
     df = df.withColumn("_rmt", F.col("request_message_type"))
     df = df.withColumn("_rc", F.col("response_code"))
     df = df.withColumn("_pc", F.substring(F.col("processing_code"), 1, 2))
@@ -592,12 +1036,33 @@ def calc_business_transaction_cycle_sms(df: DataFrame) -> DataFrame:
     business_transaction_cycle para SMS.
     No aplica para SMS (la lógica es exclusiva de transaction_code BASEII/draft) —
     en legacy el campo se mantiene en la tabla como NULL.
+
+    Args:
+        df: DataFrame de entrada (no se lee ninguna columna).
+
+    Returns:
+        df con la columna calc_business_transaction_cycle siempre NULL.
+
+    Ejemplo:
+        calc_business_transaction_cycle_sms(df)
     """
     return df.withColumn("calc_business_transaction_cycle", F.lit(None).cast(IntegerType()))
 
 
 def calc_reversal_indicator_draft(df: DataFrame) -> DataFrame:
-    """reversal_indicator para BASEII/draft."""
+    """
+    reversal_indicator para BASEII/draft.
+
+    Args:
+        df: DataFrame con la columna draft_code.
+
+    Returns:
+        df con la columna calc_reversal_indicator (1 si draft_code es un
+        código de reversal/chargeback, 0 en caso contrario).
+
+    Ejemplo:
+        calc_reversal_indicator_draft(df)
+    """
     reversal_codes = ["25", "26", "27", "35", "36", "37"]
     return df.withColumn(
         "calc_reversal_indicator",
@@ -606,7 +1071,19 @@ def calc_reversal_indicator_draft(df: DataFrame) -> DataFrame:
  
  
 def calc_reversal_indicator_sms(df: DataFrame) -> DataFrame:
-    """reversal_indicator para SMS."""
+    """
+    reversal_indicator para SMS.
+
+    Args:
+        df: DataFrame con request_message_type y response_code.
+
+    Returns:
+        df con la columna calc_reversal_indicator (0 para autorización
+        exitosa, 1 para reversal exitoso, 0 en cualquier otro caso).
+
+    Ejemplo:
+        calc_reversal_indicator_sms(df)
+    """
     return df.withColumn(
         "calc_reversal_indicator",
         F.when(
@@ -620,12 +1097,34 @@ def calc_reversal_indicator_sms(df: DataFrame) -> DataFrame:
  
  
 def calc_jurisdiction_country_draft(df: DataFrame) -> DataFrame:
-    """jurisdiction_country para BASEII/draft = merchant_country_code"""
+    """
+    jurisdiction_country para BASEII/draft = merchant_country_code
+
+    Args:
+        df: DataFrame con la columna merchant_country_code.
+
+    Returns:
+        df con la columna calc_jurisdiction_country.
+
+    Ejemplo:
+        calc_jurisdiction_country_draft(df)
+    """
     return df.withColumn("calc_jurisdiction_country", F.col("merchant_country_code"))
  
  
 def calc_jurisdiction_country_sms(df: DataFrame) -> DataFrame:
-    """jurisdiction_country para SMS = card_acceptor_country"""
+    """
+    jurisdiction_country para SMS = card_acceptor_country
+
+    Args:
+        df: DataFrame con la columna card_acceptor_country.
+
+    Returns:
+        df con la columna calc_jurisdiction_country.
+
+    Ejemplo:
+        calc_jurisdiction_country_sms(df)
+    """
     return df.withColumn("calc_jurisdiction_country", F.col("card_acceptor_country"))
 
 
@@ -634,7 +1133,20 @@ def calc_jurisdiction_country_sms(df: DataFrame) -> DataFrame:
 # =============================================================================
  
 def calc_issuer_region(df: DataFrame, country_df: DataFrame) -> DataFrame:
-    """issuer_region: JOIN country del ARDEF con tabla country."""
+    """
+    issuer_region: JOIN country del ARDEF con tabla country.
+
+    Args:
+        df: DataFrame con la columna country (país emisor del ARDEF).
+        country_df: DataFrame de referencia country (código→visa_region_code).
+
+    Returns:
+        df con la columna calc_issuer_region agregada (left join — null si
+        el país no matchea en la tabla de referencia).
+
+    Ejemplo:
+        calc_issuer_region(df, country_df)
+    """
     country_for_issuer = country_df.select(
         F.col("country_code").alias("_country_code_issuer"),
         F.col("visa_region_code").alias("calc_issuer_region")
@@ -650,7 +1162,19 @@ def calc_issuer_region(df: DataFrame, country_df: DataFrame) -> DataFrame:
  
  
 def calc_jurisdiction_region_draft(df: DataFrame, country_df: DataFrame) -> DataFrame:
-    """jurisdiction_region para BASEII/draft: JOIN merchant_country_code."""
+    """
+    jurisdiction_region para BASEII/draft: JOIN merchant_country_code.
+
+    Args:
+        df: DataFrame con la columna merchant_country_code.
+        country_df: DataFrame de referencia country.
+
+    Returns:
+        df con la columna calc_jurisdiction_region agregada.
+
+    Ejemplo:
+        calc_jurisdiction_region_draft(df, country_df)
+    """
     country_for_merchant = country_df.select(
         F.col("country_code").alias("_country_code_merchant"),
         F.col("visa_region_code").alias("calc_jurisdiction_region")
@@ -666,7 +1190,19 @@ def calc_jurisdiction_region_draft(df: DataFrame, country_df: DataFrame) -> Data
  
  
 def calc_jurisdiction_region_sms(df: DataFrame, country_df: DataFrame) -> DataFrame:
-    """jurisdiction_region para SMS: JOIN card_acceptor_country."""
+    """
+    jurisdiction_region para SMS: JOIN card_acceptor_country.
+
+    Args:
+        df: DataFrame con la columna card_acceptor_country.
+        country_df: DataFrame de referencia country.
+
+    Returns:
+        df con la columna calc_jurisdiction_region agregada.
+
+    Ejemplo:
+        calc_jurisdiction_region_sms(df, country_df)
+    """
     country_for_merchant = country_df.select(
         F.col("country_code").alias("_country_code_merchant"),
         F.col("visa_region_code").alias("calc_jurisdiction_region")
@@ -682,7 +1218,19 @@ def calc_jurisdiction_region_sms(df: DataFrame, country_df: DataFrame) -> DataFr
  
  
 def calc_source_currency_code_alphabetic_draft(df: DataFrame, currency_df: DataFrame) -> DataFrame:
-    """source_currency_code_alphabetic para BASEII/draft."""
+    """
+    source_currency_code_alphabetic para BASEII/draft.
+
+    Args:
+        df: DataFrame con la columna source_currency_code.
+        currency_df: DataFrame de referencia currency.
+
+    Returns:
+        df con la columna calc_source_currency_code_alphabetic agregada.
+
+    Ejemplo:
+        calc_source_currency_code_alphabetic_draft(df, currency_df)
+    """
     currency_lookup = currency_df.select(
         F.col("currency_numeric_code").alias("_currency_numeric"),
         F.col("currency_alphabetic_code").alias("calc_source_currency_code_alphabetic")
@@ -698,7 +1246,19 @@ def calc_source_currency_code_alphabetic_draft(df: DataFrame, currency_df: DataF
  
  
 def calc_source_currency_code_alphabetic_sms(df: DataFrame, currency_df: DataFrame) -> DataFrame:
-    """source_currency_code_alphabetic para SMS usando draft_currency_code."""
+    """
+    source_currency_code_alphabetic para SMS usando draft_currency_code.
+
+    Args:
+        df: DataFrame con la columna draft_currency_code.
+        currency_df: DataFrame de referencia currency.
+
+    Returns:
+        df con la columna calc_source_currency_code_alphabetic agregada.
+
+    Ejemplo:
+        calc_source_currency_code_alphabetic_sms(df, currency_df)
+    """
     currency_lookup = currency_df.select(
         F.col("currency_numeric_code").alias("_currency_numeric"),
         F.col("currency_alphabetic_code").alias("calc_source_currency_code_alphabetic")
@@ -721,6 +1281,30 @@ def calc_jurisdiction_draft(df: DataFrame, country_df: DataFrame, file_type: str
     """
     jurisdiction para BASEII/draft.
     Replica exacta de la lógica original en Pandas.
+
+    Agrega merchant_region_code y ardef_region (joins contra country_df) y
+    clasifica cada transacción en on-us/off-us/intraregional/interregional
+    según el país/región del comercio vs. el país/región del ARDEF y el
+    matching de BINs propios del cliente (issuing_bins_6/8_digits,
+    acquiring_bins de DynamoDB) — la lógica de qué BINs importan (issuing vs
+    acquiring) se invierte según file_type.
+
+    Args:
+        df: DataFrame con merchant_country_code, ardef_country,
+            account_number, account_reference_number_acquiring_identifier,
+            collection_only_flag.
+        country_df: DataFrame de referencia country.
+        file_type: "IN" u "OUT" — determina si on-us se evalúa con BINs de
+            issuing o de acquiring.
+        client_data: Dict de configuración del cliente (de get_client_data),
+            con issuing_bins_6_digits, issuing_bins_8_digits, acquiring_bins.
+
+    Returns:
+        df con calc_jurisdiction agregada, más merchant_region_code y
+        ardef_region como columnas adicionales (subproductos de los joins).
+
+    Ejemplo:
+        calc_jurisdiction_draft(df, country_df, "IN", client_data)
     """
     issuing_bins_6 = [b.strip() for b in str(client_data.get('issuing_bins_6_digits', '')).split(',') if b.strip()]
     issuing_bins_8 = [b.strip() for b in str(client_data.get('issuing_bins_8_digits', '')).split(',') if b.strip()]
@@ -794,6 +1378,19 @@ def calc_jurisdiction_assigned_draft(df: DataFrame) -> DataFrame:
     """
     jurisdiction_assigned para BASEII/draft.
     Lógica exacta del original.
+
+    Args:
+        df: DataFrame con merchant_country_code, ardef_country,
+            merchant_region_code, ardef_region (las 2 últimas agregadas por
+            calc_jurisdiction_draft).
+
+    Returns:
+        df con la columna calc_jurisdiction_assigned (país si mismo país,
+        región si distinto país mismo región, "9" si distinta región, ""
+        si ninguna condición matchea).
+
+    Ejemplo:
+        calc_jurisdiction_assigned_draft(df)
     """
     return df.withColumn(
         "calc_jurisdiction_assigned",
@@ -817,6 +1414,17 @@ def calc_settlement_report_currency_code_draft(df: DataFrame, client_data: dict)
     settlement_report_currency_code para BASEII/draft.
     Si jurisdiction in (on-us, off-us) y settlement_flag != 0 -> local_currency_code del cliente.
     Caso contrario -> settlement_currency_code del cliente.
+
+    Args:
+        df: DataFrame con calc_jurisdiction y settlement_flag.
+        client_data: Dict de configuración del cliente, con
+            local_currency_code y settlement_currency_code.
+
+    Returns:
+        df con la columna calc_settlement_report_currency_code.
+
+    Ejemplo:
+        calc_settlement_report_currency_code_draft(df, client_data)
     """
     local_ccy      = str(client_data.get('local_currency_code', '')).strip()
     settlement_ccy = str(client_data.get('settlement_currency_code', '')).strip()
@@ -839,6 +1447,24 @@ def calc_jurisdiction_sms(df: DataFrame, country_df: DataFrame, client_data: dic
     jurisdiction para SMS.
     NOTA: El original hace merge left_on='card_acceptor_country', right_on='merchant_country_code'
     Esto AGREGA merchant_country_code como columna al DataFrame.
+
+    Mismo criterio de clasificación que calc_jurisdiction_draft, pero
+    el on-us tiene 2 ramas según issuer_acquirer_indicator ("A" usa BINs de
+    issuing, "I" usa BINs de acquiring) — en vez de depender de file_type.
+
+    Args:
+        df: DataFrame con card_acceptor_country, ardef_country, card_number,
+            acquiring_institution_id_1, issuer_acquirer_indicator.
+        country_df: DataFrame de referencia country.
+        client_data: Dict de configuración del cliente, con
+            issuing_bins_6_digits, issuing_bins_8_digits, acquiring_bins.
+
+    Returns:
+        df con calc_jurisdiction agregada, más merchant_country_code,
+        merchant_region_code y ardef_region como columnas adicionales.
+
+    Ejemplo:
+        calc_jurisdiction_sms(df, country_df, client_data)
     """
     issuing_bins_6 = [b.strip() for b in str(client_data.get('issuing_bins_6_digits', '')).split(',') if b.strip()]
     issuing_bins_8 = [b.strip() for b in str(client_data.get('issuing_bins_8_digits', '')).split(',') if b.strip()]
@@ -909,6 +1535,17 @@ def calc_jurisdiction_assigned_sms(df: DataFrame) -> DataFrame:
     """
     jurisdiction_assigned para SMS.
     Usa merchant_country_code (agregado por el JOIN en calc_jurisdiction_sms).
+
+    Args:
+        df: DataFrame con merchant_country_code, ardef_country,
+            merchant_region_code, ardef_region.
+
+    Returns:
+        df con la columna calc_jurisdiction_assigned (mismo criterio que
+        calc_jurisdiction_assigned_draft).
+
+    Ejemplo:
+        calc_jurisdiction_assigned_sms(df)
     """
     return df.withColumn(
         "calc_jurisdiction_assigned",
@@ -939,6 +1576,16 @@ def calc_timeliness_draft(df: DataFrame) -> DataFrame:
     sundays_in_window = max(0, floor((window_size + 6 - offset) / 7))
       donde window_size = total_days - 1
             offset = dias desde purchase+1 hasta el primer domingo (0 si purchase+1 es domingo)
+
+    Args:
+        df: DataFrame con purchase_date y central_processing_date.
+
+    Returns:
+        df con la columna calc_timeliness (long; NULL si alguna fecha
+        falta, 0 si mismo día).
+
+    Ejemplo:
+        calc_timeliness_draft(df)
     """
     df = df.withColumn("_central_date", F.to_date(F.col("central_processing_date")))
     df = df.withColumn("_purchase_date", F.to_date(F.col("purchase_date")))
@@ -964,7 +1611,18 @@ def calc_timeliness_draft(df: DataFrame) -> DataFrame:
 
 
 def calc_timeliness_sms(df: DataFrame) -> DataFrame:
-    """timeliness para SMS: settlement_date_sms - local_draft_date"""
+    """
+    timeliness para SMS: settlement_date_sms - local_draft_date
+
+    Args:
+        df: DataFrame con settlement_date_sms y local_draft_date.
+
+    Returns:
+        df con la columna calc_timeliness (long, diferencia en días).
+
+    Ejemplo:
+        calc_timeliness_sms(df)
+    """
     return df.withColumn(
         "calc_timeliness",
         F.datediff(F.to_date(F.col("settlement_date_sms")), F.to_date(F.col("local_draft_date"))).cast(LongType())
@@ -976,19 +1634,65 @@ def calc_timeliness_sms(df: DataFrame) -> DataFrame:
 # =============================================================================
  
 def calc_acquirer_bin(df: DataFrame) -> DataFrame:
+    """
+    Deriva acquirer_bin: primeros 6 caracteres de retrieval_reference_number.
+
+    Args:
+        df: DataFrame con la columna retrieval_reference_number.
+
+    Returns:
+        df con la columna calc_acquirer_bin agregada.
+    """
     return df.withColumn("calc_acquirer_bin", F.substring(F.col("retrieval_reference_number"), 1, 6))
  
  
 def calc_processing_code_transaction_type(df: DataFrame) -> DataFrame:
+    """
+    Deriva processing_code_transaction_type: primeros 2 caracteres de
+    processing_code.
+
+    Args:
+        df: DataFrame con la columna processing_code.
+
+    Returns:
+        df con la columna calc_processing_code_transaction_type agregada.
+    """
     return df.withColumn("calc_processing_code_transaction_type", F.substring(F.col("processing_code"), 1, 2))
  
  
 def calc_source_amount_sms(df: DataFrame) -> DataFrame:
+    """
+    Copia la columna draft_amount a calc_source_amount.
+
+    Args:
+        df: DataFrame con la columna draft_amount.
+
+    Returns:
+        df con la columna calc_source_amount agregada.
+    """
     return df.withColumn("calc_source_amount", F.col("draft_amount"))
  
  
 def calc_transaction_code_sms(df: DataFrame) -> DataFrame:
-    """transaction_code_sms basado en business_transaction_type + reversal_indicator."""
+    """
+    transaction_code_sms basado en business_transaction_type + reversal_indicator.
+
+    Clasifica primero el tipo de transacción (PUR/CRD/CSH) según
+    calc_business_transaction_type, y luego mapea (tipo, reversal_indicator)
+    al código transaction_code_sms de 2 dígitos correspondiente (05/06/07
+    para no-reversal, 25/26/27 para reversal).
+
+    Args:
+        df: DataFrame con calc_business_transaction_type y
+            calc_reversal_indicator.
+
+    Returns:
+        df con la columna calc_transaction_code_sms (código de 2 dígitos, o
+        "" si no matchea ningún tipo).
+
+    Ejemplo:
+        calc_transaction_code_sms(df)
+    """
     df = df.withColumn(
         "_transaction_type",
         F.when(F.col("calc_business_transaction_type").isin([1, 30, 27]), F.lit("PUR"))
@@ -1017,7 +1721,19 @@ def calc_transaction_code_sms(df: DataFrame) -> DataFrame:
 # =============================================================================
  
 def calc_vss_report_type(df: DataFrame, vss_type: str) -> DataFrame:
-    """vss_report_type: int del vss_type (110, 120, 130, 140)"""
+    """
+    vss_report_type: int del vss_type (110, 120, 130, 140)
+
+    Args:
+        df: DataFrame de entrada (no se lee ninguna columna).
+        vss_type: Tipo VSS como string, ej. "110".
+
+    Returns:
+        df con la columna calc_vss_report_type (long).
+
+    Ejemplo:
+        calc_vss_report_type(df, "110")
+    """
     return df.withColumn("calc_vss_report_type", F.lit(int(vss_type)).cast(LongType()))
  
  
@@ -1040,6 +1756,19 @@ def calc_vss_aggregation_level(df: DataFrame, vss_type: str) -> DataFrame:
     Nota: la implementación anterior navegaba la jerarquía hacia arriba en 3 iteraciones,
     lo que producía que todas las hojas recibieran nivel 2 en lugar de 0, porque el
     rollup_to de una hoja siempre pertenece a rollup_group por definición.
+
+    Args:
+        df: DataFrame VSS con las columnas
+            rollup_to_sre_identifier_{vss_type} y
+            reporting_for_sre_identifier_{vss_type}.
+        vss_type: Tipo VSS como string, ej. "110".
+
+    Returns:
+        df con la columna calc_vss_aggregation_level (long; 0 si las
+        columnas de rollup no existen para ese vss_type).
+
+    Ejemplo:
+        calc_vss_aggregation_level(df, "110")
     """
     rollup_col    = f"rollup_to_sre_identifier_{vss_type}"
     reporting_col = f"reporting_for_sre_identifier_{vss_type}"
@@ -1086,7 +1815,31 @@ def calc_vss_aggregation_level(df: DataFrame, vss_type: str) -> DataFrame:
  
 def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
                             currency_df: DataFrame, file_type: str, client_data: dict) -> DataFrame:
-    """Calcula todos los campos adicionales para BASEII (30 campos)."""
+    """
+    Calcula todos los campos adicionales para BASEII (30 campos).
+
+    Orquesta el pipeline completo: join con ARDEF, campos directos del
+    ARDEF, campos de coalesce/string manipulation, lógica condicional
+    (business_mode, business_transaction_type/cycle, reversal_indicator),
+    joins con country/currency, jurisdiction + jurisdiction_assigned +
+    settlement_report_currency_code, timeliness, y selección final de las
+    30 columnas de salida (con content_hash y record como primeras
+    columnas — ver decisions.md → "Por qué se agrega content_hash...").
+
+    Args:
+        df: DataFrame CLN de BASEII.
+        ardef: DataFrame ARDEF ya cargado (de load_visa_ardef).
+        country_df: DataFrame de referencia country.
+        currency_df: DataFrame de referencia currency.
+        file_type: "IN" u "OUT".
+        client_data: Dict de configuración del cliente (de get_client_data).
+
+    Returns:
+        DataFrame CAL con las 30 columnas de salida de BASEII.
+
+    Ejemplo:
+        calculate_baseii_fields(df, ardef, country_df, currency_df, "IN", client_data)
+    """
     log_info("Calculating BASEII fields")
     log_info(f"Input records: {df.count():,}")
     
@@ -1186,7 +1939,27 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
 
 def calculate_sms_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
                          currency_df: DataFrame, client_data: dict) -> DataFrame:
-    """Calcula todos los campos adicionales para SMS (27 campos)."""
+    """
+    Calcula todos los campos adicionales para SMS (27 campos).
+
+    Mismo patrón que calculate_baseii_fields, con las variantes _sms de cada
+    función (join con ARDEF por card_number en vez de account_number, además
+    de los campos específicos de SMS: acquirer_bin,
+    processing_code_transaction_type, source_amount, transaction_code_sms).
+
+    Args:
+        df: DataFrame CLN de SMS.
+        ardef: DataFrame ARDEF ya cargado (de load_visa_ardef).
+        country_df: DataFrame de referencia country.
+        currency_df: DataFrame de referencia currency.
+        client_data: Dict de configuración del cliente (de get_client_data).
+
+    Returns:
+        DataFrame CAL con las 27 columnas de salida de SMS.
+
+    Ejemplo:
+        calculate_sms_fields(df, ardef, country_df, currency_df, client_data)
+    """
     log_info("Calculating SMS fields")
     log_info(f"Input records: {df.count():,}")
     
@@ -1279,7 +2052,20 @@ def calculate_sms_fields(df: DataFrame, ardef: DataFrame, country_df: DataFrame,
 
 
 def calculate_vss_fields(df: DataFrame, vss_type: str) -> DataFrame:
-    """Calcula los campos para VSS (2 campos)."""
+    """
+    Calcula los campos para VSS (2 campos).
+
+    Args:
+        df: DataFrame CLN de un tipo VSS (110/120/130/140).
+        vss_type: Tipo VSS como string, ej. "110".
+
+    Returns:
+        DataFrame CAL con content_hash, record, vss_report_type,
+        vss_aggregation_level.
+
+    Ejemplo:
+        calculate_vss_fields(df, "110")
+    """
     log_info(f"Calculating VSS {vss_type} fields")
     log_info(f"Input records: {df.count():,}")
     
@@ -1306,8 +2092,38 @@ def process_output(output_config: dict, staging_bucket: str, reference_bucket: s
                    file_type: str, file_date: str, client_data: dict, ardef: DataFrame,
                    country_df: DataFrame, currency_df: DataFrame) -> dict:
     """
-    Procesa un output específico (BASEII, SMS, o VSS_xxx).
+    Procesa un output específico (BASEII, SMS, o VSS_xxx) de punta a punta:
+    carga el CLN, despacha a la función de cálculo correspondiente
+    (calculate_baseii_fields/calculate_sms_fields/calculate_vss_fields), y
+    escribe el resultado al path CAL derivado (reemplazando "/300_"→"/400_" y
+    "_cln"→"_cal" en el s3_key de entrada).
+
     SIN try/except - errores suben y matan el job (Step Functions verá rojo).
+
+    Args:
+        output_config: Dict de un output del CLN, con output_type y s3_key.
+        staging_bucket: Bucket S3 de staging.
+        reference_bucket: Bucket S3 de referencia (no usado directamente acá,
+            ya se cargaron los DataFrames de referencia antes de llamar a
+            esta función).
+        file_type: "IN" u "OUT".
+        file_date: Fecha del archivo (no usado directamente, solo logging).
+        client_data: Dict de configuración del cliente.
+        ardef: DataFrame ARDEF ya cargado.
+        country_df: DataFrame de referencia country.
+        currency_df: DataFrame de referencia currency.
+
+    Returns:
+        Dict con status="SUCCESS", output_type, s3_key (de salida), records.
+
+    Raises:
+        ValueError: si el output_config no trae s3_key, o si output_type no
+            es BASEII, SMS, ni empieza con "VSS_".
+
+    Ejemplo:
+        process_output({'output_type': 'BASEII', 's3_key': '.../300_baseii_cln_drafts/.../x.parquet'},
+                        staging_bucket, reference_bucket, "IN", "2026-01-03", client_data,
+                        ardef, country_df, currency_df)
     """
     output_type = output_config.get('output_type', '')
     input_s3_key = output_config.get('s3_key', '')
@@ -1353,6 +2169,21 @@ def process_output(output_config: dict, staging_bucket: str, reference_bucket: s
 # =============================================================================
  
 def main():
+    """
+    Punto de entrada del Glue job glue-vi-calculate. Resuelve los argumentos
+    del job, carga los datos del cliente (DynamoDB) y las tablas de
+    referencia (ARDEF filtrado por file_date, country, currency), y procesa
+    cada output del archivo (process_output) — uno por tipo de record
+    (BASEII/SMS/VSS_xxx) presente en el archivo.
+
+    Returns:
+        Dict con status="SUCCESS", total_outputs, total_records, outputs
+        (lista de resultados de process_output). Llama a job.commit() al
+        finalizar.
+
+    Ejemplo:
+        main()  # invocado automáticamente al ejecutar el script como Glue job
+    """
     args = getResolvedOptions(sys.argv, [
         'JOB_NAME', 
         'reference_bucket', 

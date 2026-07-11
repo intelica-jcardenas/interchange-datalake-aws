@@ -1,38 +1,48 @@
 """
-Mastercard store pipeline — AWS Lambda handler.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-store
+================================================================================
+Archivo:     lambdas/mastercard/store/src/handler.py
 
-Último paso del pipeline MC antes del archive.
-Lee los Parquets ya procesados desde staging (CLN + CAL + ITX),
-los consolida y los escribe en el bucket operational.
+Última etapa del pipeline Mastercard antes del archive. Consolida, por
+cada MTI presente en el archivo, los Parquets de staging CLN + CAL + ITX
+(este último solo para 1240/1442, donde existe capa de interchange) en un
+único Parquet final y lo escribe en operational. A diferencia de Visa
+(join por índice `record`), el merge es por llave de negocio explícita
+`(file_id, file_idn, ref_id)` — ver `decisions.md` → "Por qué mc-store
+fusiona CLN + CAL + ITX por llave (file_id, file_idn, ref_id) y no por
+posición (axis=1)" — porque el orden posicional entre etapas Spark no está
+garantizado entre ejecuciones. CLN se procesa en streaming
+(`iter_batches`) para evitar OOM en archivos grandes (ver `decisions.md`
+→ "Por qué lmbd-mc-store restaura el schema Arrow del CLN..."); CAL e ITX
+se cargan completos en memoria (pequeños). `_restore_schema()` corrige
+tipos degradados por el round-trip pandas/pyarrow tanto en columnas
+heredadas de CLN como en columnas nuevas de CAL/ITX (NullType→string,
+decimal de precisión no-18→decimal128(18,s), timestamps→microsegundos) —
+necesario para que `spark.read.parquet()` pueda leer el directorio
+operational sin `SchemaColumnConvertNotSupportedException`.
 
-Mapeo de subdirectorios por MTI
---------------------------------
+Mapeo de subdirectorios por MTI:
   400_IPM_{mti}_CLN  →  clean transactions  (entrada, recibida en store_input.outputs)
   500_IPM_{mti}_CAL  →  calculated fields   (Glue calculate)
   600_IPM_{mti}_ITX  →  interchange data    (Glue interchange — puede no existir)
   → operational: {client_id}/{brand_id}/IPM_{mti}/file_type={file_type}/date={date}/
 
-MTIs soportados
----------------
+MTIs soportados:
 - 1240  (CLN + CAL + ITX si existe)
 - 1442  (CLN + CAL + ITX si existe)
 - 1644  (CLN + CAL,  ITX normalmente ausente → itx_s3_key = null)
 - 1740  (CLN + CAL,  ITX normalmente ausente → itx_s3_key = null)
 
-Variables de entorno
---------------------
-S3_BUCKET_STAGING      (opcional)  Bucket de origen.
-                                    Default: "itl-0004-itx-dev-intchg-02-s3-staging"
-S3_BUCKET_OPERATIONAL  (opcional)  Bucket de destino.
-                                    Default: "itl-0004-itx-dev-intchg-02-s3-operational"
-ITX_STORE_BATCH_SIZE   (opcional)  Filas por batch al leer CLN.  Default: 100000
+Variables de entorno:
+  S3_BUCKET_STAGING      : bucket de origen (default: itl-0004-itx-dev-intchg-02-s3-staging)
+  S3_BUCKET_OPERATIONAL  : bucket de destino (default: itl-0004-itx-dev-intchg-02-s3-operational)
+  ITX_STORE_BATCH_SIZE   : filas por batch al leer CLN (default: 100000)
 
-Input (Step Functions — Payload.$: "$")
-----------------------------------------
-El estado PrepareStoreInput coloca los datos bajo $.store_input.
-Los campos de identidad (client_id, file_id, …) están tanto en la raíz del
-estado SF como dentro de store_input.
-
+Input (Step Functions — Payload.$: "$"): el estado PrepareStoreInput
+coloca los datos bajo $.store_input. Los campos de identidad (client_id,
+file_id, …) están tanto en la raíz del estado SF como dentro de
+store_input (fallback via `_field()` en el handler).
+```
 {
     "client_id":    "EBGR",
     "file_id":      "38B4968A...",
@@ -56,9 +66,10 @@ estado SF como dentro de store_input.
         ...
     }
 }
+```
 
-Output (alineado con vi_store.py)
------------------------------------
+Output (alineado con el store de Visa):
+```
 {
     "status":        "SUCCESS" | "PARTIAL_SUCCESS" | "ERROR",
     "total_outputs": <int>,
@@ -86,6 +97,7 @@ Output (alineado con vi_store.py)
     "content_hash":  "...",
     "filename":      "T112T0...",
 }
+```
 """
 
 from __future__ import annotations
@@ -136,19 +148,56 @@ MTIS_WITH_ITX: frozenset[str] = frozenset({"1240", "1442"})
 
 
 def _download_to_bytesio(bucket: str, key: str) -> io.BytesIO:
-    """Descarga un objeto S3 completo y retorna un BytesIO posicionado al inicio."""
+    """
+    Descarga un objeto S3 completo a memoria.
+
+    Args:
+        bucket: Bucket S3 donde está el objeto.
+        key: Key del objeto.
+
+    Returns:
+        Buffer `BytesIO` posicionado al inicio, con el contenido completo.
+
+    Ejemplo:
+        _download_to_bytesio(bucket, "EBGR/MC/400_IPM_1240_CLN/.../x.parquet")
+    """
     body = S3.get_object(Bucket=bucket, Key=key)["Body"].read()
     return io.BytesIO(body)
 
 
 def _read_parquet_s3(bucket: str, key: str) -> pd.DataFrame:
-    """Lee un único Parquet desde S3 y retorna un DataFrame."""
+    """
+    Lee un único Parquet desde S3 y lo devuelve como DataFrame de pandas.
+
+    Args:
+        bucket: Bucket S3 donde está el Parquet.
+        key: Key del archivo Parquet.
+
+    Returns:
+        DataFrame con el contenido del Parquet.
+
+    Ejemplo:
+        _read_parquet_s3(bucket, "EBGR/MC/500_IPM_1240_CAL/.../x.parquet")
+    """
     return pd.read_parquet(_download_to_bytesio(bucket, key))
 
 
 def _read_parquet_arrow_s3(bucket: str, key: str) -> pa.Table:
-    """Lee un único Parquet desde S3 como pa.Table -- preserva el schema real
-    antes de que el round-trip por pandas lo degrade."""
+    """
+    Lee un único Parquet desde S3 como `pa.Table` — preserva el schema
+    real de la columna (tipos exactos) antes de que un eventual round-trip
+    por pandas lo degrade (INT64+nulls→float64, NullType, etc.).
+
+    Args:
+        bucket: Bucket S3 donde está el Parquet.
+        key: Key del archivo Parquet.
+
+    Returns:
+        `pa.Table` con el contenido y schema originales del Parquet.
+
+    Ejemplo:
+        _read_parquet_arrow_s3(bucket, "EBGR/MC/500_IPM_1240_CAL/.../x.parquet")
+    """
     return pq.read_table(_download_to_bytesio(bucket, key))
 
 
@@ -158,15 +207,37 @@ def _restore_schema(
     output_schema: Optional[pa.Schema] = None,
 ) -> pa.Table:
     """
-    Restaura tipos Arrow degradados por el round-trip pandas/pyarrow.
+    Restaura tipos Arrow degradados por el round-trip pandas/pyarrow, para
+    que el Parquet final tenga el mismo schema físico entre archivos
+    (necesario para que `spark.read.parquet()` lea el directorio completo
+    sin `SchemaColumnConvertNotSupportedException`).
 
     - Columnas en dtype_map (schema autoritativo de CLN+CAL+ITX, capturado
       antes de convertir a pandas): castea al tipo original, excepto
       timestamps que siempre se fuerzan a "us".
     - Columnas sin dtype conocido (no en dtype_map): NullType→string,
       decimal128(p≠18,s)→decimal128(18,s), timestamp→"us".
-    - Si se pasa output_schema (de un batch anterior): fuerza ese schema exacto
-      para garantizar consistencia entre batches al escribir al ParquetWriter.
+    - Si se pasa output_schema (de un batch anterior): fuerza ese schema
+      exacto para garantizar consistencia entre batches al escribir al
+      ParquetWriter, en vez de derivar de dtype_map.
+
+    Args:
+        table: Tabla Arrow del batch actual (ya mergeada CLN+CAL+ITX).
+        dtype_map: Schema autoritativo por nombre de columna, combinando
+            los tipos originales de CAL, ITX y CLN (`cln_dtype_map` tiene
+            prioridad en caso de colisión — ver `_store_output`). Ignorado
+            si se pasa `output_schema`.
+        output_schema: Si no es `None` (batches 2+), fuerza este schema
+            exacto en vez de derivar uno nuevo desde `dtype_map`.
+
+    Returns:
+        La misma `pa.Table`, con las columnas casteadas a su tipo
+        correcto. Si un cast individual falla, esa columna queda con su
+        tipo inferido (se loguea un warning, no aborta el batch).
+
+    Ejemplo:
+        _restore_schema(batch_table, dtype_map)  # primer batch, deriva schema
+        _restore_schema(batch_table, dtype_map, output_schema)  # batches siguientes
     """
     if output_schema is not None:
         # Modo batch 2+: castear al schema fijo del primer batch
@@ -235,6 +306,23 @@ def _derive_target_key(cln_s3_key: str, mti: str) -> str:
 
 
 def _normalize_merge_keys(df: pd.DataFrame, keys: list[str]) -> None:
+    """
+    Castea las columnas llave a `string` nullable y les aplica `.str.strip()`
+    in-place, para que el merge por llave entre CLN/CAL/ITX no falle por
+    diferencias de tipo (ej. int vs string) o espacios sobrantes.
+
+    Args:
+        df: DataFrame a normalizar (modificado in-place).
+        keys: Nombres de columna llave a normalizar, ej.
+            `["file_id", "file_idn", "ref_id"]`. Las que no estén
+            presentes en `df` se ignoran.
+
+    Returns:
+        None — modifica `df` in-place.
+
+    Ejemplo:
+        _normalize_merge_keys(df_cal, ["file_id", "file_idn", "ref_id"])
+    """
     for k in keys:
         if k in df.columns:
             df[k] = df[k].astype("string").str.strip()
@@ -250,10 +338,43 @@ def _store_output(
     operational_bucket: str,
 ) -> dict:
     """
-    Consolida CLN + CAL + ITX por llave (file_id, file_idn, ref_id).
+    Consolida CLN + CAL + ITX de un MTI en un único Parquet, mergeando por
+    llave `(file_id, file_idn, ref_id)`.
 
-    CLN se lee en streaming (iter_batches) para evitar OOM con archivos grandes.
-    CAL e ITX se cargan completos en memoria (son pequeños).
+    CLN se abre como `ParquetFile` y se itera en batches de
+    `STORE_BATCH_SIZE` filas (streaming, para evitar OOM con archivos
+    grandes). CAL e ITX se cargan completos en memoria (son pequeños) y se
+    reducen a solo `KEYS` + columnas nuevas (las que no están ya en CLN,
+    para no duplicar) antes del merge — con `validate="one_to_one"` y un
+    chequeo explícito de duplicados por `KEYS`, que aborta con
+    `ValueError` si CAL/ITX no son únicos por llave (un `how="left"`
+    silencioso con llaves duplicadas produciría fan-out difícil de
+    detectar en Athena). CAL/ITX faltantes o con error de lectura se
+    loguean como warning y el merge continúa solo con lo disponible (ITX
+    en particular es normal que falte para MTIs 1644/1740). El schema de
+    salida se deriva del primer batch (`_restore_schema` sin
+    `output_schema`) y se fuerza en los siguientes, para que el
+    `ParquetWriter` no falle por inconsistencia de schema entre batches.
+
+    Args:
+        output: Dict de un output de store_input, con `mti` y `s3_key`
+            (key del Parquet CLN).
+        staging_bucket: Bucket S3 de staging (origen de CLN/CAL/ITX).
+        operational_bucket: Bucket S3 operational (destino del Parquet
+            final).
+
+    Returns:
+        Dict con el resultado del store (`mti`, `cln_s3_key`, `cal_s3_key`,
+        `itx_s3_key` —`None` si no existía—, `target_s3_key`, `records`,
+        `columns`, `batches`).
+
+    Raises:
+        ValueError: si CLN/CAL/ITX no tienen las columnas llave, o si
+            CAL/ITX tienen filas duplicadas por `KEYS`.
+
+    Ejemplo:
+        _store_output({'mti': '1240', 's3_key': 'EBGR/MC/400_IPM_1240_CLN/.../x.parquet'},
+                       staging_bucket, operational_bucket)
     """
     KEYS = ["file_id", "file_idn", "ref_id"]
 
@@ -431,13 +552,37 @@ def _store_output(
 
 def lambda_handler(event: dict, context: Any) -> dict:
     """
-    AWS Lambda entry point para el paso Store del pipeline Mastercard.
+    Punto de entrada de la Lambda `lmbd-mc-store`. Invocada por la Step
+    Function Mastercard tras `lmbd-mc-clean` (o manualmente para
+    reprocesos, ver `.claude/memory/manual_execution.md` → "Reproceso
+    manual lmbd-mc-store"). A diferencia de `lmbd-vi-store`, no actualiza
+    DynamoDB `file_control` — eso lo hace la Step Function.
 
-    Recibe el estado completo de Step Functions (Payload.$: "$").
-    El estado PrepareStoreInput coloca la información bajo $.store_input;
-    los campos de identidad se leen de store_input con fallback al root del evento.
+    Recibe el estado completo de Step Functions (`Payload.$: "$"`). El
+    estado `PrepareStoreInput` coloca la información bajo `$.store_input`;
+    los campos de identidad se leen de `store_input` con fallback a la
+    raíz del evento (helper interno `_field()`). Recorre todos los
+    outputs recibidos (uno por MTI, o dos para 1644 con Function Code
+    685/688), descarta los MTI no soportados, hace el store de cada uno
+    con `_store_output()` de forma independiente (un fallo en un MTI no
+    aborta los demás) y agrega el resultado en un único payload de salida.
 
-    Ver docstring del módulo para detalle de input/output.
+    Args:
+        event: Payload de Step Functions — ver ejemplo completo en el
+            docstring del módulo.
+        context: Contexto de ejecución de Lambda; se usa
+            `context.aws_request_id` para logging.
+
+    Returns:
+        Dict con `status` ("SUCCESS", "PARTIAL_SUCCESS" o "ERROR"),
+        `total_outputs`, `total_records`, la lista `outputs` con el
+        resultado de cada store exitoso, y `errors` con el detalle de los
+        MTIs que fallaron — ver ejemplo completo en el docstring del
+        módulo. Lanza `ValueError` si falta `client_id` o `file_id`.
+
+    Ejemplo:
+        lambda_handler({'client_id': 'EBGR', 'file_id': '38B4968A...',
+                         'store_input': {'outputs': [...]}}, context)
     """
     log.info("REQUEST_ID=%s", context.aws_request_id)
     log.info("EVENT=%s", json.dumps(event))

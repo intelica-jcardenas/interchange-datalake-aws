@@ -1,20 +1,40 @@
 """
-Lambda Extract - itx-extract (Optimizado v2)
-============================================
-Mejoras aplicadas vs versión anterior:
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-vi-extract
+================================================================================
+Archivo:     lambdas/visa/extract/src/handler.py
 
-1. itertuples() en vez de iterrows()
-   → 10x más rápido para iterar field_defs
-   → Acceso por atributo en vez de dict lookup
+Tercera etapa del pipeline Visa (tras transform, antes de clean). Extrae
+campo por campo de cada record de ancho fijo generado por transform,
+usando las posiciones y longitudes definidas en la tabla DynamoDB
+`visa_fields` (GSI `type-record-index`). Soporta records simples (BASEII,
+VSS) y records con sub-identificador secundario (SMS, donde varios campos
+comparten la misma columna `tcsn` pero se distinguen por un
+`secondary_identifier` en una posición fija dentro del record). Procesa el
+Parquet de transform en streaming (`iter_batches` + `ParquetWriter`) y
+escribe el resultado a `s3-staging/200_*_ext_*/`.
 
-2. dict → DataFrame en vez de concat de 250 Series
-   → Elimina la construcción de objetos intermedios
-   → Una sola operación de memoria al final
+Optimizado (v2) respecto a una versión anterior más lenta: usa
+`itertuples()` en vez de `iterrows()` para recorrer las definiciones de
+campo (acceso por atributo en vez de lookup por dict, ~10x más rápido), y
+arma cada chunk extraído con un único `pd.concat()` de Series en vez de
+ensamblar un dict campo por campo.
+
+Flujo:
+1. Por cada output de transform (uno por type_record): cargar definiciones
+   de campo desde DynamoDB (ordenadas por sort_by de OUTPUT_TYPE_CONFIG)
+2. Si es SMS: aplicar preprocesamiento especial de field_defs
+3. Descargar el Parquet de transform a un buffer en memoria
+4. Iterar el Parquet en chunks (EXTRACT_CHUNK_SIZE, default 300000 filas)
+5. Por chunk: agrupar campos por columna tcsn/secondary_identifier y
+   extraer cada campo por posición/longitud
+6. Insertar content_hash como primera columna
+7. Escribir cada chunk al ParquetWriter en streaming
+8. Subir el Parquet consolidado a s3-staging
 
 Variables de entorno:
-  S3_BUCKET_STAGING        : bucket con los Parquets de transform
-  DYNAMODB_FIELD_DEFINITION: tabla de definiciones de campos
-  EXTRACT_CHUNK_SIZE        : records por batch (default: 300000)
+  S3_BUCKET_STAGING          : bucket con los Parquets de transform, y destino del extract
+  DYNAMODB_FIELD_DEFINITION  : tabla de definición de campos Visa (default: itx-visa-fields)
+  EXTRACT_CHUNK_SIZE         : filas por chunk de streaming (default: 300000)
 """
 
 import os
@@ -92,6 +112,27 @@ OUTPUT_TYPE_CONFIG = {
 # =============================================================================
 
 def _load_field_definitions(type_record: str, sort_by: List[str]) -> pd.DataFrame:
+    """
+    Consulta en DynamoDB (tabla `visa_fields`, GSI `type-record-index`)
+    todas las definiciones de campo para un `type_record` dado, paginando
+    con `LastEvaluatedKey`, y las ordena según `sort_by` para garantizar un
+    orden determinístico de extracción.
+
+    Args:
+        type_record: Tipo de record Visa a consultar, ej. "draft" para
+            BASEII.
+        sort_by: Lista de columnas por las que ordenar el resultado (de
+            `OUTPUT_TYPE_CONFIG[...]['sort_by']`), ej.
+            `["tcsn", "position", "secondary_identifier_len"]`.
+
+    Returns:
+        DataFrame con una fila por campo definido, ordenado por
+        `sort_by`, o un DataFrame vacío si no hay definiciones para ese
+        `type_record`.
+
+    Ejemplo:
+        _load_field_definitions("draft", ["tcsn", "position"])
+    """
     logger.info(f"Loading field definitions for type_record: {type_record}")
 
     table    = dynamodb.Table(FIELD_DEF_TABLE)
@@ -132,6 +173,20 @@ def _load_field_definitions(type_record: str, sort_by: List[str]) -> pd.DataFram
 
 
 def _get_s3_file_object(s3_key: str) -> BytesIO:
+    """
+    Descarga un objeto de `S3_BUCKET_STAGING` completo a un buffer en
+    memoria.
+
+    Args:
+        s3_key: Key del objeto dentro del bucket de staging.
+
+    Returns:
+        Buffer `BytesIO` con el contenido del objeto. Relanza cualquier
+        excepción tras loguearla.
+
+    Ejemplo:
+        _get_s3_file_object("EBGR/VISA/100_baseii_raw_drafts/.../x.parquet")
+    """
     logger.info(f"Downloading file into memory buffer from s3://{STAGING_BUCKET}/{s3_key}")
     try:
         response = s3.get_object(Bucket=STAGING_BUCKET, Key=s3_key)
@@ -142,6 +197,24 @@ def _get_s3_file_object(s3_key: str) -> BytesIO:
 
 
 def _process_sms_field_defs(field_defs: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajusta las definiciones de campo SMS antes de la extracción: descarta
+    el `secondary_identifier` "V22000" (no corresponde a ningún campo real
+    extraíble) y le quita el prefijo "V" al resto (ej. "V22200" → "22200"),
+    para que coincida con el nombre de columna real que usa `transform`
+    para esa columna secundaria.
+
+    Args:
+        field_defs: DataFrame de definiciones de campo SMS ya cargado de
+            DynamoDB.
+
+    Returns:
+        DataFrame ajustado, o el mismo `field_defs` sin cambios si no
+        tiene columna `secondary_identifier`.
+
+    Ejemplo:
+        _process_sms_field_defs(field_defs)  # 'V22200' -> '22200' en la columna
+    """
     if 'secondary_identifier' in field_defs.columns:
         field_defs = field_defs[
             field_defs['secondary_identifier'] != 'V22000'
@@ -159,7 +232,41 @@ def _process_sms_field_defs(field_defs: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def _extract_fields(data, field_defs, type_record):
+    """
+    Extrae todos los campos definidos en `field_defs` de un chunk de
+    records de ancho fijo (`data`), devolviendo un DataFrame con una
+    columna por campo extraído.
 
+    Agrupa las definiciones de campo por la columna origen (`tcsn` si
+    existe como columna en `data`, sino `secondary_identifier`) para
+    procesar cada columna origen una sola vez en vez de una vez por campo.
+    Para campos con `secondary_identifier` distinto de la columna origen
+    (records donde varias definiciones de campo comparten una misma
+    columna `tcsn` pero corresponden a sub-tipos distintos, distinguidos
+    por un valor fijo en una posición del record), filtra primero las
+    filas cuyo contenido en `secondary_identifier_pos`/`_len` coincide con
+    el `secondary_identifier` esperado, y solo extrae el campo de esas
+    filas — el resto queda vacío para esa columna en ese chunk. Cada campo
+    se extrae con slicing de string por `position`/`length` (ambos
+    1-indexados en la definición).
+
+    Args:
+        data: DataFrame del chunk crudo (una columna por `tcsn`/columna de
+            transform, valores string de ancho fijo).
+        field_defs: DataFrame de definiciones de campo ya cargado y
+            ordenado (ver `_load_field_definitions`).
+        type_record: Tipo de record (no usado directamente en la lógica,
+            solo pasado por compatibilidad de firma).
+
+    Returns:
+        DataFrame con una columna por campo extraído (más `record` como
+        primera columna si `data` la trae), o un DataFrame vacío si
+        `data`/`field_defs` están vacíos o no se pudo extraer ningún
+        campo.
+
+    Ejemplo:
+        _extract_fields(chunk_df, field_defs, 'draft')  # DataFrame con ~90 columnas
+    """
     if data.empty or field_defs.empty:
         return pd.DataFrame()
 
@@ -250,7 +357,39 @@ def extract_output(
     client_id: str, brand: str,
     file_type: str, file_date: str, content_hash: str
 ) -> Optional[Dict]:
+    """
+    Extrae un output de transform (un `type_record` de un archivo, ej.
+    BASEII o VSS_120) de punta a punta: carga las definiciones de campo,
+    descarga el Parquet de transform, lo procesa en streaming por chunks
+    de `EXTRACT_CHUNK_SIZE` filas (`iter_batches` + `ParquetWriter`, para
+    no cargar el archivo completo en memoria), inserta `content_hash` como
+    primera columna de cada chunk extraído y sube el Parquet consolidado a
+    `s3-staging/200_*_ext_*/`.
 
+    Args:
+        output: Dict de un output de transform, con `output_type`,
+            `s3_key` y `records`.
+        client_id: Código del cliente (no usado para lógica, solo
+            trazabilidad).
+        brand: Marca del archivo ("VISA"), no usado para lógica, solo
+            trazabilidad.
+        file_type: "IN" u "OUT", no usado para lógica, solo trazabilidad.
+        file_date: Fecha del archivo (no usado para lógica, solo
+            trazabilidad).
+        content_hash: MD5 del archivo origen, insertado como primera
+            columna de cada chunk extraído.
+
+    Returns:
+        Dict con el resultado de la extracción (`output_type`, `s3_key`,
+        `records`, `fields`, `batches`), o `None` si el `output_type` no
+        está en `OUTPUT_TYPE_CONFIG`, no hay definiciones de campo para su
+        `type_record`, o no se extrajo ningún registro. Relanza cualquier
+        excepción tras loguearla.
+
+    Ejemplo:
+        extract_output({'output_type': 'BASEII', 's3_key': '...', 'records': 1000},
+                        'EBGR', 'VISA', 'IN', '2026-01-03', 'AB12...')
+    """
     output_type   = output.get('output_type')
     input_s3_key  = output.get('s3_key')
     input_records = output.get('records', 0)
@@ -367,6 +506,32 @@ def extract_output(
 # =============================================================================
 
 def lambda_handler(event, context):
+    """
+    Punto de entrada de la Lambda `lmbd-vi-extract`. Invocada por la Step
+    Function Visa tras `lmbd-vi-transform`. Recorre todos los outputs de
+    transform recibidos en el evento, extrae cada uno con
+    `extract_output()` de forma independiente (un fallo en un output no
+    aborta los demás) y agrega el resultado en un único payload de salida
+    para la siguiente etapa (`lmbd-vi-clean`).
+
+    Args:
+        event: Payload de Step Functions con `client_id`, `file_id`,
+            `brand`, `file_type`, `file_date`, `content_hash` y `outputs`
+            (lista de outputs de transform a extraer).
+        context: Contexto de ejecución de Lambda (no usado).
+
+    Returns:
+        Dict con `status` ("SUCCESS", "PARTIAL_SUCCESS" o "ERROR"),
+        `total_outputs`, `total_records`, `total_fields`, la lista
+        `outputs` con el resultado de cada extracción exitosa, y `errors`
+        con el detalle de los outputs que fallaron. Lanza `ValueError` si
+        falta `S3_BUCKET_STAGING`.
+
+    Ejemplo:
+        lambda_handler({'client_id': 'EBGR', 'file_id': '...', 'brand': 'VISA',
+                         'file_type': 'IN', 'file_date': '2026-01-03',
+                         'content_hash': '...', 'outputs': [...]}, None)
+    """
     logger.info("=" * 70)
     logger.info("ITX EXTRACT LAMBDA v2 - START")
     logger.info(f"Config: chunk_size={CHUNK_SIZE:,}")

@@ -1,19 +1,73 @@
+"""
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-interpreter
+================================================================================
+Archivo:     lambdas/mastercard/interpreter/src/handler.py
+
+Primera etapa exclusiva del pipeline Mastercard (sin equivalente en Visa —
+ver decisions.md → "Por qué Mastercard tiene un paso Interpreter que Visa
+no tiene"). Traduce el archivo IPM binario (ISO-8583) a Parquets
+estructurados por MTI. Consulta DynamoDB para determinar encoding
+(latin-1/cp500) y si el archivo viene bloqueado (file_block) o requiere
+interpreter_fix; si está bloqueado, elimina los 2 bytes separadores de
+cada bloque de 1014 bytes (unblock_1014, con pushback de separadores no
+válidos — mismo mecanismo que el router replica en
+_mc_unblock_full/_mc_unblock_chunk). Lee mensaje a mensaje usando el RDW
+(4 bytes big-endian con el largo del mensaje), parsea la estructura
+ISO-8583 (MTI de 4 bytes + bitmap de 8 o 16 bytes + Data Elements), agrupa
+mensajes en bloques delimitados por headers MTI 1644/FC 697 y trailers
+MTI 1644/FC 695, y escribe Parquets por MTI a s3-staging/100_IPM_{MTI}_RAW/.
+
+Módulo único y autosuficiente (todo el intérprete vive en este solo
+archivo, incluyendo la clase Database/FileStorage propias — no reutiliza
+las de otras Lambdas Mastercard):
+  1. Database          – acceso DynamoDB
+  2. FileStorage       – I/O en S3 y staging temporal /tmp
+  3. Helpers ISO-8583  – decode, bitmap, MTI, Parameters
+  4. Lógica de negocio – parsing DE, build_wide_row, encoding, headers
+  5. Lectores IO       – unblock_1014, read_len_prefixed_messages*
+  6. Writers Parquet   – write_parquet_by_mti_block_streaming, finalize
+  7. Orquestador       – interpretate_msg
+
+Resiliencia ante mensajes corruptos: ante cualquier fallo de parseo de un
+DE, se intenta un resync del stream (_resync_stream +
+_valid_mti_byte_patterns) buscando el siguiente mensaje válido por
+patrón de MTI plausible; si no se encuentra, se preservan los bloques ya
+procesados en vez de descartar el archivo completo (a diferencia del
+comportamiento del legacy) — ver gotchas.md → "mc-interpreter: mensaje
+IPM con DE_55 corrupto desincronizaba el stream y abortaba el archivo
+completo".
+
+Streaming: `_process_block` itera el buffer de bloque en sub-chunks de
+ITX_INTERPRETER_BLOCK_CHUNK_SIZE (default 10000) filas, liberando memoria
+entre sub-chunks (ver decisions.md → "Por qué lmbd-mc-clean y
+lmbd-mc-extract leen/escriben Parquet en streaming").
+
+MTIs que produce: 1240, 1442, 1740 (transaccionales) y 1644 FC
+685/688/691 (liquidación) — ver tabla completa en CLAUDE.md → "Flujo
+detallado Mastercard".
+
+Variables de entorno (ninguna declarada en config.json/env-vars.json
+actualmente — todas usan el default hardcodeado en el código):
+  AWS_REGION                        : región AWS (default: eu-south-2)
+  ITX_DDB_FILE_CONTROL_TABLE / ITX_TABLE_FILE_CONTROL
+                                     : tabla de control (default: itl-0004-itx-dev-dynamo-file_control-02)
+  ITX_DDB_FILE_NAME_REGEX_PARAM_TABLE / ITX_TABLE_FILE_NAME_REGEX_PARAM
+                                     : tabla de patrones (default: itl-0004-itx-dev-dynamo-file_pattern-02)
+  ITX_DDB_CLIENT_TABLE / ITX_TABLE_CLIENT
+                                     : tabla de clientes (default: itl-0004-itx-dev-dynamo-client-02)
+  ITX_S3_BUCKET_LANDING             : bucket de landing (default: itl-0004-itx-dev-intchg-02-s3-landing)
+  ITX_S3_BUCKET_STAGING             : bucket de staging (default: itl-0004-itx-dev-intchg-02-s3-staging)
+  ITX_S3_BUCKET_OPERATIONAL         : bucket operational (sin default — falla si se usa sin configurar)
+  ITX_TMP_ROOT                      : raíz local de staging temporal (default: /tmp/mc_interpreter)
+  ITX_LOG_LEVEL                     : nivel de logging (default: info)
+  ITX_INTERPRETER_BLOCK_CHUNK_SIZE  : filas por sub-chunk de streaming (default: 10000)
+
+Config Lambda: Timeout 900s, Memory 10240MB, EphemeralStorage 1536MB
+(config.json).
+"""
+
 from __future__ import annotations
- 
-# ──────────────────────────────────────────────────────────────────────────────
-# mc_interpreter_handler.py
-# Módulo único y autosuficiente del intérprete IPM Mastercard.
-#
-# Contiene en un solo archivo:
-#   1. Database          – acceso DynamoDB
-#   2. FileStorage       – I/O en S3 y staging temporal /tmp
-#   3. Helpers ISO-8583  – decode, bitmap, MTI, Parameters
-#   4. Lógica de negocio – parsing DE, build_wide_row, encoding, headers
-#   5. Lectores IO       – unblock_1014, read_len_prefixed_messages*
-#   6. Writers Parquet   – write_parquet_by_mti_block_streaming, finalize
-#   7. Orquestador       – interpretate_msg
-# ──────────────────────────────────────────────────────────────────────────────
- 
+
 import gc
 import io
 import json
@@ -69,6 +123,17 @@ class Logger:
  
     def __init__(self, name: str) -> None:
  
+        """
+        Configura el logger con StreamHandler (stdout, capturado por CloudWatch
+        en Lambda) — no reconfigura handlers si el logger ya tiene alguno
+        (evita duplicar líneas de log en warm starts).
+
+        Args:
+            name: Nombre del logger (típicamente __name__).
+
+        Returns:
+            None.
+        """
         self.logger = logging.getLogger(name)
  
         if self.logger.handlers:
@@ -113,16 +178,45 @@ class Database:
     DEFAULT_CLIENT_TABLE = "itl-0004-itx-dev-dynamo-client-02"
  
     def __init__(self) -> None:
+        """
+        Inicializa el cliente DynamoDB (lazy, vía _get_resource) y el caché de
+        resultados de read_records a nivel de instancia.
+
+        Returns:
+            None.
+        """
         self.region = os.environ.get("AWS_REGION", "eu-south-2")
         self._dynamodb = None
         self._cache: dict[tuple[str, tuple[tuple[str, str], ...]], pd.DataFrame] = {}
  
     def _get_resource(self):
+        """
+        Devuelve el resource boto3 de DynamoDB, creándolo en la primera llamada
+        (lazy init).
+
+        Returns:
+            Resource boto3 de DynamoDB.
+        """
         if self._dynamodb is None:
             self._dynamodb = boto3.resource("dynamodb", region_name=self.region)
         return self._dynamodb
  
     def _resolve_table_name(self, table_name: str) -> str:
+        """
+        Traduce un nombre lógico de tabla ("file_control", "file_name_regex_param",
+        "client") al nombre real de la tabla en DynamoDB, leído de variables de
+        entorno con fallback a un default hardcodeado.
+
+        Args:
+            table_name: Nombre lógico de la tabla.
+
+        Returns:
+            Nombre real de la tabla en DynamoDB, o table_name sin cambios si
+            no es uno de los 3 nombres lógicos reconocidos.
+
+        Ejemplo:
+            db._resolve_table_name("client")  # "itl-0004-itx-dev-dynamo-client-02"
+        """
         normalized = table_name.strip().lower()
         mapping = {
             "file_control": os.environ.get(
@@ -145,10 +239,28 @@ class Database:
         return mapping.get(normalized, table_name)
  
     def _get_table(self, logical_table_name: str):
+        """
+        Devuelve el objeto Table de boto3 para un nombre lógico de tabla.
+
+        Args:
+            logical_table_name: Nombre lógico ("file_control", "client", etc.).
+
+        Returns:
+            Objeto Table de boto3.
+        """
         return self._get_resource().Table(self._resolve_table_name(logical_table_name))
  
     @staticmethod
     def _to_str(value: Any) -> str:
+        """
+        Convierte un valor de DynamoDB (incluyendo Decimal) a string plano.
+
+        Args:
+            value: Valor a convertir.
+
+        Returns:
+            String; "" si value es None.
+        """
         if value is None:
             return ""
         if isinstance(value, Decimal):
@@ -157,6 +269,18 @@ class Database:
  
     @staticmethod
     def _match_where(item: dict[str, Any], where: dict[str, str | int | float]) -> bool:
+        """
+        Verifica que un item de DynamoDB cumpla todas las condiciones de
+        igualdad de where (comparación case-insensitive, recortada).
+
+        Args:
+            item: Item de DynamoDB a validar.
+            where: Dict de condiciones {campo: valor_esperado}.
+
+        Returns:
+            True si todos los campos de where matchean (o si where está
+            vacío), False si falta algún campo o no coincide el valor.
+        """
         for key, expected in where.items():
             actual = item.get(key)
             if actual is None:
@@ -166,6 +290,15 @@ class Database:
         return True
  
     def _scan_all(self, logical_table_name: str) -> list[dict[str, Any]]:
+        """
+        Escanea una tabla completa, paginando automáticamente.
+
+        Args:
+            logical_table_name: Nombre lógico de la tabla a escanear.
+
+        Returns:
+            Lista de todos los items de la tabla.
+        """
         table = self._get_table(logical_table_name)
         items: list[dict[str, Any]] = []
         scan_kwargs: dict[str, Any] = {}
@@ -214,6 +347,17 @@ class Database:
         return None
  
     def _to_bool(self, val: object) -> bool:
+        """
+        Convierte un valor de DynamoDB (bool/int/str) a bool.
+
+        Args:
+            val: Valor a convertir.
+
+        Returns:
+            True si val es bool True o su representación string (lowercase,
+            strip) está en {'true','1','y','yes','t'}; False en cualquier otro
+            caso, incluido None.
+        """
         if val is None:
             return False
         if isinstance(val, bool):
@@ -300,6 +444,25 @@ class Database:
         raise ValueError(f"Consulta read_sql no soportada en Lambda handler: {sql}")
 
     def needs_unblock_for_file(self, client_id: str, file_id: str) -> bool:
+        """
+        Determina si un archivo Mastercard viene bloqueado en bloques de 1014
+        bytes, consultando primero file_control (file_type, brand_id,
+        landing_file_name) y luego file_name_regex_param (file_block) por
+        patrón de nombre de archivo matcheado contra landing_file_name.
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+
+        Returns:
+            True si el patrón de archivo matcheado tiene file_block=true en
+            file_name_regex_param; False si no hay registro, no hay patrones
+            configurados para ese cliente/marca, o ningún patrón matchea el
+            nombre de archivo.
+
+        Ejemplo:
+            db.needs_unblock_for_file("SBSA", "DD9D...")
+        """
         df_cf = self.read_records(
             table_name="file_control",
             fields=["file_type", "brand_id", "landing_file_name"],
@@ -371,6 +534,24 @@ class Database:
         return False
 
     def needs_interpreter_fix(self, client_id: str, file_id: str) -> bool:
+        """
+        Determina si un archivo Mastercard requiere el fix de interpreter
+        (interpreter_fix), mismo mecanismo de consulta que
+        needs_unblock_for_file pero leyendo la columna interpreter_fix en vez
+        de file_block.
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+
+        Returns:
+            True si el patrón de archivo matcheado tiene interpreter_fix=true
+            en file_name_regex_param; False si no hay registro o ningún patrón
+            matchea.
+
+        Ejemplo:
+            db.needs_interpreter_fix("SBSA", "DD9D...")
+        """
         log.logger.info(
             f"[Search need_interpreter_fix value] client_id: {client_id} | file_id: {file_id}"
         )
@@ -478,17 +659,49 @@ class FileStorage:
     DEFAULT_BUCKET_STAGING = "itl-0004-itx-dev-intchg-02-s3-staging"
  
     def __init__(self) -> None:
+        """
+        Inicializa la configuración de región, raíz local de staging temporal
+        (ITX_TMP_ROOT) y el caché de metadata de archivo
+        (get_file_control_details). El cliente S3 se crea lazy (_get_client).
+
+        Returns:
+            None.
+        """
         self.region = os.environ.get("AWS_REGION", "eu-south-2")
         self.tmp_root = Path(os.environ.get("ITX_TMP_ROOT", "/tmp/mc_interpreter"))
         self._s3 = None
         self._details_cache: dict[tuple[str, str], dict[str, Any]] = {}
  
     def _get_client(self):
+        """
+        Devuelve el cliente boto3 de S3, creándolo en la primera llamada (lazy
+        init).
+
+        Returns:
+            Cliente boto3 de S3.
+        """
         if self._s3 is None:
             self._s3 = boto3.client("s3", region_name=self.region)
         return self._s3
  
     def _get_bucket(self, layer: _Layer) -> str:
+        """
+        Resuelve el nombre de bucket S3 real para una capa lógica, leyendo la
+        variable de entorno correspondiente.
+
+        Args:
+            layer: Capa lógica (_Layer.LANDING/STAGING/OPERATIONAL).
+
+        Returns:
+            Nombre de bucket S3.
+
+        Raises:
+            ValueError: si no hay bucket configurado para esa capa (ej.
+                OPERATIONAL, que no tiene default).
+
+        Ejemplo:
+            fs._get_bucket(fs.Layer.STAGING)
+        """
         mapping = {
             self.Layer.LANDING: (
                 "ITX_S3_BUCKET_LANDING",
@@ -515,6 +728,28 @@ class FileStorage:
         file_id: str,
         fields: list[str] | None = None,
     ) -> dict[str, Any]:
+        """
+        Recupera la metadata de un archivo desde DynamoDB (file_control), con
+        caché a nivel de instancia (cache_key = client_id+file_id en
+        mayúsculas) — usada por todos los métodos de construcción de S3 keys
+        (_get_s3_key_prefix, _get_s3_key, _get_local_root, etc.).
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            fields: Campos a devolver (default: client_id, brand_id, file_type,
+                file_processing_date, landing_file_name, file_id).
+
+        Returns:
+            Dict con los campos solicitados.
+
+        Raises:
+            ValueError: si no existe registro de file_control para ese
+                client_id/file_id.
+
+        Ejemplo:
+            fs.get_file_control_details("SBSA", "DD9D...")
+        """
         if fields is None:
             fields = [
                 "client_id",
@@ -549,6 +784,23 @@ class FileStorage:
         file_id: str,
         subdir: str = "",
     ) -> str:
+        """
+        Construye el prefix de S3 key para una capa/cliente/archivo/subdirectorio,
+        según el esquema de particionamiento Hive-style del pipeline (landing
+        tiene estructura distinta: solo "{client_id}/").
+
+        Args:
+            layer: Capa lógica de destino.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio, ej. "100_IPM_1240_RAW".
+
+        Returns:
+            Prefix con barra final.
+
+        Ejemplo:
+            fs._get_s3_key_prefix(fs.Layer.STAGING, "SBSA", "DD9D...", "100_IPM_1240_RAW")
+        """
         details = self.get_file_control_details(client_id=client_id, file_id=file_id)
  
         if layer == self.Layer.LANDING:
@@ -572,6 +824,24 @@ class FileStorage:
         file_id: str,
         subdir: str = "",
     ) -> str:
+        """
+        Construye el S3 key completo (prefix + nombre de archivo) para una
+        capa/cliente/archivo/subdirectorio. Para LANDING usa el
+        landing_file_name real; para el resto usa file_id como nombre base.
+
+        Args:
+            layer: Capa lógica de destino.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio.
+
+        Returns:
+            S3 key completo (sin extensión — los callers agregan ".parquet" si
+            corresponde).
+
+        Ejemplo:
+            fs._get_s3_key(fs.Layer.LANDING, "SBSA", "DD9D...", "")
+        """
         details = self.get_file_control_details(client_id=client_id, file_id=file_id)
         prefix = self._get_s3_key_prefix(layer, client_id, file_id, subdir)
  
@@ -581,6 +851,22 @@ class FileStorage:
         return prefix + file_id
  
     def _get_local_root(self, client_id: str, file_id: str) -> Path:
+        """
+        Devuelve la raíz local en /tmp para un cliente/archivo (solo
+        client/brand — los segmentos subdir/file_type=/date= se agregan en
+        _get_file_path/_get_folder_path).
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo (usado para resolver brand_id
+                vía get_file_control_details).
+
+        Returns:
+            Path local, ej. Path("/tmp/mc_interpreter/SBSA/MC").
+
+        Ejemplo:
+            fs._get_local_root("SBSA", "DD9D...")
+        """
         details = self.get_file_control_details(client_id=client_id, file_id=file_id)
         # Raiz base: solo client/brand
         # Los segmentos subdir, file_type= y date= se añaden en _get_file_path/_get_folder_path.
@@ -609,6 +895,23 @@ class FileStorage:
     def _get_folder_path(
         self, layer: _Layer, client_id: str, file_id: str, subdir: str = ""
     ) -> str:
+        """
+        Devuelve el path local (carpeta, sin nombre de archivo) donde
+        escribir/leer los Parquets temporales de un cliente/archivo/subdirectorio,
+        siguiendo la misma estructura de particionamiento que S3.
+
+        Args:
+            layer: Capa lógica.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio.
+
+        Returns:
+            Path local de la carpeta (como string).
+
+        Ejemplo:
+            fs._get_folder_path(fs.Layer.STAGING, "SBSA", "DD9D...", "100_IPM_1240_RAW")
+        """
         if layer == self.Layer.LANDING:
             return str(self.tmp_root / "landing" / client_id)
  
@@ -621,6 +924,21 @@ class FileStorage:
         return str(base / f"file_type={file_type}" / f"date={date}")
  
     def cleanup_tmp_outputs(self, client_id: str, file_id: str) -> None:
+        """
+        Elimina recursivamente la carpeta local temporal de un cliente/archivo
+        (_get_local_root), liberando espacio en /tmp tras subir los outputs a
+        S3.
+
+        Args:
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+
+        Returns:
+            None.
+
+        Ejemplo:
+            fs.cleanup_tmp_outputs("SBSA", "DD9D...")
+        """
         local_root = self._get_local_root(client_id=client_id, file_id=file_id)
         if local_root.exists():
             shutil.rmtree(local_root)
@@ -633,6 +951,23 @@ class FileStorage:
         subdir: str = "",
         in_memory: bool = True,
     ) -> BinaryIO:
+        """
+        Descarga un objeto de S3 completo a un buffer en memoria.
+
+        Args:
+            layer: Capa lógica de origen (típicamente LANDING).
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio (no aplica a LANDING).
+            in_memory: No usado actualmente (reservado; siempre devuelve
+                BytesIO en memoria).
+
+        Returns:
+            Buffer BytesIO con el contenido del objeto.
+
+        Ejemplo:
+            fs.read_binary(fs.Layer.LANDING, "SBSA", "DD9D...")
+        """
         bucket = self._get_bucket(layer)
         key = self._get_s3_key(layer, client_id, file_id, subdir)
  
@@ -650,6 +985,22 @@ class FileStorage:
     def read_parquet(
         self, layer: _Layer, client_id: str, file_id: str, subdir: str = ""
     ) -> pd.DataFrame:
+        """
+        Descarga y lee un Parquet de S3 dado cliente/capa/subdirectorio (key
+        resuelto internamente vía _get_s3_key + ".parquet").
+
+        Args:
+            layer: Capa lógica de origen.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio.
+
+        Returns:
+            DataFrame con el contenido del Parquet.
+
+        Ejemplo:
+            fs.read_parquet(fs.Layer.STAGING, "SBSA", "DD9D...", "100_IPM_1240_RAW")
+        """
         bucket = self._get_bucket(layer)
         key = self._get_s3_key(layer, client_id, file_id, subdir) + ".parquet"
         log.logger.info(f"Leyendo parquet desde S3: s3://{bucket}/{key}")
@@ -665,6 +1016,26 @@ class FileStorage:
         subdir: str = "",
         index: bool = False,
     ) -> str:
+        """
+        Serializa un DataFrame como Parquet en memoria y lo sube directamente a
+        S3 (sin pasar por /tmp) — usado para outputs pequeños; el hot path del
+        interpreter (bloques grandes) usa en cambio
+        write_parquet_by_mti_block_streaming, que sí escribe primero a /tmp.
+
+        Args:
+            data: DataFrame a escribir.
+            layer: Capa lógica de destino.
+            client_id: Código de cliente.
+            file_id: Identificador del archivo.
+            subdir: Subdirectorio.
+            index: Si incluir el índice de pandas en el Parquet (default: False).
+
+        Returns:
+            URI S3 completo del archivo escrito.
+
+        Ejemplo:
+            fs.write_parquet(df, fs.Layer.STAGING, "SBSA", "DD9D...", "some_subdir")
+        """
         bucket = self._get_bucket(layer)
         key = self._get_s3_key(layer, client_id, file_id, subdir) + ".parquet"
         buffer = io.BytesIO()
@@ -818,6 +1189,14 @@ class Parameters:
     """Class for storing parameters for Mastercard files."""
  
     def __init__(self, *args):
+        """
+        No-op — delega en la superclase; Parameters no tiene estado propio, solo
+        expone getdataelements()/getIPMParameters() como tablas de configuración
+        estática.
+
+        Returns:
+            None.
+        """
         super(Parameters, self).__init__(*args)
  
     def getdataelements(self) -> dict:
@@ -959,6 +1338,25 @@ class Parameters:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def obtain_encoding(db: Database, client_id: str, file_id: str) -> str | None:
+    """
+    Resuelve el encoding IPM (latin-1/cp500) de un archivo a partir de su
+    file_type (file_control) y la configuración de encoding del cliente
+    (client.file_mc_encoding_in/_out). No usada en el flujo Lambda actual
+    (que resuelve el encoding directamente vía otros medios) — conserva la
+    firma original basada en read_sql, útil para debugging/scripts locales.
+
+    Args:
+        db: Instancia de Database.
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+
+    Returns:
+        "Latin-1" o "cp500" según la configuración del cliente, o None si el
+        file_type no es IN/OUT o el valor configurado no es reconocido.
+
+    Ejemplo:
+        obtain_encoding(db, "SBSA", "DD9D...")
+    """
     df_file_control = db.read_sql(
         """
         SELECT file_type
@@ -1009,6 +1407,27 @@ DE_COL: Dict[int, str] = {de: f"de_{de}" for de in range(2, 129)}
 def parse_des_one_pass(
     body: bytes, fields: list[int], enc: str, de_spec: dict, *, max_de: int = 128
 ) -> Dict[int, bytes]:
+    """
+    Parsea, en una sola pasada, los DEs indicados de un body ISO-8583 según
+    de_spec (campos fijos o variable-length con prefijo de longitud),
+    deteniéndose en el primer DE que falle o exceda max_de.
+
+    Args:
+        body: Bytes del body del mensaje (después del bitmap).
+        fields: Lista de números de DE presentes (del bitmap), en orden.
+        enc: Encoding del mensaje ("cp500" o similar) usado para decodificar
+            longitudes variable-length.
+        de_spec: Especificación de campos (Parameters().getdataelements()).
+        max_de: DE máximo a parsear (default: 128) — permite parseos
+            parciales (ej. solo hasta DE 24).
+
+    Returns:
+        Dict {número de DE: bytes crudos}, solo con los DEs efectivamente
+        parseados antes de detenerse.
+
+    Ejemplo:
+        parse_des_one_pass(body, fields, "cp500", de_spec, max_de=24)
+    """
     if not body or not fields:
         return {}
  
@@ -1072,6 +1491,25 @@ def format_de_value(
     binary_des: AbstractSet[int]  = DEFAULT_BINARY_DES,
     ebcdic_text_des: AbstractSet[int] = DEFAULT_EBCDIC_TEXT_DES,
 ) -> Optional[str]:
+    """
+    Formatea el valor crudo (bytes) de un DE a string, según su categoría:
+    binario (hex), numérico (dígitos decodificados) o texto (decode_text_best).
+
+    Args:
+        de: Número de DE.
+        raw: Bytes crudos del DE, o None.
+        enc: Encoding del mensaje.
+        numeric_des: Set de DEs numéricos (default: DEFAULT_NUMERIC_DES).
+        binary_des: Set de DEs binarios (default: DEFAULT_BINARY_DES).
+        ebcdic_text_des: Set de DEs de texto EBCDIC (default:
+            DEFAULT_EBCDIC_TEXT_DES).
+
+    Returns:
+        Valor formateado como string, o None si raw es None.
+
+    Ejemplo:
+        format_de_value(4, raw_bytes, "cp500")
+    """
     if raw is None:
         return None
     if de in binary_des:
@@ -1196,6 +1634,26 @@ def extract_de24_fast(
     de_spec: dict,
     fields: Optional[list[int]],
 ) -> str | None:
+    """
+    Extrae únicamente el DE24 (function_code) de un mensaje, sin parsear el
+    resto de los DEs — usado para clasificación rápida de mensajes (ej.
+    detectar el trailer 1644/695) sin el costo de parsear todo el body.
+
+    Args:
+        body_hex: Body del mensaje, en bytes o hex string.
+        bitmap_hex: Bitmap del mensaje, en bytes o hex string.
+        enc: Encoding del mensaje.
+        de_spec: Especificación de campos.
+        fields: Lista de DEs presentes (bitmap ya decodificado), o None
+            para derivarlo del bitmap.
+
+    Returns:
+        Valor de DE24 como string, o None si falta algún dato de entrada o
+        el DE24 no está presente/parseable.
+
+    Ejemplo:
+        extract_de24_fast(body_hex, bitmap_hex, "cp500", de_spec, None)
+    """
     if (body_hex is None) or (bitmap_hex is None) or (not enc):
         return None
  
@@ -1214,6 +1672,22 @@ def extract_de24_fast(
  
  
 def extract_pds_value_48_105(pds_blob: str | None, target_tag: str = "0105") -> str | None:
+    """
+    Extrae el valor de un tag PDS del blob DE48 (formato TLV: 4 chars tag +
+    3 chars longitud + valor). Usado típicamente para extraer el tag "0105"
+    (file_idn) del mensaje 695.
+
+    Args:
+        pds_blob: String decodificado del DE48, o None/NaN.
+        target_tag: Tag PDS a buscar (default: "0105").
+
+    Returns:
+        Valor del tag encontrado, o None si pds_blob es None/NaN, el tag no
+        está presente, o el blob está corrupto.
+
+    Ejemplo:
+        extract_pds_value_48_105(pds_blob, "0105")  # file_idn
+    """
     if pds_blob is None or pd.isna(pds_blob):
         return None
  
@@ -1312,10 +1786,30 @@ def apply_block_file_context_697(
 
 
 def decode_numeric(text_bytes: bytes, enc: str) -> str:
+    """
+    Decodifica y recorta un campo numérico (wrapper de decode_digits).
+
+    Args:
+        text_bytes: Bytes crudos del campo.
+        enc: Encoding del mensaje.
+
+    Returns:
+        String de dígitos decodificado y recortado.
+    """
     return decode_digits(text_bytes, enc).strip()
  
  
 def decode_text_ebcdic(raw: bytes) -> str:
+    """
+    Decodifica bytes EBCDIC (cp500) a texto, con fallback a latin1 si falla
+    la decodificación cp500.
+
+    Args:
+        raw: Bytes a decodificar.
+
+    Returns:
+        String decodificado y recortado.
+    """
     try:
         return raw.decode("cp500").strip()
     except Exception:
@@ -1323,6 +1817,18 @@ def decode_text_ebcdic(raw: bytes) -> str:
 
 
 def decode_text(raw: bytes, enc: str) -> str:
+    """
+    Decodifica un campo de texto según el encoding del mensaje: cp500 (con
+    fallback latin1) si enc="EBCDIC_DIGITS", sino ascii (con fallback
+    latin1).
+
+    Args:
+        raw: Bytes a decodificar.
+        enc: Encoding del mensaje.
+
+    Returns:
+        String decodificado y recortado; "" si raw está vacío.
+    """
     if not raw:
         return ""
     if enc == "EBCDIC_DIGITS":
@@ -1410,6 +1916,29 @@ def unblock_1014(
     sep_size: int = 2,
     valid_seps: tuple[bytes, ...] = (b"", b"\x20\x20", b"\x40\x40", b"\x00\x00"),
 ) -> bytes:
+    """
+    Desbloquea un stream en formato 1014 bytes/bloque
+    ([1012 bytes payload][2 bytes separador]…), con pushback: si el
+    separador leído no está entre los válidos, los 2 bytes se devuelven al
+    stream (seek atrás) y se tratan como parte del payload del siguiente
+    bloque, evitando que el stream quede desalineado en archivos con
+    separadores no estándar. Réplica de la lógica que el router aplica
+    también para extraer la fecha de archivos MC bloqueados (_mc_unblock_full).
+
+    Args:
+        stream_file: Stream binario posicionable (se hace seek(0) al
+            inicio).
+        payload_size: Tamaño del payload por bloque (default: 1012).
+        sep_size: Tamaño del separador por bloque (default: 2).
+        valid_seps: Separadores considerados válidos (EBCDIC space, ASCII
+            space, null, vacío).
+
+    Returns:
+        Bytes desbloqueados (payloads concatenados, sin separadores).
+
+    Ejemplo:
+        unblock_1014(stream_file)
+    """
     stream_file.seek(0)
     out_bytes = bytearray()
  
@@ -1495,6 +2024,19 @@ def read_len_prefixed_messages(
  
  
 def _bitmap_to_fields_1_128(bitmap_16: bytes) -> List[int]:
+    """
+    Decodifica un bitmap primario+secundario (16 bytes) a la lista de
+    números de DE presentes (1-128), bit más significativo primero.
+
+    Args:
+        bitmap_16: Bytes del bitmap (16 bytes, primario+secundario).
+
+    Returns:
+        Lista de números de DE presentes (1-indexados), en orden ascendente.
+
+    Ejemplo:
+        _bitmap_to_fields_1_128(bitmap_bytes)  # [2, 3, 4, ...]
+    """
     fields = []
     de_no  = 1
     for byte in bitmap_16:
@@ -1694,6 +2236,23 @@ def read_len_prefixed_messages_variable(
 # ══════════════════════════════════════════════════════════════════════════════
  
 def _canonical_schema_from_de_spec(de_spec: dict) -> pa.Schema:
+    """
+    Construye el schema Arrow canónico de salida (columnas de metadata +
+    una columna string por cada DE en de_spec), usado por
+    write_parquet_by_mti_block_streaming/2 para garantizar el mismo schema
+    físico entre todos los bloques/archivos escritos.
+
+    Args:
+        de_spec: Especificación de campos (Parameters().getdataelements()).
+
+    Returns:
+        pa.Schema con las columnas de metadata (file_idn, file_dt, file_id,
+        content_hash, msg_no, block, mti, enc, function_code,
+        function_role, parse_ok) más una columna de_{n} por cada DE.
+
+    Ejemplo:
+        _canonical_schema_from_de_spec(de_spec)
+    """
     fields = [
         pa.field("file_idn",      pa.string()),
         pa.field("file_dt",       pa.string()),
@@ -1735,6 +2294,19 @@ def _ensure_and_cast(table: pa.Table, schema: pa.Schema) -> pa.Table:
  
  
 def subdir_for_mti(mti: str) -> str:
+    """
+    Mapea un MTI al subdirectorio de salida RAW correspondiente.
+
+    Args:
+        mti: MTI como string, ej. "1240".
+
+    Returns:
+        Subdirectorio, ej. "100_IPM_1240_RAW"; "100_IPM_UNK_RAW" si el MTI
+        no es uno de los 4 soportados.
+
+    Ejemplo:
+        subdir_for_mti("1240")  # "100_IPM_1240_RAW"
+    """
     mti = str(mti)
     if mti == "1240":
         return "100_IPM_1240_RAW"
@@ -1748,6 +2320,24 @@ def subdir_for_mti(mti: str) -> str:
  
  
 def _base_dir_for_subdir(fs: FileStorage, layer, client_id: str, file_id: str, subdir: str) -> Path:
+    """
+    Resuelve el directorio local (carpeta padre) donde se escriben los
+    Parquets temporales de un subdirectorio, derivándolo de
+    FileStorage._get_file_path.
+
+    Args:
+        fs: Instancia de FileStorage.
+        layer: Capa lógica.
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+        subdir: Subdirectorio, ej. "100_IPM_1240_RAW".
+
+    Returns:
+        Path local de la carpeta.
+
+    Ejemplo:
+        _base_dir_for_subdir(fs, layer.STAGING, "SBSA", "DD9D...", "100_IPM_1240_RAW")
+    """
     base = Path(fs._get_file_path(layer, client_id, file_id, subdir=subdir))
     return base.parent
  
@@ -1762,6 +2352,33 @@ def write_parquet_by_mti_block_streaming(
     schema: pa.Schema,
     writers: dict,
 ) -> None:
+    """
+    Escribe un chunk de filas (agrupadas por file_idn+mti) a sus respectivos
+    ParquetWriters locales en /tmp, creando el writer la primera vez que se
+    ve esa combinación (file_id, file_idn, mti). Usado en el flujo principal
+    de mensajes len-prefixed variables (donde cada mensaje ya trae su propio
+    file_idn resuelto).
+
+    Args:
+        df_chunk: DataFrame del sub-chunk actual (filas con columna
+            file_idn no nula).
+        fs: Instancia de FileStorage.
+        target_layer: Capa lógica de destino (típicamente STAGING).
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+        schema: Schema Arrow canónico (de _canonical_schema_from_de_spec).
+        writers: Dict compartido {(file_id, file_idn, mti): ParquetWriter},
+            modificado in-place — persiste entre llamadas para reutilizar
+            los writers ya abiertos.
+
+    Returns:
+        None. Filas con file_idn nulo se descartan silenciosamente.
+
+    Ejemplo:
+        write_parquet_by_mti_block_streaming(chunk, fs=fs, target_layer=layer.STAGING,
+                                              client_id="SBSA", file_id="DD9D...",
+                                              schema=schema, writers=writers)
+    """
     df_chunk = df_chunk[df_chunk["file_idn"].notna()]
     if df_chunk.empty:
         return
@@ -1793,6 +2410,20 @@ def write_parquet_by_mti_block_streaming(
 
 
 def finalize_writers(writers: Dict[Tuple[str, int, str], pq.ParquetWriter]) -> None:
+    """
+    Cierra todos los ParquetWriters abiertos y vacía el dict, finalizando
+    la escritura de todos los archivos temporales en /tmp.
+
+    Args:
+        writers: Dict {llave: ParquetWriter} a cerrar (modificado in-place,
+            queda vacío al terminar).
+
+    Returns:
+        None.
+
+    Ejemplo:
+        finalize_writers(writers)
+    """
     for w in writers.values():
         w.close()
     writers.clear()
@@ -1808,6 +2439,31 @@ def write_parquet_by_mti_block_streaming2(
     schema: pa.Schema,
     writers: dict,
 ) -> None:
+    """
+    Variante de write_parquet_by_mti_block_streaming que agrupa por
+    (block, mti) en vez de (file_idn, mti) — usado en el flujo de bloques
+    delimitados por headers/trailers 1644 (donde el file_idn aún no se
+    conoce por fila, solo el número de bloque).
+
+    Args:
+        df_chunk: DataFrame del sub-chunk actual (filas con columna block
+            no nula).
+        fs: Instancia de FileStorage.
+        target_layer: Capa lógica de destino.
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+        schema: Schema Arrow canónico.
+        writers: Dict compartido {(file_id, block, mti): ParquetWriter},
+            modificado in-place.
+
+    Returns:
+        None. Filas con block nulo se descartan silenciosamente.
+
+    Ejemplo:
+        write_parquet_by_mti_block_streaming2(chunk, fs=fs, target_layer=layer.STAGING,
+                                               client_id="SBSA", file_id="DD9D...",
+                                               schema=schema, writers=writers)
+    """
     df_chunk = df_chunk[df_chunk["block"].notna()]
     if df_chunk.empty:
         return
@@ -1839,6 +2495,21 @@ def write_parquet_by_mti_block_streaming2(
  
  
 def extract_fc_from_filepath(filepath: str | Path) -> str:
+    """
+    Extrae el Function Code del nombre de archivo de salida (sufijo tras el
+    último guión bajo), usado para identificar a qué FC de 1644 corresponde
+    un Parquet ya escrito.
+
+    Args:
+        filepath: Path o nombre de archivo, ej.
+            ".../HASH_FILEIDN25CHARS_685.parquet".
+
+    Returns:
+        Function Code extraído, ej. "685".
+
+    Ejemplo:
+        extract_fc_from_filepath("x_685.parquet")  # "685"
+    """
     name = Path(filepath).name
     return name.rsplit("_", 1)[-1].replace(".parquet", "")
 
@@ -1861,6 +2532,24 @@ def _load_as_binary(
     file_id: str,
     subdir: str = "",
 ) -> BinaryIO:
+    """
+    Descarga el archivo original de landing como buffer binario en memoria
+    — wrapper delgado de fs.read_binary fijando layer=LANDING e
+    in_memory=True.
+
+    Args:
+        layer: Parámetro posicional heredado de la firma original (no se
+            usa — siempre se lee de LANDING).
+        client_id: Código de cliente.
+        file_id: Identificador del archivo.
+        subdir: Subdirectorio (no aplica a LANDING).
+
+    Returns:
+        Buffer BytesIO con el contenido del archivo.
+
+    Ejemplo:
+        _load_as_binary(fs.Layer.LANDING, "SBSA", "DD9D...")
+    """
     return fs.read_binary(fs.Layer.LANDING, client_id, file_id, subdir, True)
  
  

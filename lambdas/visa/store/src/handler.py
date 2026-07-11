@@ -1,11 +1,22 @@
 """
-Lambda Store - itx-store
-========================
-Último paso del pipeline antes del archive.
-Lee los 3 Parquets de staging (CLN + CAL + ITX) y los consolida
-en un único Parquet final en el bucket operational.
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-vi-store
+================================================================================
+Archivo:     lambdas/visa/store/src/handler.py
 
-Mapeo de subdirectorios (equivalente al store.py local):
+Última etapa del pipeline Visa antes del archive. Une los tres Parquets
+clave de staging (CLN, CAL, ITX) en un solo Parquet consolidado por
+output_type y lo escribe al bucket operational — sin este paso no existe
+el archivo que Athena consultará vía crawler. El join es por índice
+`record` (no por llave de negocio como en Mastercard, ver
+`decisions.md` → "Por qué mc-store fusiona CLN + CAL + ITX por llave"): CAL
+e ITX se cargan completos en memoria (pocas columnas, ~50), mientras que
+CLN se procesa en streaming por chunks (muchas columnas, ~250) para
+acotar el pico de memoria. Restaura los tipos Arrow originales del CAL
+(`_cal_dtype_map`) tras el round-trip por pandas, que degrada enteros con
+nulls a `float64` y columnas 100% null a `NullType` — ver `decisions.md`
+→ "Por qué lmbd-vi-store lee el CAL con _read_parquet_arrow".
+
+Mapeo de subdirectorios por output_type:
   BASEII:
     300_baseii_cln_drafts  → transactions (clean)
     400_baseii_cal_drafts  → calculated   (Glue calculate)
@@ -24,9 +35,10 @@ Mapeo de subdirectorios (equivalente al store.py local):
     → operational: baseii_vss_{type}
 
 Variables de entorno:
-  S3_BUCKET_STAGING     : bucket de staging (origen)
-  S3_BUCKET_OPERATIONAL : bucket operational (destino)
+  S3_BUCKET_STAGING           : bucket de staging (origen de CLN/CAL/ITX)
+  S3_BUCKET_OPERATIONAL       : bucket operational (destino del Parquet final)
   DYNAMODB_TABLE_FILE_CONTROL : tabla de control de archivos
+  STORE_CHUNK_SIZE            : filas por chunk al procesar CLN (default: 80000)
 """
 
 import os
@@ -109,8 +121,27 @@ OUTPUT_TYPE_CONFIG = {
 
 def _read_parquet_from_s3(bucket: str, s3_key: str) -> pd.DataFrame:
     """
-    Lee un Parquet de S3.
-    Soporta archivo único (Lambda output) y directorio PySpark (Glue output).
+    Lee un Parquet de S3 como DataFrame de pandas, soportando tanto un
+    archivo único (típico de un output de Lambda, ej. ITX) como un
+    directorio con part-files de Spark (típico de un output de Glue). Para
+    el caso directorio, concatena todos los part-files ordenados por
+    nombre.
+
+    Args:
+        bucket: Bucket S3 donde está el Parquet.
+        s3_key: Key del archivo único, o prefix del directorio con
+            part-files.
+
+    Returns:
+        DataFrame con el contenido completo (archivo único o concatenación
+        de todos los part-files).
+
+    Raises:
+        FileNotFoundError: si `s3_key` no es un archivo único y el
+            directorio no tiene part-files.
+
+    Ejemplo:
+        _read_parquet_from_s3(bucket, "SBSA/VISA/500_baseii_itx_drafts/.../")
     """
     logger.info(f"Reading s3://{bucket}/{s3_key}")
 
@@ -154,7 +185,22 @@ def _read_parquet_from_s3(bucket: str, s3_key: str) -> pd.DataFrame:
 
 
 def _write_parquet_to_s3(df: pd.DataFrame, bucket: str, s3_key: str) -> int:
-    """Escribe un DataFrame como Parquet en S3. Retorna el número de records."""
+    """
+    Escribe un DataFrame completo como un único Parquet en S3, vía un
+    buffer en memoria (sin pasar por disco).
+
+    Args:
+        df: DataFrame a escribir.
+        bucket: Bucket S3 destino.
+        s3_key: Key del archivo Parquet a escribir.
+
+    Returns:
+        Cantidad de records escritos (`len(df)`). Relanza cualquier
+        excepción tras loguearla.
+
+    Ejemplo:
+        _write_parquet_to_s3(df, bucket, "SBSA/VISA/baseii_drafts/.../x.parquet")
+    """
     logger.info(f"Writing {len(df):,} records to s3://{bucket}/{s3_key}")
     try:
         table  = pa.Table.from_pandas(df)
@@ -169,6 +215,26 @@ def _write_parquet_to_s3(df: pd.DataFrame, bucket: str, s3_key: str) -> int:
         raise
 
 def _read_parquet_arrow(bucket: str, key: str) -> pa.Table:
+    """
+    Igual que `_read_parquet_from_s3()` (soporta archivo único o
+    directorio con part-files), pero devuelve una `pa.Table` de PyArrow en
+    vez de convertir a pandas. Se usa para el CAL específicamente, porque
+    preserva el schema Arrow original (necesario para `_cal_dtype_map` en
+    `store_output`, que restaura tipos degradados por el round-trip a
+    pandas más adelante).
+
+    Args:
+        bucket: Bucket S3 donde está el Parquet.
+        key: Key del archivo único, o prefix del directorio con
+            part-files.
+
+    Returns:
+        `pa.Table` con el contenido completo (archivo único o
+        concatenación de todos los part-files).
+
+    Ejemplo:
+        _read_parquet_arrow(bucket, "SBSA/VISA/400_baseii_cal_drafts/.../")
+    """
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         return pq.read_table(BytesIO(response['Body'].read()))
@@ -198,17 +264,32 @@ def _build_s3_key(
     bucket_type: str = "operational"
 ) -> str:
     """
-    Construye el S3 key de destino reemplazando el subdir.
+    Construye el S3 key de destino reemplazando el subdir de CLN por otro
+    subdir (CAL, ITX, o el subdir final de operational) — el resto del
+    path (cliente/marca/file_type/date/hash) es idéntico entre las 3
+    etapas de staging y el archivo final.
 
-    Para staging (cal e itx): reemplaza 300_xxx → 400_xxx o 500_xxx
-    Para operational (target): reemplaza 300_xxx → baseii_drafts/etc
-    y cambia el path prefix para apuntar a operational.
+    Nota: pese al parámetro `bucket_type`, la función no cambia el bucket
+    ni el prefix — solo hace el `.replace()` de subdirectorio. El caller
+    (`store_output`) es responsable de escribir en el bucket correcto
+    (`OPERATIONAL_BUCKET` vs `STAGING_BUCKET`).
+
+    Args:
+        clean_s3_key: S3 key del Parquet CLN (staging), fuente de verdad
+            del resto del path.
+        cln_subdir: Subdir de CLN a reemplazar, ej. "300_baseii_cln_drafts".
+        target_subdir: Subdir de destino, ej. "400_baseii_cal_drafts" o
+            "baseii_drafts" (operational).
+        bucket_type: No usado actualmente en la lógica — ver nota arriba.
+
+    Returns:
+        El `clean_s3_key` con el subdir reemplazado.
 
     Ejemplo:
-      clean_s3_key = "SBSA/VISA/300_baseii_cln_drafts/file_type=OUT/date=2026-04-04/HASH.parquet"
-      cln_subdir   = "300_baseii_cln_drafts"
-      target_subdir = "baseii_drafts"
-      → "SBSA/VISA/baseii_drafts/file_type=OUT/date=2026-04-04/HASH.parquet"
+        _build_s3_key(
+            "SBSA/VISA/300_baseii_cln_drafts/file_type=OUT/date=2026-04-04/HASH.parquet",
+            "300_baseii_cln_drafts", "baseii_drafts"
+        )  # "SBSA/VISA/baseii_drafts/file_type=OUT/date=2026-04-04/HASH.parquet"
     """
     return clean_s3_key.replace(cln_subdir, target_subdir)
 
@@ -225,13 +306,48 @@ def store_output(
     content_hash: str,
 ) -> Optional[Dict]:
     """
-    Realiza el merge de los 3 Parquets (CLN + CAL + ITX) para un output_type
-    y guarda el resultado en operational.
+    Realiza el merge de los 3 Parquets (CLN + CAL + ITX) para un
+    output_type y guarda el resultado consolidado en operational.
 
     Estrategia de memoria:
-      - CAL e ITX se cargan completos en RAM (pocas columnas ~50)
-      - CLN se procesa en chunks (muchas columnas ~250)
-      - Join por índice 'record' — resultado idéntico al join completo
+      - CAL e ITX se cargan completos en RAM (pocas columnas, ~50)
+      - CLN se procesa en chunks de STORE_CHUNK_SIZE filas (muchas
+        columnas, ~250) — nunca se carga completo
+      - Join por índice 'record' (left join CLN+CAL, luego +ITX si aplica)
+        — el resultado es idéntico al de un join completo porque cada
+        chunk de CLN solo necesita las filas de CAL/ITX cuyo índice
+        interseca ese chunk
+
+    Tras el merge, restaura en `merged_table` los tipos Arrow originales
+    del CAL (`_cal_dtype_map`, capturado antes del round-trip a pandas) —
+    ver comentario inline antes del loop de restauración para el detalle
+    de qué degrada el round-trip y por qué. A partir del segundo batch,
+    fuerza el schema del primer batch (`merged_table.cast(schema)`) para
+    evitar `Table schema does not match` entre chunks del mismo Parquet.
+
+    Args:
+        output: Dict de un output de clean, con `output_type` y `s3_key`
+            (key del Parquet CLN).
+        client_id: Código del cliente (no usado para lógica, solo
+            trazabilidad).
+        brand: Marca del archivo ("VISA"), no usado para lógica, solo
+            trazabilidad.
+        file_type: "IN" u "OUT", no usado para lógica, solo trazabilidad.
+        file_date: Fecha del archivo (no usado para lógica, solo
+            trazabilidad).
+        content_hash: MD5 del archivo origen (no usado para lógica en esta
+            función — ya viene propagado como columna desde CLN).
+
+    Returns:
+        Dict con el resultado del store (`output_type`, `cln_s3_key`,
+        `cal_s3_key`, `itx_s3_key`, `target_s3_key`, `records`, `columns`,
+        `batches`), o `None` si el `output_type` no está en
+        `OUTPUT_TYPE_CONFIG` o no se escribió ningún registro. Relanza
+        cualquier excepción tras loguearla.
+
+    Ejemplo:
+        store_output({'output_type': 'BASEII', 's3_key': '.../300_baseii_cln_drafts/.../x.parquet'},
+                      'SBSA', 'VISA', 'OUT', '2026-04-04', '279AE7CB...')
     """
     import time
 
@@ -414,37 +530,52 @@ def store_output(
 
 def lambda_handler(event, context):
     """
-    Entry point del Lambda store.
+    Punto de entrada de la Lambda `lmbd-vi-store`. Invocada por la Step
+    Function Visa tras `lmbd-vi-clean` (o manualmente para reprocesos, ver
+    `.claude/memory/manual_execution.md`). Recorre todos los outputs de
+    clean recibidos en el evento, hace el store de cada uno con
+    `store_output()` de forma independiente (un fallo en un output no
+    aborta los demás) y agrega el resultado en un único payload de salida
+    — última etapa antes de `lmbd-archive-file`.
 
-    Input (desde Step Functions — viene del clean_result.outputs):
-    {
-        "client_id":    "SBSA",
-        "file_id":      "ABC123",
-        "brand":        "VISA",
-        "file_type":    "OUT",
-        "file_date":    "2026-04-04",
-        "content_hash": "279AE7CB...",
-        "outputs": [
+    Args:
+        event: Payload de Step Functions con `client_id`, `file_id`,
+            `brand`, `file_type`, `file_date`, `content_hash` y `outputs`
+            (lista de outputs de clean a consolidar), ej.:
+            ```
             {
-                "output_type":   "BASEII",
-                "output_subdir": "300_baseii_cln_drafts",
-                "s3_key":        "SBSA/VISA/300_baseii_cln_drafts/file_type=OUT/date=.../HASH.parquet",
-                "records":       2369332,
-                ...
-            },
-            ...
-        ]
-    }
+                "client_id":    "SBSA",
+                "file_id":      "ABC123",
+                "brand":        "VISA",
+                "file_type":    "OUT",
+                "file_date":    "2026-04-04",
+                "content_hash": "279AE7CB...",
+                "outputs": [
+                    {
+                        "output_type":   "BASEII",
+                        "output_subdir": "300_baseii_cln_drafts",
+                        "s3_key":        "SBSA/VISA/300_baseii_cln_drafts/file_type=OUT/date=.../HASH.parquet",
+                        "records":       2369332,
+                        ...
+                    },
+                    ...
+                ]
+            }
+            ```
+        context: Contexto de ejecución de Lambda (no usado).
 
-    Output:
-    {
-        "status":        "SUCCESS",
-        "total_outputs": 1,
-        "total_records": 2369332,
-        "outputs": [...],
-        "client_id":     "SBSA",
-        ...
-    }
+    Returns:
+        Dict con `status` ("SUCCESS", "PARTIAL_SUCCESS" o "ERROR"),
+        `total_outputs`, `total_records`, la lista `outputs` con el
+        resultado de cada store exitoso, y `errors` con el detalle de los
+        outputs que fallaron. Lanza `ValueError` si falta
+        `S3_BUCKET_STAGING` o `S3_BUCKET_OPERATIONAL`.
+
+    Ejemplo:
+        lambda_handler({'client_id': 'SBSA', 'file_id': 'ABC123', 'brand': 'VISA',
+                         'file_type': 'OUT', 'file_date': '2026-04-04',
+                         'content_hash': '279AE7CB...', 'outputs': [...]}, None)
+        # {'status': 'SUCCESS', 'total_outputs': 1, 'total_records': 2369332, ...}
     """
     logger.info("=" * 70)
     logger.info("ITX STORE LAMBDA - START")
