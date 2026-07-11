@@ -1,35 +1,31 @@
 """
-glue-vi-mc-scheme-fee (job real: itl-0004-itx-dev-intchg-02-glue-scheme-fee,
-todavia no creado en AWS -- ver pending.md "Scheme Fee")
-=========================================================================
-Replica del modulo legacy "Scheme Fee" (Module.SchemeFee.managment.scheme_fee,
-ejecutado antes en un EC2 via exec_scheme_fee.py) sobre el nuevo pipeline
-Data Lake. Genera y actualiza el reporte mensual de cuotas (scheme fees) que
-se intercambia como CSV con el equipo externo que calcula el costo real.
+scheme_fee.py — Job real: itl-0004-itx-dev-intchg-02-glue-scheme-fee
+================================================================================
+Archivo:     glue/scripts/reports/scheme_fee/scheme_fee.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/scheme_fee.py
 
-Referencia legacy (no forma parte de este repo, sólo contexto): 3 scripts
-subidos por el usuario a tst_files/scheme_Fee_legacy_scripts/ (exec_scheme_fee.py,
-managment.py, getquery.py). Ese proceso corría contra PostgreSQL (tablas
-operational.mh_transaction_scheme_fee / mh_monthly_scheme_fee /
-mh_monthly_scheme_fee_legacy / mh_scheme_fee_sumary) usando un EC2. Este script
-reimplementa la MISMA lógica de negocio en PySpark sobre S3, sin base de datos:
-el "estado" que el legacy guardaba en tablas Postgres aquí se guarda como
-Parquet en el bucket analytics.
+Genera y actualiza el reporte mensual de cuotas (scheme fees) que se
+intercambia como CSV con el equipo externo que calcula el costo real de cada
+grupo de transacciones. Corre como Glue job PySpark sobre los Parquets de
+s3-operational, sin base de datos intermedia — todo el estado del proceso
+(detalle transaccional, reporte agregado, resumen de ejecución) se persiste
+como Parquet/JSON en el bucket analytics.
 
-Proceso en 2 pasos (igual que legacy, ahora como --mode del job):
+Proceso en 2 pasos, controlados por el parámetro --mode del job:
 
   --mode generate
-    1. Lee Visa BASEII y Mastercard IPM_1240/1442 operational del mes pedido.
-       (Visa SMS queda deshabilitado por defecto - ver ENABLE_SMS más abajo,
-       mismo estado "pendiente validación" que en glue-vi-mc-reporting.)
+    1. Lee Visa BASEII, Visa SMS y Mastercard IPM_1240/1442 operational del
+       mes pedido (Visa SMS validado end-to-end 2026-07-07, ENABLE_SMS=True
+       más abajo -- a diferencia de get_transaction.py, donde SMS sigue
+       comentado por ahora, ver pending.md).
     2. Arma el detalle transaccional (~20 dimensiones de negocio + monto en
        report_currency), aplica duplicado on-us cuando el cliente lo requiere
        (duplicate_on_us_flag_visa / _mastercard en DynamoDB client-02).
     3. Agrupa el detalle en filas de "reporte" (una fila por combinación única
-       de las 20 dimensiones — el mismo grano que usaba el SP legacy).
-    4. Exporta el reporte en el formato CSV legacy exacto (columnas
-       abreviadas: rpt_bnk_id, set_mth, bus_id, sch_id, tkt_siz_id, prd_id,
-       prg_id, fnd_src_id, txn_scp_id, txn_typ_id, txn_rvsl_flg_id,
+       de las 20 dimensiones de negocio).
+    4. Exporta el reporte a un CSV con columnas abreviadas (formato acordado
+       con el equipo externo: rpt_bnk_id, set_mth, bus_id, sch_id, tkt_siz_id,
+       prd_id, prg_id, fnd_src_id, txn_scp_id, txn_typ_id, txn_rvsl_flg_id,
        txn_crncy_lcl_flg_id, txn_crd_prs_flg_id, mct_cd, txn_cnt, txn_amt,
        txn_sfc, mct_ctry_id, unt_sfc, est_sch_fee_amt, unt_est_sch_fee_amt,
        swt_cd, trvl_prg_ind, grc_mpymt_ind, key_etrd_tpe) a
@@ -41,19 +37,18 @@ Proceso en 2 pasos (igual que legacy, ahora como --mode del job):
     1. Lee el CSV que el equipo externo devolvió (con txn_sfc / est_sch_fee_amt
        ya completados) desde s3://{scheme_fee_bucket}/IN/{client}/{in_file_key}
     2. Valida que la cantidad de filas coincida con el summary generado en el
-       paso anterior (mismo chequeo de seguridad que hacía el legacy).
+       paso anterior (control de integridad antes de aplicar el update).
     3. Calcula unt_sfc = txn_sfc / txn_cnt y unt_est_sch_fee_amt =
-       est_sch_fee_amt / txn_cnt (igual que legacy, no vienen en el CSV).
-    4. Actualiza el reporte (join por app_id, igual que legacy — el equipo
-       externo devuelve el mismo app_id que se le entregó, no se re-matchea
-       por las 20 dimensiones).
+       est_sch_fee_amt / txn_cnt (no vienen calculados en el CSV de vuelta).
+    4. Actualiza el reporte (join por app_id — el equipo externo devuelve el
+       mismo app_id que se le entregó, no se re-matchea por las 20
+       dimensiones).
     5. Propaga txn_sfc/unt_sfc/est_sch_fee_amt/unt_est_sch_fee_amt al detalle
-       transaccional (join por las 20 dimensiones — igual que legacy
-       get_update_detail), dejando el detalle final listo para ser consumido
-       por scheme_fees_amount en glue-vi-mc-reporting (get_transaction.py)
-       usando la columna UNITARIA (unt_sfc), no transaction_scheme_fee_cost
-       (que replica el TOTAL del grupo en cada fila, igual que hacía legacy —
-       ver nota en update_report_and_propagate()).
+       transaccional (join por las 20 dimensiones), dejando el detalle final
+       listo para ser consumido por scheme_fees_amount en
+       glue-vi-mc-reporting (get_transaction.py) usando la columna UNITARIA
+       (unt_sfc), no transaction_scheme_fee_cost (que replica el TOTAL del
+       grupo en cada fila — ver nota en update_report_and_propagate()).
 
 Fuentes de datos
 ----------------
@@ -71,7 +66,7 @@ Salida
   CSV (intercambio con equipo externo):
     s3://{scheme_fee_bucket}/OUT/{client}/{client}_{report_month}_{ts}.csv   (generate)
     s3://{scheme_fee_bucket}/IN/{client}/{in_file_key}                       (leído en read)
-  Estado interno (Parquet, reemplaza las tablas Postgres del legacy):
+  Estado interno (Parquet):
     s3://{analytics_bucket}/{client}/scheme_fee/state/{report_month}/detail/
     s3://{analytics_bucket}/{client}/scheme_fee/state/{report_month}/report/
     s3://{analytics_bucket}/{client}/scheme_fee/state/{report_month}/summary.json
@@ -83,29 +78,28 @@ correr el job; ver detalle de columnas en load_bin_funding_source(),
 load_size_ticket() y load_scheme_fee_bin_products() más abajo):
   1. s3://{reference_bucket}/bin_funding_source/data.parquet
      cols: bin_funding_source_code (string, 'C'/'D'), bin_funding_source_mc_numeric_code (int)
-     Equivalente legacy: operational.m_bin_funding_source
   2. s3://{reference_bucket}/size_ticket/data.parquet
      cols: brand (string, 'VISA'/'MasterCard'), country_code_list (string, alpha-3),
            ticket_currency (string, alpha-3), size_ticket_min (double),
            size_ticket_max (double), app_id (int — id del bucket de ticket size)
-     Equivalente legacy: operational.m_size_ticket
   3. s3://{reference_bucket}/scheme_fee_bin_products/data.parquet
      cols: product_code (string), range_program_id (int), legacy_product_id (int),
            brand (string, 'VISA'/'MC' — OJO, distinto de size_ticket que usa 'MasterCard')
-     Equivalente legacy: operational.m_scheme_fee_bin_products
      IMPORTANTE: NO reusar visa_bin_products/mastercard_bin_products (las que
-     ya usa get_transaction.py) para esto — están desalineadas de
-     m_scheme_fee_bin_products (2 product_code de VISA y 17 de Mastercard con
-     range_program_id distinto, más cobertura de filas distinta). El legacy
-     de scheme fee siempre usó m_scheme_fee_bin_products específicamente.
+     ya usa get_transaction.py) para esto — están desalineadas de esta tabla
+     (2 product_code de VISA y 17 de Mastercard con range_program_id distinto
+     entre ambas fuentes, más cobertura de filas distinta). Este job siempre
+     debe usar scheme_fee_bin_products específicamente, no las otras dos
+     tablas.
 
 Requiere además el argumento de job --dynamodb_table_file_control (tabla
 file_control, usada por switch_code — ver get_local_switch_content_hashes).
 
-SIMPLIFICACIONES CONOCIDAS respecto al legacy (documentadas, no bloqueantes):
-  - Visa SMS: implementado pero deshabilitado por defecto (ENABLE_SMS=False),
-    mismo estado "pendiente validación end-to-end" que transform_visa_sms en
-    glue-vi-mc-reporting.
+SIMPLIFICACIONES CONOCIDAS (documentadas, no bloqueantes):
+  - Visa SMS: ENABLE_SMS=True, validado end-to-end 2026-07-07 (txn_cnt/txn_amt
+    residual +0.03%/+0.07%, explicado 100% por el gap de ARDEF ya conocido en
+    BASEII, ver decisions.md/gotchas.md). switch_code sigue en 0 fijo (ver
+    docstring de _resolve_switch_code).
 
 Parámetros del job
 ------------------
@@ -119,9 +113,8 @@ Parámetros del job
   --dynamodb_table_client Tabla DynamoDB de clientes
   --force                 "true"/"false" — sólo en generate. Si ya existe un
                            summary previo para el mismo client+report_month y
-                           force=false, el job aborta (igual que la
-                           confirmación interactiva del legacy, que en un job
-                           batch no puede pedirse).
+                           force=false, el job aborta (evita sobreescribir un
+                           reporte ya generado sin confirmación explícita).
   --in_file_key           Sólo en read. Nombre del archivo bajo
                            IN/{client_code}/ en scheme_fee_bucket.
 """
@@ -620,17 +613,32 @@ def _join_fx(
     return df
 
 
-def _apply_duplicate_on_us(df: DataFrame) -> DataFrame:
+def _apply_duplicate_on_us(df: DataFrame, dup_table_description: str) -> DataFrame:
     """
     Duplica filas on-us con business_mode_id='ACQUIRING' agregando una copia
     con business_mode_id='ISSUING'. Equivalente al bloque
     duplicate_on_us_flag_{visa,mastercard} del legacy (visa_on_us_query /
     mastercard_on_us_query) — mismo patrón que _apply_duplicate_on_us() en
     get_transaction.py.
+
+    table_description de la copia se fuerza al literal exacto que usa el
+    legacy para cada caso (get_on_us_visa/get_sms_on_us_visa/
+    get_on_us_mastercard en getquery.py — 'VISA ON-US DUP (ACQ TO ISS)',
+    'VISA ON-US DUP (SMS TO ISS)', 'MASTERCARD ON-US DUP (ACQ TO ISS)'),
+    no derivado del table_description original — el legacy tampoco lo
+    deriva, lo hardcodea igual que el business_mode='issuing' de la copia.
+    Esto además permite que el join contra get_transaction.py (por
+    file_id+row_id) desambigüe original vs. duplicado sin depender de
+    traducir business_mode_id — mismo tipo de bug ya visto entre Visa
+    (mayúscula) y Mastercard (minúscula) para ese campo (ver gotchas.md).
     """
-    dup_df = df.filter(
-        (F.col("jurisdiction") == "on-us") & (F.col("business_mode_id") == "ACQUIRING")
-    ).withColumn("business_mode_id", F.lit("ISSUING"))
+    dup_df = (
+        df.filter(
+            (F.col("jurisdiction") == "on-us") & (F.col("business_mode_id") == "ACQUIRING")
+        )
+        .withColumn("business_mode_id", F.lit("ISSUING"))
+        .withColumn("table_description", F.lit(dup_table_description))
+    )
     return df.union(dup_df)
 
 
@@ -767,7 +775,9 @@ def transform_visa_baseii_scheme_fee(
         F.col("customer_code").alias("app_customer_code"),
         F.col("content_hash").alias("app_hash_file"),
         F.col("record").cast(LongType()).alias("app_id"),
-        F.lit("VISA").alias("table_description"),
+        F.when(F.upper(F.col("business_mode")) == "ACQUIRING", F.lit("VISA ACQ"))
+        .otherwise(F.lit("VISA ISS"))
+        .alias("table_description"),
         F.col("date").alias("app_processing_date"),
         F.col("account_number").cast(StringType()).alias("account_number"),
         F.col("card_acceptor_id").cast(StringType()),
@@ -797,7 +807,11 @@ def transform_visa_baseii_scheme_fee(
         F.col("report_amount").cast(DoubleType()),
         F.lit(report_currency).alias("report_currency"),
     )
-    return _apply_duplicate_on_us(df) if client_cfg["dup_on_us_visa"] else df
+    return (
+        _apply_duplicate_on_us(df, "VISA ON-US DUP (ACQ TO ISS)")
+        if client_cfg["dup_on_us_visa"]
+        else df
+    )
 
 
 # =============================================================================
@@ -998,7 +1012,11 @@ def transform_visa_sms_scheme_fee(
         F.col("report_amount").cast(DoubleType()),
         F.lit(report_currency).alias("report_currency"),
     )
-    return _apply_duplicate_on_us(df) if client_cfg["dup_on_us_visa"] else df
+    return (
+        _apply_duplicate_on_us(df, "VISA ON-US DUP (SMS TO ISS)")
+        if client_cfg["dup_on_us_visa"]
+        else df
+    )
 
 
 # =============================================================================
@@ -1166,7 +1184,7 @@ def transform_mastercard_scheme_fee(
         F.col("customer_code").alias("app_customer_code"),
         F.col("content_hash").alias("app_hash_file"),
         F.col("ref_id").cast(LongType()).alias("app_id"),
-        F.lit("MasterCard").alias("table_description"),
+        F.lit("MASTERCARD ISS AND ACQ").alias("table_description"),
         F.col("date").alias("app_processing_date"),
         F.col("pan_de_2").cast(StringType()).substr(1, 16).alias("account_number"),
         F.col("card_acceptor_id_code_de_42").cast(StringType()).alias("card_acceptor_id"),
@@ -1196,7 +1214,11 @@ def transform_mastercard_scheme_fee(
         F.col("report_amount").cast(DoubleType()),
         F.lit(report_currency).alias("report_currency"),
     )
-    return _apply_duplicate_on_us(df) if client_cfg["dup_on_us_mc"] else df
+    return (
+        _apply_duplicate_on_us(df, "MASTERCARD ON-US DUP (ACQ TO ISS)")
+        if client_cfg["dup_on_us_mc"]
+        else df
+    )
 
 
 # =============================================================================

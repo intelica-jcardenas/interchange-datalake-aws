@@ -1,9 +1,13 @@
 """
-glue-vi-mc-reporting
-====================
-Genera el reporte consolidado de transacciones (equivalente al SP
-analytics.generate_transaction_tables) a partir de los Parquets
-finales del bucket operational.
+get_transaction.py — Job real: itl-0004-itx-dev-intchg-02-glue-get-transaction
+================================================================================
+Archivo:     glue/scripts/reports/get_transaction/get_transaction.py
+S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/get_transaction.py
+
+Genera el reporte consolidado de transacciones de un cliente (Visa BASE II,
+Visa SMS y Mastercard MTI 1240/1442) a partir de los Parquets finales del
+bucket operational del Data Lake, en un único schema unificado de 32
+columnas listo para análisis en Athena.
 
 Fuentes de datos
 ----------------
@@ -19,8 +23,8 @@ Salida
   Una sola escritura por ejecución, cubriendo el rango [start_date, end_date].
   report_suffix es un parámetro del job (ej: "202601", "202601_v2").
 
-Schema de salida (32 columnas — idéntico a report_transactions en PostgreSQL)
-----------------------------------------------------------------------
+Schema de salida (32 columnas)
+-------------------------------
   customer_code, file_id, row_id, customer_country_code, business_mode_code,
   brand_code, processing_date, processing_month, transaction_date,
   transaction_month, transaction_group_code, transaction_type_id,
@@ -37,7 +41,8 @@ Parámetros del job
   --end_date              Fin del rango en formato YYYY-MM-DD (inclusive)
   --report_suffix         Identificador para el nombre de salida, ej: "202601"
                            o "202601_v2" — reemplaza al YYYYMM[_suffix] anterior
-  --scheme_fee            "true" / "false"
+  --scheme_fee            "true" / "false" — activa el duplicado on-us y el
+                           join de costo de cuotas contra scheme_fee.py
   --operational_bucket    Nombre del bucket operational (lectura de Parquets)
   --reference_bucket      Nombre del bucket reference (country, exchange-rates)
   --analytics_bucket      Nombre del bucket analytics (escritura del reporte)
@@ -45,8 +50,12 @@ Parámetros del job
 
 Pendientes (TODO)
 -----------------
-  - scheme_fees_amount : join con Parquet de scheme fees cuando el flujo esté
-                         disponible — actualmente retorna 0.0
+  - Visa SMS: implementado y validado individualmente, pero deshabilitado
+    a propósito en process_client_range() mientras los bancos activos
+    (EBGR, SBSA) no manejan ese tipo de transacción.
+  - scheme_fees_amount: validado estructuralmente con datos reales pero
+    solo con costos de prueba — falta validar con el costo real que
+    devuelve el equipo externo de cuotas.
 """
 
 import sys
@@ -88,10 +97,25 @@ logger = glueContext.get_logger()
 
 
 def log_info(message: str):
+    """
+    Escribe un mensaje informativo al log de CloudWatch del job, con el
+    prefijo estándar que usa el logger de Glue.
+
+    Args:
+        message: Texto a loggear. Ejemplo: "[read_operational] Loaded 4200 rows".
+    """
     logger.info(f"GlueLogger: {message}")
 
 
 def log_error(message: str):
+    """
+    Escribe un mensaje de error al log de CloudWatch del job. No detiene
+    la ejecución — se usa junto con try/except para que el fallo de un
+    tramo del reporte (ej. un brand sin datos) no aborte el job completo.
+
+    Args:
+        message: Texto a loggear. Ejemplo: "[BASEII] SBSA/2026-01-01_2026-01-31: ...".
+    """
     logger.error(f"GlueLogger: {message}")
 
 
@@ -132,15 +156,44 @@ DDB_CLIENT_TABLE = args["dynamodb_table_client"]
 
 
 def get_client_config(client_code: str) -> dict:
-    """Lee report_currency_code y flags duplicate_on_us desde DynamoDB."""
+    """
+    Lee la configuración de un cliente desde la tabla DynamoDB client-02:
+    la moneda en la que se debe reportar y si corresponde duplicar sus
+    transacciones "on-us" (mismo banco como emisor y adquirente).
+
+    Los flags llegan de DynamoDB como texto, no como booleano — se parsean
+    explícitamente comparando contra "TRUE" (case-insensitive) en vez de
+    usar bool() directo, porque bool("FALSE") es True en Python y castearía
+    cualquier flag no vacío a True sin importar su contenido real.
+    report_currency_code usa "or" en vez del default de .get() porque ese
+    default no aplica cuando la clave existe pero está vacía.
+
+    Args:
+        client_code: Código de cliente. Ejemplo: "SBSA", "EBGR".
+
+    Returns:
+        dict con:
+          report_currency (str): moneda de reporte, ej. "ZAR". "USD" si el
+            cliente no tiene el campo configurado.
+          dup_on_us_visa (bool): si True, duplicar transacciones on-us Visa.
+          dup_on_us_mc (bool): si True, duplicar transacciones on-us Mastercard.
+
+    Ejemplo:
+        cfg = get_client_config("SBSA")
+        # {"report_currency": "ZAR", "dup_on_us_visa": True, "dup_on_us_mc": True}
+    """
     dynamodb = boto3.resource("dynamodb")
     table = dynamodb.Table(DDB_CLIENT_TABLE)
     resp = table.get_item(Key={"client_id": client_code})
     item = resp.get("Item", {})
+
+    def _flag(value) -> bool:
+        return str(value).strip().upper() == "TRUE"
+
     return {
-        "report_currency": item.get("report_currency_code", "USD"),
-        "dup_on_us_visa": bool(item.get("duplicate_on_us_flag_visa", False)),
-        "dup_on_us_mc": bool(item.get("duplicate_on_us_flag_mastercard", False)),
+        "report_currency": item.get("report_currency_code") or "USD",
+        "dup_on_us_visa": _flag(item.get("duplicate_on_us_flag_visa", "")),
+        "dup_on_us_mc": _flag(item.get("duplicate_on_us_flag_mastercard", "")),
     }
 
 
@@ -149,20 +202,35 @@ def read_operational(
 ) -> DataFrame | None:
     """
     Lee todos los Parquets del bucket operational para un cliente, marca y
-    tipo de dato, filtrando por el rango de fechas [start_date, end_date].
+    tipo de dato dentro del rango de fechas pedido, y agrega la columna
+    customer_code con el literal del cliente.
 
-    Añade columna de metadata:
-      - customer_code : literal del client_id
+    "content_hash" ya viene como columna real en el Parquet (Visa y
+    Mastercard) — se deja tal cual acá, cada transform la alias a "file_id"
+    en su propio .select() final. No se deriva "file_id" del nombre del
+    archivo: en Visa el archivo se llama "{content_hash}.parquet" (coincide
+    por casualidad), pero en Mastercard se llama
+    "{file_id}_{bloque}_{mti}.parquet" — el nombre completo del archivo no
+    es el content_hash ahí.
 
-    "content_hash" ya viene como columna real en el Parquet (VISA y MC) — se
-    deja tal cual acá; cada transform la alias a "file_id" en su .select()
-    final (no derivar "file_id" del nombre del archivo: para VISA el archivo
-    se llama "{content_hash}.parquet", coincide por casualidad, pero para MC
-    se llama "{file_id_dynamo}_{bloque}_{mti}.parquet" — el nombre completo
-    del archivo NO es el content_hash ahí).
+    Las particiones Hive (file_type, date) quedan disponibles como columnas
+    del DataFrame automáticamente, sin necesidad de parsearlas del path.
 
-    Las particiones Hive (file_type, date) son añadidas automáticamente
-    por Spark como columnas del DataFrame.
+    Args:
+        client_id: Código de cliente. Ejemplo: "SBSA".
+        brand: "VISA" o "MC" — primer nivel del path en el bucket operational.
+        data_type: Tipo de dato dentro de la marca. Ejemplo: "baseii_drafts",
+            "sms_messages", "IPM_1240", "IPM_1442".
+        start_date: Fecha de inicio del rango, formato "YYYY-MM-DD".
+        end_date: Fecha de fin del rango, formato "YYYY-MM-DD".
+
+    Returns:
+        DataFrame con todas las columnas del operational + customer_code, o
+        None si no hay Parquets en ese path o no hay filas en el rango.
+
+    Ejemplo:
+        df = read_operational("SBSA", "VISA", "baseii_drafts",
+                               "2026-01-01", "2026-01-31")
     """
     base_path = f"s3://{OPERATIONAL_BUCKET}/{client_id}/{brand}/{data_type}/"
 
@@ -196,10 +264,16 @@ def read_operational(
 
 def load_country() -> DataFrame:
     """
-    Carga la tabla de países desde S3 reference.
-    Columnas usadas:
-      country_code             (2-letter ISO, e.g. 'GR')
-      country_code_alternative (3-letter ISO, e.g. 'GRC')
+    Carga la tabla de referencia de países desde el bucket S3 reference.
+    Se usa para traducir el código de país de 2 letras que trae el
+    operational de Visa a su equivalente de 3 letras del reporte final.
+
+    Returns:
+        DataFrame con country_code (2 letras, ej. "GR") y
+        country_code_alternative (3 letras, ej. "GRC").
+
+    Ejemplo:
+        country_df = load_country()
     """
     path = f"s3://{BUCKET_REF}/country/data.parquet"
     return spark.read.parquet(path).select("country_code", "country_code_alternative")
@@ -207,11 +281,15 @@ def load_country() -> DataFrame:
 
 def load_visa_bin_products() -> DataFrame:
     """
-    Carga la tabla de productos Visa por rango de BIN (m_visa_bin_products
-    en legacy) desde S3 reference.
+    Carga la tabla de referencia de productos Visa por rango de BIN desde
+    el bucket S3 reference. Se usa para resolver product_program_id a
+    partir del product_id que ya viene calculado en el Parquet operational.
 
-    Mapea product_id (calculado en glue-vi-calculate via cruce ARDEF) a
-    product_program_id. Columnas usadas: bin_product_id, range_program_id.
+    Returns:
+        DataFrame con bin_product_id y range_program_id.
+
+    Ejemplo:
+        vi_bin_products_df = load_visa_bin_products()
     """
     path = f"s3://{BUCKET_REF}/visa_bin_products/data.parquet"
     return spark.read.parquet(path).select("bin_product_id", "range_program_id")
@@ -219,11 +297,18 @@ def load_visa_bin_products() -> DataFrame:
 
 def load_currency() -> DataFrame:
     """
-    Carga la tabla de monedas (ISO 4217 numérico → alfabético) desde S3
-    reference. Usada para mapear currency_code_transaction_de_49 /
-    currency_code_reconciliation_de_50 (códigos numéricos en el operational
-    de Mastercard) a código alfabético para el join con exchange_rate
-    (cuyas columnas from_currency/to_currency son alfabéticas).
+    Carga la tabla de referencia de monedas (código ISO 4217 numérico →
+    alfabético) desde el bucket S3 reference. Se usa para traducir los
+    códigos de moneda numéricos del operational de Mastercard
+    (currency_code_transaction_de_49 / currency_code_reconciliation_de_50)
+    al código alfabético que usan las columnas from_currency/to_currency
+    de la tabla de tipo de cambio.
+
+    Returns:
+        DataFrame con currency_numeric_code y currency_alphabetic_code.
+
+    Ejemplo:
+        currency_df = load_currency()
     """
     path = f"s3://{BUCKET_REF}/currency/data.parquet"
     return spark.read.parquet(path).select(
@@ -233,12 +318,16 @@ def load_currency() -> DataFrame:
 
 def load_mastercard_bin_products() -> DataFrame:
     """
-    Carga la tabla de productos Mastercard por rango de BIN
-    (m_mastercard_bin_products en legacy) desde S3 reference.
+    Carga la tabla de referencia de productos Mastercard por rango de BIN
+    desde el bucket S3 reference. Se usa para resolver product_program_id
+    a partir de gcms_product_identifier (DE_48 PDS_0002), ya presente en
+    el Parquet operational.
 
-    Mapea gcms_product_identifier (DE_48 PDS_0002, ya presente en el
-    operational) a product_program_id. Columnas usadas: bin_product_id,
-    range_program_id.
+    Returns:
+        DataFrame con bin_product_id y range_program_id.
+
+    Ejemplo:
+        mc_bin_products_df = load_mastercard_bin_products()
     """
     path = f"s3://{BUCKET_REF}/mastercard_bin_products/data.parquet"
     return spark.read.parquet(path).select("bin_product_id", "range_program_id")
@@ -246,15 +335,26 @@ def load_mastercard_bin_products() -> DataFrame:
 
 def load_exchange_rates(start_date: str, end_date: str, brand_path: str) -> DataFrame:
     """
-    Carga los tipos de cambio desde S3 reference para el rango de fechas
-    [start_date, end_date]. Path: exchange-rates-glue/brand={brand}/exchange_date=YYYY-MM-DD/
+    Carga los tipos de cambio del bucket S3 reference para el rango de
+    fechas pedido, desde exchange-rates-glue/ — la fuente de tipo de
+    cambio con cobertura viva del pipeline, particionada por marca y
+    fecha, con códigos de moneda numéricos y alfabéticos ya combinados.
 
-    Fuente: exchange-rates-glue (enriquecido con codigos numericos por
-    glue-exchange-rates, cobertura viva y actualizada) — reemplaza a
-    exchange_rate/, fuente manual congelada al 2026-04-30. Particionada por
-    brand + exchange_date (a diferencia de exchange_rate/, que solo
-    particionaba por rate_date y traía ambas marcas en una columna).
-    Columnas resultantes: exchange_date, from_currency, to_currency, fx_rate
+    Si no hay datos en el path (marca o rango sin cobertura), retorna un
+    DataFrame vacío con el schema correcto en vez de fallar, para que el
+    resto del job siga funcionando con tasas por defecto (1.0).
+
+    Args:
+        start_date: Fecha de inicio del rango, formato "YYYY-MM-DD".
+        end_date: Fecha de fin del rango, formato "YYYY-MM-DD".
+        brand_path: Marca para el filtro de partición. Ejemplo: "Visa",
+            "MasterCard" (se capitaliza automáticamente).
+
+    Returns:
+        DataFrame con exchange_date, from_currency, to_currency, fx_rate.
+
+    Ejemplo:
+        xrate_vi_df = load_exchange_rates("2026-01-01", "2026-01-31", "Visa")
     """
     brand_partition = brand_path.capitalize()
     path = f"s3://{BUCKET_REF}/exchange-rates-glue/brand={brand_partition}/"
@@ -318,7 +418,25 @@ FINAL_COLS = [
 
 
 def _apply_reversal_negation(df: DataFrame) -> DataFrame:
-    """Negar transaction_amount e interchange_fees_amount en reversales."""
+    """
+    Invierte el signo de transaction_amount e interchange_fees_amount en
+    las filas marcadas como reversa/contracargo, para que el reporte
+    refleje el efecto neto real de la transacción sobre el balance del
+    cliente. scheme_fees_amount no se toca — el costo de cuota no se
+    revierte.
+
+    Args:
+        df: DataFrame ya con las columnas transaction_amount,
+            interchange_fees_amount e is_reversal_or_chargeback.
+
+    Returns:
+        Mismo DataFrame con los 2 montos negados donde corresponde.
+
+    Ejemplo:
+        df = _apply_reversal_negation(df)
+        # Una fila con is_reversal_or_chargeback=True y transaction_amount=100.0
+        # queda con transaction_amount=-100.0.
+    """
     return df.withColumn(
         "transaction_amount",
         F.when(
@@ -334,9 +452,26 @@ def _apply_reversal_negation(df: DataFrame) -> DataFrame:
 
 def _apply_duplicate_on_us(df: DataFrame, brand: str) -> DataFrame:
     """
-    Duplica las filas on-us con business_mode='A' (Acquirer) añadiendo
-    una copia con business_mode_code='I' (Issuer).
-    Equivalente al bloque duplicate_on_us_flag en el SP.
+    Duplica las transacciones "on-us" (donde el mismo banco es emisor y
+    adquirente de la tarjeta) agregando una copia marcada como emisor,
+    para que el reporte final refleje ambos roles de negocio por
+    separado. Solo se llama cuando el cliente tiene esta duplicación
+    activada (ver client_cfg["dup_on_us_visa"]/["dup_on_us_mc"]) y el job
+    corre con --scheme_fee=true.
+
+    Args:
+        df: DataFrame ya transformado (con columnas jurisdiction_code y
+            business_mode_code), antes de unir con otros brands.
+        brand: Solo para logging/trazabilidad, no afecta la lógica.
+            Ejemplo: "VISA", "MC".
+
+    Returns:
+        df original + las filas duplicadas (union), mismo schema.
+
+    Ejemplo:
+        df = _apply_duplicate_on_us(df, brand="VISA")
+        # Una transacción on-us con business_mode_code='A' (adquirente)
+        # genera una segunda fila idéntica salvo business_mode_code='I'.
     """
     dup_df = df.filter(
         (F.col("jurisdiction_code") == "on-us") & (F.col("business_mode_code") == "A")
@@ -352,10 +487,30 @@ def _join_exchange_rates(
     report_currency: str,
 ) -> DataFrame:
     """
-    Añade columnas xr1_rate y xr2_rate al DataFrame.
-      xr1_rate : tipo de cambio de la moneda de la transacción al report_currency
-      xr2_rate : tipo de cambio de la moneda del fee al report_currency
-    Join: date (operational) == exchange_date (reference)
+    Agrega al DataFrame las tasas de cambio necesarias para convertir
+    montos a la moneda de reporte del cliente: xr1_rate (moneda de la
+    transacción → report_currency) y xr2_rate (moneda del fee de
+    interchange → report_currency). El join es por fecha de procesamiento
+    exacta contra exchange_date.
+
+    Args:
+        df: DataFrame con las columnas "date", src_currency_col y
+            fee_currency_col ya resueltas.
+        xrate_df: Tabla de tipo de cambio (via load_exchange_rates()).
+        src_currency_col: Nombre de la columna con la moneda de la
+            transacción. Ejemplo: "source_currency_code_alphabetic".
+        fee_currency_col: Nombre de la columna con la moneda del fee de
+            interchange. Ejemplo: "interchange_fee_currency".
+        report_currency: Moneda de reporte del cliente. Ejemplo: "ZAR".
+
+    Returns:
+        df + columnas xr1_rate y xr2_rate (NULL si no hubo match — se
+        maneja con coalesce(...,1.0) en el punto de uso).
+
+    Ejemplo:
+        df = _join_exchange_rates(df, xrate_vi_df,
+                                   "source_currency_code_alphabetic",
+                                   "interchange_fee_currency", "ZAR")
     """
     xr = xrate_df.filter(F.col("to_currency") == report_currency)
 
@@ -398,15 +553,38 @@ def transform_visa_baseii(
     dup_on_us: bool,
 ) -> DataFrame:
     """
-    Equivalente a analytics.get_visa_baseii_transactions().
+    Transforma las transacciones Visa BASE II del bucket operational al
+    schema estándar de reporte de transacciones.
 
-    Joins contra tablas de referencia:
-      merchant_country_ref (country_df): merchant_country_code (2-letter)
-                                          → country_code_alternative (3-letter)
-      issuer_country_ref   (country_df): ardef_country (2-letter)
-                                          → country_code_alternative (3-letter)
-      product_ref (vi_bin_products_df): product_id → bin_product_id
-                                         → range_program_id (product_program_id)
+    Enriquece cada transacción cruzando contra tablas de referencia
+    (país del comercio, país del emisor vía el rango ARDEF, producto →
+    rango de programa) y convierte los montos a la moneda de reporte del
+    cliente usando el tipo de cambio del día. El resultado queda listo
+    para unirse con las transformaciones de SMS y Mastercard en un único
+    reporte consolidado.
+
+    Args:
+        df: Parquet operational de baseii_drafts (via read_operational()),
+            ya filtrado por rango de fechas. Debe incluir content_hash,
+            record, business_mode, draft_code, ardef_country, product_id.
+        country_df: Tabla de referencia de países (via load_country()).
+        xrate_df: Tipo de cambio (via load_exchange_rates()).
+        vi_bin_products_df: Tabla de productos Visa por BIN (via
+            load_visa_bin_products()).
+        report_currency: Moneda de reporte del cliente. Ejemplo: "ZAR".
+        dup_on_us: Si True, duplica transacciones on-us adquirentes
+            agregando una copia como emisor (ver _apply_duplicate_on_us()).
+
+    Returns:
+        DataFrame con las 32 columnas de FINAL_COLS, listo para unir con
+        transform_visa_sms()/transform_mastercard() vía unionByName.
+
+    Ejemplo:
+        df_baseii = read_operational("SBSA", "VISA", "baseii_drafts",
+                                      "2026-01-01", "2026-01-31")
+        result = transform_visa_baseii(df_baseii, country_df, xrate_vi_df,
+                                        vi_bin_products_df, "ZAR",
+                                        dup_on_us=True)
     """
     merchant_country_ref = country_df.select(
         F.col("country_code").alias("_country_code_merchant"),
@@ -532,7 +710,32 @@ def transform_visa_sms(
     dup_on_us: bool,
 ) -> DataFrame:
     """
-    Equivalente a analytics.get_visa_sms_transactions().
+    Transforma las transacciones Visa SMS (mensajería de cajeros
+    automáticos) del bucket operational al schema estándar de reporte de
+    transacciones. Mismo patrón de enriquecimiento y conversión de moneda
+    que transform_visa_baseii(), con una regla de monto adicional para el
+    caso source_amount=0 (ver más abajo, xr3).
+
+    Args:
+        df: Parquet operational de sms_messages (via read_operational()),
+            ya filtrado por rango de fechas.
+        country_df: Tabla de referencia de países (via load_country()).
+        xrate_df: Tipo de cambio (via load_exchange_rates()).
+        vi_bin_products_df: Tabla de productos Visa por BIN (via
+            load_visa_bin_products()).
+        report_currency: Moneda de reporte del cliente. Ejemplo: "ZAR".
+        dup_on_us: Si True, duplica transacciones on-us adquirentes
+            agregando una copia como emisor.
+
+    Returns:
+        DataFrame con las 32 columnas de FINAL_COLS.
+
+    Ejemplo:
+        df_sms = read_operational("SBSA", "VISA", "sms_messages",
+                                   "2026-01-01", "2026-01-31")
+        result = transform_visa_sms(df_sms, country_df, xrate_vi_df,
+                                     vi_bin_products_df, "ZAR",
+                                     dup_on_us=True)
     """
     df = df.filter(F.col("local_draft_date").isNotNull())
 
@@ -571,14 +774,13 @@ def transform_visa_sms(
         report_currency=report_currency,
     )
 
-    # xr3: tasa USD -> report_currency (fija). Legacy usa un tercer join (X3)
-    # hardcodeado a USD ('840') para el caso source_amount=0 -- cryptogram_amount
-    # y surcharge_amount_sms siempre vienen en USD segun la especificacion de
-    # Visa, sin importar la moneda real de la transaccion. Un intento anterior
-    # de esta funcion reemplazo el hardcode por la moneda real reportada en
-    # cryptogram_currency_code, pero eso diverge del legacy y producia montos
-    # ~16x menores para business_transaction_type=247 (ATM balance inquiry,
-    # MCC 6011) en la validacion contra SBSA enero 2026 -- revertido.
+    # xr3: tasa USD -> report_currency (fija). Para el caso source_amount=0,
+    # cryptogram_amount y surcharge_amount_sms siempre vienen en USD segun la
+    # especificacion de Visa, sin importar la moneda real de la transaccion,
+    # asi que la conversion usa siempre USD como origen (no la moneda
+    # reportada en cryptogram_currency_code -- probado y descartado: producia
+    # montos ~16x menores para business_transaction_type=247, ATM balance
+    # inquiry, MCC 6011, en la validacion contra SBSA enero 2026).
     xr3 = xrate_df.filter(
         (F.col("to_currency") == report_currency) & (F.col("from_currency") == "USD")
     ).select(
@@ -677,21 +879,38 @@ def transform_mastercard(
     dup_on_us: bool,
 ) -> DataFrame:
     """
-    Equivalente a analytics.get_mastercard_transactions() para MTI 1240 y 1442.
+    Transforma las transacciones Mastercard (MTI 1240 y 1442) del bucket
+    operational al schema estándar de reporte de transacciones.
 
-    A diferencia de Visa, el operational de MC ya trae los países en alpha-3
-    (card_acceptor_country_code_de_43_6 = merchant, iar_country = issuer) —
-    no requiere join contra country_df.
+    A diferencia de Visa, el operational de Mastercard ya trae los países
+    en formato alpha-3 (card_acceptor_country_code_de_43_6 para el
+    comercio, iar_country para el emisor) — no requiere join contra una
+    tabla de países. Las monedas sí llegan como código ISO 4217 numérico
+    y se traducen a alfabético (currency_df) para el join de tipo de
+    cambio; la moneda del fee IAR (rate_currency) ya viene alfabética.
+    El producto se resuelve igual que en Visa: gcms_product_identifier →
+    bin_product_id → range_program_id.
 
-    Las monedas (currency_code_transaction_de_49 / currency_code_
-    reconciliation_de_50) son ISO 4217 numéricos — se mapean a alfabético
-    via currency_alpha_ref (currency_df) para el join de exchange_rate.
-    rate_currency (fee IAR) ya viene alfabético.
+    Args:
+        df: Parquet operational de IPM_1240 o IPM_1442 (via
+            read_operational()), ya filtrado por rango de fechas.
+        currency_df: Tabla de monedas numérico→alfabético (via load_currency()).
+        xrate_df: Tipo de cambio (via load_exchange_rates()).
+        mc_bin_products_df: Tabla de productos Mastercard por BIN (via
+            load_mastercard_bin_products()).
+        report_currency: Moneda de reporte del cliente. Ejemplo: "ZAR".
+        dup_on_us: Si True, duplica transacciones on-us adquirentes
+            agregando una copia como emisor.
 
-    product_ref (mc_bin_products_df): gcms_product_identifier → bin_product_id
-    → range_program_id (product_program_id), igual patrón que Visa con
-    visa_bin_products.
+    Returns:
+        DataFrame con las 32 columnas de FINAL_COLS.
 
+    Ejemplo:
+        df_mc1240 = read_operational("SBSA", "MC", "IPM_1240",
+                                      "2026-01-01", "2026-01-31")
+        result = transform_mastercard(df_mc1240, currency_df, xrate_mc_df,
+                                       mc_bin_products_df, "ZAR",
+                                       dup_on_us=True)
     """
     df = df.withColumn(
         "_effective_product_id",
@@ -878,6 +1097,64 @@ def transform_mastercard(
     return df
 
 
+def load_scheme_fee_costs(
+    client_id: str, start_date: str, analytics_bucket: str
+) -> DataFrame | None:
+    """
+    Lee el costo de cuotas ya calculado por el proceso de scheme fee para
+    un cliente y mes, y arma la llave necesaria para cruzarlo contra el
+    reporte de transacciones: file_id + row_id + business_mode_code
+    (traducido de business_mode_id ACQUIRING/ISSUING a A/I).
+
+    Usa la columna UNITARIA (unitary_scheme_fee_cost) — no
+    transaction_scheme_fee_cost, que replica el TOTAL del grupo en cada
+    fila y sobrecontaría el costo si se sumara fila por fila.
+
+    (file_id, row_id, business_mode_code) es única por construcción en
+    el detalle de cuotas: cada transacción fuente genera 1 fila, y el
+    duplicado on-us agrega como máximo 1 fila adicional con
+    business_mode_id ya forzado al valor opuesto — nunca hay 2 filas con
+    el mismo business_mode_code para el mismo (file_id, row_id).
+
+    Args:
+        client_id: Código de cliente. Ejemplo: "SBSA".
+        start_date: Fecha de inicio del rango del job, formato
+            "YYYY-MM-DD". El mes de reporte de cuotas (YYYYMM) se deriva
+            de acá — el rango start_date/end_date debe caer dentro de un
+            único mes calendario al pedir scheme_fees_amount.
+        analytics_bucket: Nombre del bucket S3 analytics.
+
+    Returns:
+        DataFrame con file_id, row_id, business_mode_code y
+        scheme_fees_amount, o None si el detalle de cuotas todavía no
+        existe para ese cliente+mes — en ese caso scheme_fees_amount
+        queda en el default 0.0 que cada transform ya trae, sin que
+        esto se considere un error del job.
+
+    Ejemplo:
+        cost_df = load_scheme_fee_costs("SBSA", "2026-01-01",
+                                         "itl-...-s3-analytics")
+    """
+    report_month = start_date[:4] + start_date[5:7]
+    path = f"s3://{analytics_bucket}/{client_id}/scheme_fee/final/{report_month}/detail/"
+    try:
+        df = spark.read.parquet(path)
+    except Exception as e:
+        log_info(
+            f"[load_scheme_fee_costs] No final/detail for {client_id}/{report_month}: {e}"
+        )
+        return None
+
+    return df.select(
+        F.col("app_hash_file").cast(StringType()).alias("file_id"),
+        F.col("app_id").cast(IntegerType()).alias("row_id"),
+        F.when(F.col("business_mode_id") == "ACQUIRING", F.lit("A"))
+        .when(F.col("business_mode_id") == "ISSUING", F.lit("I"))
+        .alias("business_mode_code"),
+        F.col("unitary_scheme_fee_cost").cast(DoubleType()).alias("scheme_fees_amount"),
+    ).filter(F.col("business_mode_code").isNotNull())
+
+
 # =============================================================================
 # PROCESAMIENTO POR CLIENTE Y RANGO DE FECHAS
 # =============================================================================
@@ -896,8 +1173,37 @@ def process_client_range(
     client_cfg: dict,
 ) -> DataFrame | None:
     """
-    Genera el DataFrame de report_transactions para un cliente en el rango
-    [start_date, end_date]. Une BASEII + SMS + MC_1240 + MC_1442.
+    Genera el reporte consolidado de un cliente para un rango de fechas:
+    lee cada fuente operational disponible (Visa BASE II, Visa SMS,
+    Mastercard MTI 1240/1442), la transforma al schema común, y une todo
+    en un único DataFrame. Si --scheme_fee=true, además cruza el costo de
+    cuotas ya calculado (ver load_scheme_fee_costs()).
+
+    Cada fuente se procesa en un try/except independiente — si una marca
+    no tiene datos o falla su transformación, el reporte sigue con las
+    demás en vez de abortar el job completo.
+
+    Args:
+        client_id: Código de cliente. Ejemplo: "SBSA".
+        start_date: Fecha de inicio del rango, formato "YYYY-MM-DD".
+        end_date: Fecha de fin del rango, formato "YYYY-MM-DD".
+        country_df: Tabla de referencia de países (via load_country()).
+        xrate_vi_df: Tipo de cambio de Visa (via load_exchange_rates()).
+        vi_bin_products_df: Productos Visa por BIN.
+        currency_df: Tabla de monedas numérico→alfabético.
+        xrate_mc_df: Tipo de cambio de Mastercard.
+        mc_bin_products_df: Productos Mastercard por BIN.
+        client_cfg: Configuración del cliente (via get_client_config()).
+
+    Returns:
+        DataFrame con las 32 columnas de FINAL_COLS, o None si ninguna
+        fuente tuvo datos en el rango pedido.
+
+    Ejemplo:
+        result_df = process_client_range(
+            "SBSA", "2026-01-01", "2026-01-31", country_df, xrate_vi_df,
+            vi_bin_products_df, currency_df, xrate_mc_df,
+            mc_bin_products_df, client_cfg)
     """
     rep_cur = client_cfg["report_currency"]
     dup_vi = client_cfg["dup_on_us_visa"] and SCHEME_FEE
@@ -965,14 +1271,34 @@ def process_client_range(
     for f in frames[1:]:
         result = result.union(f)
 
+    if SCHEME_FEE:
+        cost_df = load_scheme_fee_costs(client_id, start_date, ANALYTICS_BUCKET)
+        if cost_df is not None:
+            result = (
+                result.drop("scheme_fees_amount")
+                .join(cost_df, on=["file_id", "row_id", "business_mode_code"], how="left")
+                .fillna({"scheme_fees_amount": 0.0})
+            )
+
     return result.select(FINAL_COLS)
 
 
 def write_result(df: DataFrame, client_id: str) -> str:
     """
-    Escribe el DataFrame resultado como Parquet en S3 analytics.
-    Nombre: report_transactions_{client_id}_{report_suffix}.parquet
-    Path:   {bucket}/{client_id}/reports/
+    Escribe el reporte final como un único archivo Parquet en el bucket
+    S3 analytics, bajo {client_id}/reports/.
+
+    Args:
+        df: DataFrame final (32 columnas de FINAL_COLS) a persistir.
+        client_id: Código de cliente, usado en el nombre del archivo.
+            Ejemplo: "SBSA".
+
+    Returns:
+        Path completo de S3 donde quedó escrito el archivo.
+
+    Ejemplo:
+        s3_path = write_result(result_df, "SBSA")
+        # "s3://itl-...-s3-analytics/SBSA/reports/report_transactions_SBSA_202601.parquet"
     """
     filename = f"report_transactions_{client_id}_{REPORT_SUFFIX}.parquet"
 
@@ -981,7 +1307,6 @@ def write_result(df: DataFrame, client_id: str) -> str:
 
     log_info(f"[write_result] Writing {df.count()} rows → {s3_path}")
 
-    # Escribir como un solo archivo (repartition a 1)
     df.repartition(1).write.mode("overwrite").parquet(s3_path)
 
     log_info(f"[write_result] Done → {s3_path}")
@@ -994,6 +1319,14 @@ def write_result(df: DataFrame, client_id: str) -> str:
 
 
 def main():
+    """
+    Punto de entrada del job: carga las tablas de referencia una sola vez
+    (cacheadas para reusar entre BASE II/SMS/Mastercard), lee la
+    configuración del cliente, genera el reporte del rango pedido y lo
+    escribe a S3. No recibe argumentos ni retorna nada — todos los
+    parámetros vienen de los --args del job (ver CLIENT_CODE, START_DATE,
+    etc. al inicio del archivo).
+    """
     job = Job(glueContext)
     job.init(args["JOB_NAME"], args)
 
