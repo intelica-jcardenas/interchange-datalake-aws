@@ -183,14 +183,16 @@ foreach ($Suffix in $ToSync.Keys) {
         continue
     }
 
-    # 3. Subir a AWS -- SOLO codigo.
+    # 3. Subir a AWS -- SOLO codigo. No se suprime stderr: si aws cli falla
+    #    (credenciales expiradas, funcion no encontrada, etc.) el mensaje real
+    #    debe verse en consola en vez de un "ERROR" generico sin causa.
     $UpdateJson = aws lambda update-function-code `
         --function-name $FunctionName `
         --zip-file "fileb://$ZipPath" `
-        --output json 2>$null
+        --output json
 
     if (-not $UpdateJson) {
-        Write-Host "  ERROR - update-function-code fallo (ver salida de aws cli arriba)" -ForegroundColor Red
+        Write-Host "  ERROR - update-function-code fallo (ver mensaje de aws cli arriba)" -ForegroundColor Red
         $null = $Results.Add([pscustomobject]@{ Lambda = $Suffix; Group = $Meta.Group; Status = "UPDATE FAILED" })
         Write-Host ""
         continue
@@ -207,9 +209,9 @@ Remove-Item $TempDir -Recurse -Force
 Write-Host "========== Resumen ==========" -ForegroundColor White
 $Results | Format-Table -AutoSize
 
-$ok     = ($Results | Where-Object { $_.Status -eq "OK" }).Count
-$skip   = ($Results | Where-Object { $_.Status -ne "OK" }).Count
-$errors = ($Results | Where-Object { $_.Status -match "ERROR|FAILED" }).Count
+$ok     = @($Results | Where-Object { $_.Status -eq "OK" }).Count
+$skip   = @($Results | Where-Object { $_.Status -ne "OK" }).Count
+$errors = @($Results | Where-Object { $_.Status -match "ERROR|FAILED" }).Count
 if ($skip -eq 0) {
     Write-Host "Completado: $ok OK" -ForegroundColor Green
 } else {

@@ -137,10 +137,12 @@ foreach ($Suffix in $ToSync.Keys) {
         continue
     }
 
-    aws s3 cp $ScriptLocal $ScriptS3Path 2>$null | Out-Null
+    # No se suprime stderr: si aws cli falla (credenciales expiradas, bucket sin
+    # permiso, etc.) el mensaje real debe verse en consola.
+    aws s3 cp $ScriptLocal $ScriptS3Path
 
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "  ERROR - aws s3 cp fallo" -ForegroundColor Red
+        Write-Host "  ERROR - aws s3 cp fallo (ver mensaje de aws cli arriba)" -ForegroundColor Red
         $null = $Results.Add([pscustomobject]@{ Job = $Suffix; Group = $Meta.Group; Status = "UPLOAD FAILED" })
         Write-Host ""
         continue
@@ -154,9 +156,9 @@ foreach ($Suffix in $ToSync.Keys) {
 Write-Host "========== Resumen ==========" -ForegroundColor White
 $Results | Format-Table -AutoSize
 
-$ok     = ($Results | Where-Object { $_.Status -eq "OK" }).Count
-$skip   = ($Results | Where-Object { $_.Status -ne "OK" }).Count
-$errors = ($Results | Where-Object { $_.Status -match "ERROR|FAILED" }).Count
+$ok     = @($Results | Where-Object { $_.Status -eq "OK" }).Count
+$skip   = @($Results | Where-Object { $_.Status -ne "OK" }).Count
+$errors = @($Results | Where-Object { $_.Status -match "ERROR|FAILED" }).Count
 if ($skip -eq 0) {
     Write-Host "Completado: $ok OK" -ForegroundColor Green
 } else {

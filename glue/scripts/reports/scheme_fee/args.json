@@ -1,8 +1,9 @@
 ﻿{
     "DefaultArguments":  {
                              "--client_code":  "EBGR",
+                             "--dynamodb_table_file_control":  "itl-0004-itx-dev-dynamo-file_control-02",
                              "--report_month":  "202601",
-                             "--in_file_key":  "",
+                             "--in_file_key":  "N/A",
                              "--scheme_fee_bucket":  "itl-0004-itx-dev-intchg-02-s3-scheme-fee",
                              "--TempDir":  "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/scheme-fee/",
                              "--dynamodb_table_client":  "itl-0004-itx-dev-dynamo-client-02",

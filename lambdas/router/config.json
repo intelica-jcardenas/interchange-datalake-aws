@@ -4,12 +4,12 @@
     "Runtime": "python3.11",
     "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-vi-role",
     "Handler": "handler.lambda_handler",
-    "CodeSize": 12972,
+    "CodeSize": 16996,
     "Description": "Router de clasificacion de archivos",
     "Timeout": 240,
     "MemorySize": 8192,
-    "LastModified": "2026-06-12T23:58:05.000+0000",
-    "CodeSha256": "5FHc/SXR2lp3931csVnV+QVYixyX3Xv4Khdc8myenoU=",
+    "LastModified": "2026-07-11T16:01:51.000+0000",
+    "CodeSha256": "N4jEUcZApZJnefS6GuEmqwl4giwW2NweEpkBqgeB+pE=",
     "Version": "$LATEST",
     "VpcConfig": {
         "SubnetIds": [
@@ -40,7 +40,7 @@
     "TracingConfig": {
         "Mode": "PassThrough"
     },
-    "RevisionId": "c0267232-5cc0-4598-9f91-b070be9b54ff",
+    "RevisionId": "98483740-5b8c-46eb-babd-2182ba120cf0",
     "State": "Active",
     "LastUpdateStatus": "Successful",
     "PackageType": "Zip",
@@ -55,7 +55,7 @@
         "OptimizationStatus": "Off"
     },
     "RuntimeVersionConfig": {
-        "RuntimeVersionArn": "arn:aws:lambda:eu-south-2::runtime:53285ee2fb9fac4cc9ebbb3c5ac1845832297f816fabe2356a10a7e37355c64e"
+        "RuntimeVersionArn": "arn:aws:lambda:eu-south-2::runtime:15606da216b3bff5de1872be70ce1a6be87f1f26dafc9bcf45233c0dc338335b"
     },
     "LoggingConfig": {
         "LogFormat": "Text",
