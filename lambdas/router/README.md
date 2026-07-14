@@ -1,26 +1,35 @@
-# itx-router
+# `itl-0004-itx-dev-intchg-02-lmbd-router`
 
-## Descripcion
-Punto de entrada del pipeline. Se activa cuando un archivo
-es depositado en itx-landing-dev. Detecta el tipo de archivo
-(BASEII, SMS, VSS) y dispara el flujo en Step Functions.
+Punto de entrada del pipeline. Trigger: S3 Event `ObjectCreated:*` en
+`s3-landing`, path `{client_id}/{filename}`.
 
-## Trigger
-S3 Event: s3:ObjectCreated:* en itx-landing-dev
+## Flujo
 
-## Responsabilidades
-1. Detectar tipo de archivo via itx-file-pattern (DynamoDB)
-2. Registrar entrada en itx-file-control (DynamoDB)
-3. Disparar itx-main-orchestrator (Step Functions)
+1. Extrae `client_id` del path.
+2. Si es ZIP → delega a `lmbd-unzip` (async) y termina; cada archivo
+   extraído re-dispara el router (paralelismo gratis).
+3. Clasifica el archivo contra los patrones regex de DynamoDB
+   `file_pattern` (por prioridad).
+4. Extrae la fecha de negocio del contenido — lógica distinta por marca:
+   header de 50 bytes (Visa), escaneo del trailer 1644/695 con descarga
+   completa + `unblock_1014` para archivos bloqueados (Mastercard),
+   formatos propios para IAR/ARDEF.
+5. Calcula el MD5 (`content_hash`) en streaming (nunca carga el archivo
+   completo) y detecta duplicados/nuevas versiones en `file_control`.
+6. Registra el archivo en DynamoDB (`PENDING` → `PROCESSING`).
+7. Despacha según `direction`/`brand`:
+   - `ARDEF` → `lmbd-vi-ardef` (Lambda directa, sin Step Functions)
+   - `IAR` → `lmbd-mc-iar` (Lambda directa, sin Step Functions)
+   - `VISA` → Step Function `sfn-vi`
+   - `MASTERCARD` → Step Function `sfn-mc`
 
 ## Variables de entorno
-STEP_FUNCTION_ARN           = arn:aws:states:...:itx-main-orchestrator
-DYNAMODB_TABLE_FILE_CONTROL = itx-file-control
-DYNAMODB_TABLE_FILE_PATTERN = itx-file-pattern
-S3_BUCKET_LANDING           = itx-landing-{env}
 
-## IAM Role
-itx-lambda-router-role
-
-## Estado
-Implementado y en produccion
+| Variable | Descripción |
+|----------|-------------|
+| `S3_BUCKET_LANDING` | Bucket de landing |
+| `DYNAMODB_TABLE_FILE_CONTROL` | Tabla de control de archivos |
+| `DYNAMODB_TABLE_FILE_PATTERN` | Tabla de patrones de clasificación |
+| `STEP_FUNCTION_VI_ARN` / `STEP_FUNCTION_MC_ARN` | ARNs de las Step Functions |
+| `VISA_ARDEF_FUNCTION_NAME` / `MASTERCARD_IAR_FUNCTION_NAME` | Lambdas de reglas (invocación directa) |
+| `UNZIP_FUNCTION_NAME` | Lambda de descompresión |

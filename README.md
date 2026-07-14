@@ -190,7 +190,7 @@ terraform init && terraform plan && terraform apply
 | Pipeline Visa completo | Implementado y validado |
 | Pipeline Mastercard completo | Implementado y validado end-to-end (comparativos EBGR + SBSA enero 2026) |
 | Reporting (`get_transaction.py`) | Validado para ambas marcas |
-| Scheme Fee (cuotas) | `--mode generate` validado end-to-end; `--mode read` pendiente |
+| Scheme Fee (cuotas) | `--mode generate` y `--mode read` validados end-to-end; falta validar con costos reales del equipo externo |
 | Athena (crawlers, workgroups, tablas) | Pendiente de configuracion y validacion |
 
 Ver `CLAUDE.md` para documentacion tecnica detallada.

@@ -1,12 +1,7 @@
-# Lambda Layer - itx-pandas-pyarrow
+# Layer — `itl-0004-itx-{env}-intchg-02-pandas-pyarrow`
 
-## Descripcion
-Layer compartido con pandas y pyarrow.
-Requerido por: itx-transform, itx-extract, itx-clean, itx-store.
+Layer compartido (pandas + pyarrow) usado por todas las Lambdas de
+procesamiento: `vi-transform/extract/clean/store`,
+`mc-transform/extract/clean/store/interpreter`, `vi-ardef`, `mc-iar`.
 
-## Version
-v1 - Python 3.11
-
-## Deploy
-El deploy.sh sube y registra este layer automaticamente
-antes de crear las lambdas que dependen de el.
+`layer.zip` es el paquete real subido a AWS.

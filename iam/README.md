@@ -1,17 +1,22 @@
 # IAM Roles
 
-## Roles actuales
+11 roles con permisos granulares (S3, DynamoDB, Step Functions, Glue,
+Lambda invoke). Patrón de nombres:
+`itl-0004-itx-{env}-intchg-02-lmbd-{marca}-role` para Lambdas — ej.
+`itl-0004-itx-dev-intchg-02-lmbd-mc-role`; los Glue jobs comparten
+`itl-0004-itx-dev-intchg-02-glue-role` (jobs de negocio) o
+`itl-0004-itx-dev-intchg-02-glue-test-role` (data quality/reportes,
+heredado de cuando esos jobs se llamaban `glue-test-N`).
 
-itx-lambda-router-role    -> itx-router, itx-extract (temporal)
-itx-lambda-transform-role -> itx-transform
-itx-lambda-clean-role     -> itx-clean
-itx-lambda-store-role     -> itx-store
-itx-lambda-archive-role   -> itx-archive-file
-itx-stepfunctions-role    -> itx-main-orchestrator
-itx-glue-calculate-role   -> itx-calculate
-itx-glue-interchange-role -> itx-interchange
-itx-glue-crawler-reference-role -> crawler_itx_reference
+## Pendiente (ver `.claude/memory/pending.md`)
 
-## Pendientes en nuevo ambiente
-- itx-lambda-extract-role: rol propio para itx-extract
-- itx-glue-crawler-ebgr-role: rol para crawler_ebgr_visa_staging
+- `lmbd-vi-extract` comparte rol con el router — falta un
+  `itx-lambda-extract-role` propio con permisos mínimos.
+- El crawler Mastercard no tiene rol propio.
+
+## Nota
+
+`roles/*.json` en esta carpeta son exports del scaffolding inicial
+(nomenclatura `itx-lambda-router-role`, etc.) — no hay script de
+sincronización para IAM (a diferencia de Lambdas/Glue/DynamoDB/Step
+Functions), así que no reflejan los roles reales actuales.

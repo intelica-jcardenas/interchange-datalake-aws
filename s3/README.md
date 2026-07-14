@@ -1,28 +1,19 @@
-# S3 - Arquitectura de Buckets
+# S3 — Buckets del Data Lake
 
-## itx-landing-dev
-Recepcion de archivos raw (BASEII, SMS, VSS).
-Trigger: s3:ObjectCreated:* hacia itx-router.
+5 buckets, uno por capa. Patrón de nombres:
+`itl-0004-itx-{env}-intchg-02-s3-{tipo}`.
 
-## itx-staging-dev
-Procesamiento intermedio en Parquet por etapas.
-Contiene scripts/ con los Glue Jobs.
-
-## itx-operational-dev
-Parquets finales listos para consumo.
-Se populara cuando itx-store este implementado.
-
-## itx-archive-dev
-Archivos originales post-procesamiento.
-Destino final de itx-archive-file.
-
-## itx-reference-dev
-Archivos de referencia estaticos:
-- exchange_rates
-- visa_ardef
-- visa_rules
-- currency
-- country
+| Bucket | Capa | Contenido |
+|--------|------|-----------|
+| `s3-landing` | Entrada | Archivos raw, dispara el router vía S3 Event |
+| `s3-staging` | Intermedio | Parquets de cada etapa (transform/extract/clean/calculate/interchange) |
+| `s3-operational` | Salida | Parquets finales, consultables desde Athena |
+| `s3-archive` | Archivo | Originales movidos post-procesamiento |
+| `s3-reference` | Referencia | ARDEF, IAR, tipos de cambio (`exchange-rates-glue/`), country, currency, `mc_rules/` |
 
 ## Nota
-En nuevo ambiente reemplazar sufijo -dev segun ambiente.
+
+`configs/itx-*-dev/` en esta carpeta son exports del scaffolding inicial
+(nomenclatura vieja `itx-landing-dev`, etc.) — no hay script de
+sincronización para S3 (a diferencia de Lambdas/Glue/DynamoDB/Step
+Functions), así que no reflejan la configuración real actual.
