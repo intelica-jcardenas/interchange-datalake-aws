@@ -6,7 +6,7 @@
                              "--enable-continuous-cloudwatch-log":  "true",
                              "--job-language":  "python",
                              "--S3_STAGING":  "s3://itl-0004-itx-dev-intchg-02-s3-staging",
-                             "--TempDir":  "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/mastercard/tmp/calculate/",
+                             "--TempDir":  "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/mc-calculate/",
                              "--S3_REFERENCE":  "s3://itl-0004-itx-dev-intchg-02-s3-reference"
                          }
 }

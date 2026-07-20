@@ -1,5 +1,57 @@
 # Gotchas y problemas conocidos
 
+## vi_data_quality.py (BASEII) usaba interchange_fee_currency para convertir itx_amt — mismo error de moneda que MC, ya corregido en get_transaction.py — FIX APLICADO LOCALMENTE, SIN DESPLEGAR NI VALIDAR
+
+**Archivo:** `glue/scripts/reports/vi_data_quality/vi_data_quality.py` (funciones `join_with_exchange_rates` y `aggregate_results`, sección BASEII — el bloque VSS de `aggregate_vss_results` no está afectado).
+**Detectado:** 2026-07-14, aplicando a Visa el mismo proceso de revisión que a MC (ver gotcha de `get_transaction.py`/`mc_data_quality.py` arriba).
+
+**Causa raíz:** `itx_amt` se calculaba con `COALESCE(X2.exchange_value, X1.exchange_value, 1) * interchange_fee_amount_itx`, donde `X2` convierte `interchange_fee_currency` (moneda de la regla) → `report_currency`. Pero `interchange_fee_amount_itx` (= `T3.calculated_value`) ya está en `source_currency` desde siempre (decisión validada "dirección del exchange_value", `decisions.md`) — nunca estuvo en `interchange_fee_currency`. El código venía heredado de "Standard 1.0" (legacy), que sí tenía el fee en la moneda de la regla — nunca se actualizó al migrar a la convención actual.
+
+**Diferencia con el caso de MC:** acá no hubo ningún rewrite que cambiara el comportamiento — el fee de Visa siempre estuvo en `source_currency`; simplemente `vi_data_quality.py` nunca se alineó con eso al escribirse (a diferencia de `get_transaction.py`, que si usa `xr1_rate` correctamente para Visa desde el principio).
+
+**Riesgo real:** bajo — `glue-vi-data-quality` solo tiene un smoke test (2026-07-08, corrió sin error), nunca se validó a fondo contra legacy para `itx_amt` específicamente. El fix no mueve ningún número ya confirmado.
+
+**Fix aplicado (local, sin desplegar a S3 ni commitear):**
+- `join_with_exchange_rates()`: eliminado el join `X2` completo (`exchange_rate_x2`, el join contra `interchange_fee_currency`, sus drops) — solo queda `X1` (`source_currency_code` numérico → `report_currency`).
+- `aggregate_results()`: `itx_amt` pasó de `COALESCE(X2.exchange_value, X1.exchange_value, 1)` a solo `COALESCE(X1.exchange_value, 1)`.
+- Docstrings de ambas funciones recortados, sin la explicación completa de "Standard 1.0 vs 2.0".
+- Verificado con `grep` que `interchange_fee_currency`/`x2_exchange_value` no quedan referenciados como columna Spark en ningún lado (solo texto de documentación).
+- `python -m py_compile` sin errores. **Sin ejecutar, sin comparar contra legacy, sin subir a S3/AWS todavía.**
+
+**Estado:** Fix de código aplicado localmente. Pendiente: subir a S3, correr `glue-vi-data-quality` con datos reales y comparar `itx_amt` antes/después para cuantificar la diferencia (esperable: pequeña, dado que la mayoría de transacciones tienen `interchange_fee_currency == source_currency`).
+
+---
+
+## get_transaction.py / mc_data_quality.py asumían calculated_value (MC) en rate_currency — desactualizado tras el rewrite de calculate_mastercard_fee_pyspark — FIX APLICADO LOCALMENTE, SIN DESPLEGAR NI VALIDAR
+
+**Archivos:** `glue/scripts/reports/get_transaction/get_transaction.py` (función `transform_mastercard`, `_fee_currency_mc`), `glue/scripts/reports/mc_data_quality/mc_data_quality.py` (función `get_mastercard_validation_results_transactional`, `x2_currency_join`)
+**Detectado:** 2026-07-14, revisando el impacto downstream del rewrite de `calculate_mastercard_fee_pyspark` en `glue-mc-interchange` (commit `0d9ae133`, 2026-07-05/06 — ver `decisions.md`/memoria de usuario `mc_interchange_fee_currency_rewrite.md`).
+
+**Causa raíz:** el rewrite cambió la moneda en la que queda expresado `calculated_fee` (columna que se escribe al ITX como `calculated_value`): antes en `rule_currency` (`rate_currency`), ahora siempre en `trx_ccy`/DE_49 (moneda original de la transacción). Ni `get_transaction.py` ni `mc_data_quality.py` se habían actualizado para reflejar ese cambio — ambos seguían asumiendo que `calculated_value` estaba en `rate_currency`.
+
+**Hallazgo adicional (importante para la decisión):** el SP legacy real (`sql/get_mastercard_transactions.sql`, línea ~122: `AND X2.currency_from = T3.rate_currency`) confirma que legacy **sí** espera el fee en `rate_currency` para archivos OUT — es decir, `get_transaction.py`/`mc_data_quality.py` no estaban "desactualizados" respecto a legacy, estaban REPLICANDO correctamente el comportamiento legacy. El que se desvió de legacy fue el rewrite de `calculate_mastercard_fee_pyspark` (motivado por una investigación local que consideraba `rate_currency` "no útil para reportería/conciliación" — ver memoria de usuario).
+
+**Decisión tomada (2026-07-14, con el usuario):** mantener el rewrite de `calculate_mastercard_fee_pyspark` (ya desplegado, no se toca) y actualizar los 2 reportes para seguir la nueva convención (`trx_ccy`) en vez de revertir el rewrite. **Consecuencia aceptada:** el resultado de `interchange_fees_amount`/validación MC OUT ya NO va a coincidir con el SP legacy en escenarios cross-currency (`rate_currency != trx_ccy`) — antes sí coincidía. Se prioriza consistencia interna con el pipeline nuevo sobre paridad exacta con legacy en este punto.
+
+**Fix aplicado (local, sin desplegar a S3 ni commitear):**
+- `get_transaction.py`: `_fee_currency_mc` pasó de `F.when(file_type=="IN", src_currency_alpha).otherwise(rate_currency)` a simplemente `F.col("src_currency_alpha")` (misma moneda que `amount_transaction` para ambos file_type — ya no depende de `rate_currency`).
+- `mc_data_quality.py`: `x2_currency_join` (rama OUT) pasó de `"X2.currency_from = T1.rate_currency"` a `"X2.currency_from_code = T1.currency_code_transaction"` (mismo join que `x1_currency_join`, coherente con que ambas monedas ya son la misma).
+- **Simplificación adicional (2026-07-14):** una vez que `_fee_currency_mc == src_currency_alpha`, `xr1_rate`/`xr2_rate` quedaban siempre idénticos para MC — y al revisar los otros 2 callers de `_join_exchange_rates()` (Visa BASEII/SMS) se confirmó que **ninguno de los 3 usa `xr2_rate` en su fórmula real** de `interchange_fees_amount` (Visa siempre usó `xr1_rate`; el único uso real de `xr2_rate` en todo el archivo era la línea de MC ya simplificada arriba) — consistente con que el fee de Visa ya está en `source_currency` desde antes (decisión "dirección del exchange_value"), Visa nunca tuvo este problema. Como ningún caller lo necesitaba, se eliminó `xr2_rate`/`fee_currency_col` de raíz: `_join_exchange_rates()` perdió el parámetro `fee_currency_col` (queda `df, xrate_df, src_currency_col, report_currency`) y solo calcula `xr1_rate` — se actualizaron los 3 call sites (`transform_visa_baseii`, `transform_visa_sms`, `transform_mastercard`) para dejar de pasar `fee_currency_col`. La columna `_fee_currency_mc` de MC quedó eliminada por completo (ya no hace falta ni siquiera como alias).
+- **`mc_data_quality.py` — limpieza de `rate_currency` muerta (2026-07-14):** al quitarle la referencia a `rate_currency` de `x2_currency_join`, la columna quedaba seleccionada en `t1_norm` sin ningún uso downstream — se eliminó la constante `COL_TRX_RATE_CURRENCY`, su selección en `t1_norm` y el `StructField("rate_currency", ...)` del schema de `read_ipm_1240_operational()` (20 columnas en vez de 21). Verificado con `grep` que no queda ninguna referencia colgante.
+- **`mc_data_quality.py` — join X2 redundante eliminado (2026-07-14):** en `get_mastercard_validation_results_transactional`, tras el fix, `x1_currency_join` y `x2_currency_join` quedaron **literalmente idénticos** en ambas ramas (IN: ambos `currency_code_reconciliation`; OUT: ambos `currency_code_transaction`) — mismo patrón que `xr1_rate`/`xr2_rate` en `get_transaction.py`. Se eliminó `x2_currency_join`, el segundo `LEFT JOIN trx_x X2 ...`, y la fórmula de `itx_amt` pasó de `COALESCE(X2.exchange_value, X1.exchange_value, 1)` a solo `COALESCE(X1.exchange_value, 1)`. No afecta `get_mastercard_validation_results_settlement()` (MTI 1644) — esa función usa `amount_net_fee_in_reconciliation_currency_2` (ya denominado en su propia moneda) y nunca tuvo un segundo join, no toca `calculated_value`/reglas IAR en absoluto.
+- Ambos archivos verificados con `python -m py_compile` — sin errores de sintaxis. **Sin ejecutar, sin comparar contra legacy, sin subir a S3/AWS todavía.**
+
+**Impacto real hoy (antes del fix, para contexto):**
+- `get_transaction.py`: afectaba `interchange_fees_amount` de Mastercard **solo para archivos OUT** (los IN usan `amounts_transaction_fee_7_pds_146_7`, no `calculated_value`, no afectados). El comparativo MC más reciente (2026-06-30) es anterior al rewrite (07-05/06) — no detectó este problema porque en ese momento la asunción todavía era correcta.
+- `mc_data_quality.py`: bug latente, sin impacto observado — el job nunca se ha corrido en producción.
+- `scheme_fee.py`: **no afectado** — no usa `calculated_value`/`rate_currency` de MC en ningún punto (su `scheme_fees_amount` es la cuota externa, concepto distinto al fee de interchange).
+
+**Si vuelve a aparecer (residual de `interchange_fees_amount` MC OUT vs legacy en transacciones cross-currency):** es el comportamiento esperado tras esta decisión, no un bug nuevo — confirmar que `rate_currency != trx_ccy` en las filas con diferencia antes de investigar otra causa.
+
+**Estado:** Fix de código aplicado localmente. Pendiente: (1) correr un comparativo real contra legacy con este fix para cuantificar el residual cross-currency que se acepta; (2) subir ambos scripts a S3 y desplegar; (3) commitear (lo hace el usuario). Sigue pendiente también lo ya conocido de `calculate_mastercard_fee_pyspark` en sí (ver `pending.md`): validar el fee en trx_ccy contra legacy, limpiar `settlement_currency_u`, revisar residuales ATM.
+
+---
+
 ## SMS: interchange_fees_amount +60% de más, concentrado 100% en transaction_type_id=22 (ATM cash withdrawal) — causa en glue-vi-interchange, no en get_transaction.py — PENDIENTE
 
 **Detectado:** 2026-07-09, validando `transform_visa_sms()` (recién activada, ver gotcha de `xr3_rate` más abajo) contra `analytics.get_visa_sms_transactions()` real, SBSA enero 2026.

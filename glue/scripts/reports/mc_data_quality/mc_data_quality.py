@@ -165,7 +165,6 @@ COL_TRX_JURISDICTION = "jurisdiction"
 COL_TRX_SETTLEMENT_REPORT_CURRENCY = "settlement_report_currency_code"
 COL_TRX_INTELICA_ID = "intelica_id"
 COL_TRX_CALCULATED_VALUE = "calculated_value"
-COL_TRX_RATE_CURRENCY = "rate_currency"
 
 
 # =============================================================================
@@ -241,8 +240,7 @@ def read_ipm_1240_operational(spark, path: str) -> DataFrame:
     Lee el Parquet operational de MTI 1240 (transaccional) con un schema
     Arrow/Spark explícito, incluyendo las columnas ya enriquecidas por el
     pipeline (jurisdiction, settlement_report_currency_code, intelica_id,
-    calculated_value, rate_currency) — mismo motivo que
-    read_ipm_1644_operational().
+    calculated_value) — mismo motivo que read_ipm_1644_operational().
 
     Args:
         spark: Sesión de Spark activa.
@@ -250,7 +248,7 @@ def read_ipm_1240_operational(spark, path: str) -> DataFrame:
             ({S3_OPERATIONAL}/{customer_code}/MC/IPM_1240/file_type={file_type}/date={query_date}/).
 
     Returns:
-        DataFrame con el schema fijo declarado (21 columnas).
+        DataFrame con el schema fijo declarado (20 columnas).
 
     Ejemplo:
         read_ipm_1240_operational(spark, "s3a://.../EBGR/MC/IPM_1240/file_type=IN/date=2026-01-03/")
@@ -280,7 +278,6 @@ def read_ipm_1240_operational(spark, path: str) -> DataFrame:
         StructField("settlement_report_currency_code", StringType(), True),
         StructField("intelica_id", StringType(), True),
         StructField("calculated_value", DoubleType(), True),
-        StructField("rate_currency", StringType(), True),
     ])
     
     print(f"[READ] IPM_1240 with explicit schema: {path}", flush=True)
@@ -934,12 +931,16 @@ def get_mastercard_validation_results_transactional(
     hash_file_filter SBSA — no hay member_activity_col para esta fuente,
     app_type_file ya distingue Issuer/Acquirer), normaliza a un schema
     intermedio (t1_norm) y agrega vía Spark SQL contra 3 referencias
-    (business_transaction_type, exchange-rates-glue con doble join X1/X2,
-    currency). Las expresiones de monto/moneda difieren según file_type: IN
-    usa amount_reconciliation/amounts_transaction_fee_7 con join de tipo de
-    cambio por currency_code_reconciliation; OUT usa
-    amount_transaction/calculated_value con join por
-    currency_code_transaction/rate_currency.
+    (business_transaction_type, exchange-rates-glue, currency). Las
+    expresiones de monto/moneda difieren según file_type: IN usa
+    amount_reconciliation/amounts_transaction_fee_7 con tipo de cambio
+    por currency_code_reconciliation; OUT usa amount_transaction/
+    calculated_value con tipo de cambio por currency_code_transaction
+    — calculated_value ya está en la moneda de la transacción
+    (trx_ccy/DE_49), no en rate_currency, desde el rewrite de
+    calculate_mastercard_fee_pyspark (ver gotchas.md). Una única tasa
+    (X1) alcanza para monto y fee en ambos file_type — antes había un
+    segundo join (X2) redundante, eliminado (ver gotchas.md).
 
     Args:
         spark: Sesión de Spark activa.
@@ -1048,7 +1049,6 @@ def get_mastercard_validation_results_transactional(
 
         F.col(COL_TRX_INTELICA_ID).cast("string").alias("intelica_id"),
         F.col(COL_TRX_CALCULATED_VALUE).cast("double").alias("calculated_value"),
-        F.col(COL_TRX_RATE_CURRENCY).cast("string").alias("rate_currency"),
     )
 
     m1 = df_btt.select(
@@ -1080,12 +1080,10 @@ def get_mastercard_validation_results_transactional(
         trx_amt_expr = "T1.amount_reconciliation"
         itx_amt_expr = "T1.amounts_transaction_fee_7"
         x1_currency_join = "X1.currency_from_code = T1.currency_code_reconciliation"
-        x2_currency_join = "X2.currency_from_code = T1.currency_code_reconciliation"
     else:
         trx_amt_expr = "T1.amount_transaction"
         itx_amt_expr = "T1.calculated_value"
         x1_currency_join = "X1.currency_from_code = T1.currency_code_transaction"
-        x2_currency_join = "X2.currency_from = T1.rate_currency"
 
     final_df = spark.sql(f"""
         SELECT
@@ -1129,7 +1127,7 @@ def get_mastercard_validation_results_transactional(
             )                                                           AS trx_amt,
 
             CAST(
-                SUM(COALESCE(X2.exchange_value, X1.exchange_value, 1) * {itx_amt_expr})
+                SUM(COALESCE(X1.exchange_value, 1) * {itx_amt_expr})
                 AS DECIMAL(38,6)
             )                                                           AS itx_amt
 
@@ -1141,10 +1139,6 @@ def get_mastercard_validation_results_transactional(
         LEFT JOIN trx_x X1
             ON {x1_currency_join}
            AND X1.currency_to = CAST('{report_currency_code}' AS STRING)
-
-        LEFT JOIN trx_x X2
-            ON {x2_currency_join}
-           AND X2.currency_to = CAST('{report_currency_code}' AS STRING)
 
         LEFT JOIN trx_mc MC
             ON MC.currency_alphabetic_code = T1.settlement_report_currency_code

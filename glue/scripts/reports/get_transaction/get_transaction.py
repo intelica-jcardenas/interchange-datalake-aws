@@ -483,34 +483,31 @@ def _join_exchange_rates(
     df: DataFrame,
     xrate_df: DataFrame,
     src_currency_col: str,
-    fee_currency_col: str,
     report_currency: str,
 ) -> DataFrame:
     """
-    Agrega al DataFrame las tasas de cambio necesarias para convertir
-    montos a la moneda de reporte del cliente: xr1_rate (moneda de la
-    transacción → report_currency) y xr2_rate (moneda del fee de
-    interchange → report_currency). El join es por fecha de procesamiento
-    exacta contra exchange_date.
+    Agrega al DataFrame xr1_rate (tasa de cambio: moneda de la transacción
+    → report_currency). El join es por fecha de procesamiento exacta
+    contra exchange_date.
+
+    Antes también calculaba xr2_rate (una segunda moneda para el fee) —
+    se eliminó porque ningún caller la usaba (ver gotchas.md).
 
     Args:
-        df: DataFrame con las columnas "date", src_currency_col y
-            fee_currency_col ya resueltas.
+        df: DataFrame con las columnas "date" y src_currency_col ya
+            resueltas.
         xrate_df: Tabla de tipo de cambio (via load_exchange_rates()).
         src_currency_col: Nombre de la columna con la moneda de la
             transacción. Ejemplo: "source_currency_code_alphabetic".
-        fee_currency_col: Nombre de la columna con la moneda del fee de
-            interchange. Ejemplo: "interchange_fee_currency".
         report_currency: Moneda de reporte del cliente. Ejemplo: "ZAR".
 
     Returns:
-        df + columnas xr1_rate y xr2_rate (NULL si no hubo match — se
-        maneja con coalesce(...,1.0) en el punto de uso).
+        df + columna xr1_rate (NULL si no hubo match — se maneja con
+        coalesce(...,1.0) en el punto de uso).
 
     Ejemplo:
         df = _join_exchange_rates(df, xrate_vi_df,
-                                   "source_currency_code_alphabetic",
-                                   "interchange_fee_currency", "ZAR")
+                                   "source_currency_code_alphabetic", "ZAR")
     """
     xr = xrate_df.filter(F.col("to_currency") == report_currency)
 
@@ -524,17 +521,6 @@ def _join_exchange_rates(
         (df["date"] == x1["_xr1_date"]) & (df[src_currency_col] == x1["_xr1_from"]),
         how="left",
     ).drop("_xr1_date", "_xr1_from")
-
-    x2 = xr.select(
-        F.col("exchange_date").alias("_xr2_date"),
-        F.col("from_currency").alias("_xr2_from"),
-        F.col("fx_rate").alias("xr2_rate"),
-    )
-    df = df.join(
-        x2,
-        (df["date"] == x2["_xr2_date"]) & (df[fee_currency_col] == x2["_xr2_from"]),
-        how="left",
-    ).drop("_xr2_date", "_xr2_from")
 
     return df
 
@@ -617,7 +603,6 @@ def transform_visa_baseii(
         df,
         xrate_df,
         src_currency_col="source_currency_code_alphabetic",
-        fee_currency_col="interchange_fee_currency",
         report_currency=report_currency,
     )
 
@@ -770,7 +755,6 @@ def transform_visa_sms(
         df,
         xrate_df,
         src_currency_col="source_currency_code_alphabetic",
-        fee_currency_col="interchange_fee_currency",
         report_currency=report_currency,
     )
 
@@ -887,9 +871,14 @@ def transform_mastercard(
     comercio, iar_country para el emisor) — no requiere join contra una
     tabla de países. Las monedas sí llegan como código ISO 4217 numérico
     y se traducen a alfabético (currency_df) para el join de tipo de
-    cambio; la moneda del fee IAR (rate_currency) ya viene alfabética.
-    El producto se resuelve igual que en Visa: gcms_product_identifier →
-    bin_product_id → range_program_id.
+    cambio. El producto se resuelve igual que en Visa:
+    gcms_product_identifier → bin_product_id → range_program_id.
+
+    Moneda del fee (`calculated_value`, archivos OUT): queda en la moneda
+    de la propia transacción (`trx_ccy`/DE_49, no `rate_currency`) desde
+    el rewrite de `calculate_mastercard_fee_pyspark` — por eso
+    `interchange_fees_amount` usa `xr1_rate` (misma tasa que
+    `transaction_amount`) para ambos `file_type`.
 
     Args:
         df: Parquet operational de IPM_1240 o IPM_1442 (via
@@ -952,20 +941,12 @@ def transform_mastercard(
         how="left",
     ).drop("_currency_numeric", "_src_currency_numeric")
 
-    df = df.withColumn(
-        "_fee_currency_mc",
-        F.when(F.col("file_type") == "IN", F.col("src_currency_alpha"))
-        .otherwise(F.col("rate_currency")),
-    )
-
     df = _join_exchange_rates(
         df,
         xrate_df,
         src_currency_col="src_currency_alpha",
-        fee_currency_col="_fee_currency_mc",
         report_currency=report_currency,
     )
-    df = df.drop("_fee_currency_mc")
 
     is_1442 = F.col("type_mti") == "1442"
 
@@ -1081,7 +1062,7 @@ def transform_mastercard(
         .cast(DoubleType())
         .alias("transaction_amount"),
         (
-            F.coalesce(F.col("xr2_rate"), F.col("xr1_rate"), F.lit(1.0))
+            F.coalesce(F.col("xr1_rate"), F.lit(1.0))
             * F.when(
                 F.col("file_type") == "IN", F.col("amounts_transaction_fee_7_pds_146_7")
             ).otherwise(F.col("calculated_value"))

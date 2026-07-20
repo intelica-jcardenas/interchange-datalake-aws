@@ -718,37 +718,15 @@ def join_with_exchange_rates(
     report_currency_code: str
 ) -> DataFrame:
     """
-    Une el DataFrame BaseII con las tasas de cambio para calcular los importes
-    convertidos a la moneda de reporte del cliente.
+    Une el DataFrame BaseII con la tasa de cambio (X1: source_currency_code
+    numérico → report_currency_code) para convertir trx_amt e itx_amt a la
+    moneda de reporte del cliente.
 
-    En Standard 1.0 se realizaban DOS joins independientes a la misma tabla de
-    tasas de cambio (bajo los alias X1 y X2):
-
-      X1 — Para calcular trx_amt (importe de transacción en moneda de reporte):
-        ON X1.app_processing_date = T1.app_processing_date
-        AND X1.currency_from_code::INTEGER = T1.source_currency_code::INTEGER  ← cód. NUMÉRICO
-        AND X1.currency_to = C1.report_currency_code
-
-      X2 — Para calcular itx_amt (importe de tarifa de intercambio en moneda de reporte):
-        ON X2.app_processing_date = T3.app_processing_date
-        AND X2.currency_from = T3.fee_currency                                  ← cód. ALFABÉTICO
-        AND X2.currency_to = C1.report_currency_code
-
-    Diferencia clave X1 vs X2:
-      · X1 usa currency_from_code (Integer ISO numérico) porque la transacción
-        almacena el código numérico de la moneda origen (source_currency_code).
-      · X2 usa currency_from (String alfabético) porque la tarifa de intercambio
-        está expresada en código alfabético (interchange_fee_currency).
-
-    En Standard 2.0:
-      · El join de fecha se hace sobre app_processing_date = rate_date (ambos String)
-      · Se pre-filtran ambos aliases por report_currency_code (currency_to) para
-        reducir el volumen antes del join
-      · Todas las columnas se renombran con prefijos x1_ / x2_ para evitar
-        conflictos en el DataFrame combinado
-      · Se usa broadcast en ambos aliases por ser tablas de referencia pequeñas
+    Antes había un segundo join (X2, por interchange_fee_currency alfabético)
+    para convertir itx_amt — se eliminó porque interchange_fee_amount_itx ya
+    está en source_currency, no en interchange_fee_currency (ver gotchas.md).
     """
-    log_info(f"Joining with exchange_rate X1 (numeric code) and X2 (alphabetic code) "
+    log_info(f"Joining with exchange_rate X1 (numeric code) "
              f"for report_currency: {report_currency_code}")
 
     # ── Alias X1: join por código NUMÉRICO de moneda origen ───────────────────
@@ -759,14 +737,6 @@ def join_with_exchange_rates(
         F.col("exchange_value").cast(DoubleType()).alias("x1_exchange_value")
     ).filter(F.col("x1_currency_to") == report_currency_code)
 
-    # ── Alias X2: join por código ALFABÉTICO de moneda de tarifa ──────────────
-    exchange_rate_x2 = exchange_rate_df.select(
-        F.col("rate_date").cast(StringType()).alias("x2_rate_date"),
-        F.col("currency_from").alias("x2_currency_from"),
-        F.col("currency_to").alias("x2_currency_to"),
-        F.col("exchange_value").cast(DoubleType()).alias("x2_exchange_value")
-    ).filter(F.col("x2_currency_to") == report_currency_code)
-
     # ── Join X1: source_currency_code (numérico) ↔ currency_from_code ─────────
     df = df.join(
         F.broadcast(exchange_rate_x1),
@@ -775,15 +745,7 @@ def join_with_exchange_rates(
         how="left"
     ).drop("x1_rate_date", "x1_currency_from_code", "x1_currency_to")
 
-    # ── Join X2: interchange_fee_currency (alfabético) ↔ currency_from ────────
-    df = df.join(
-        F.broadcast(exchange_rate_x2),
-        (F.col("app_processing_date") == F.col("x2_rate_date")) &
-        (F.col("interchange_fee_currency") == F.col("x2_currency_from")),
-        how="left"
-    ).drop("x2_rate_date", "x2_currency_from", "x2_currency_to")
-
-    log_info("  Exchange rate joins complete (x1_exchange_value, x2_exchange_value added)")
+    log_info("  Exchange rate join complete (x1_exchange_value added)")
     return df
 
 
@@ -898,14 +860,11 @@ def aggregate_results(df: DataFrame) -> DataFrame:
         Si no hay tasa X1 disponible → COALESCE devuelve 1.0 → importe sin conversión.
         source_amount es el importe original de la transacción (campo T1 en Standard 1.0).
 
-    · itx_amt: SUM(COALESCE(X2.exchange_value, X1.exchange_value, 1) * interchange_fee_amount_itx)
-        Importe total de tarifas de intercambio en moneda de reporte.
-        Cascada de tasas:
-          1. X2: tasa de la moneda de la tarifa (interchange_fee_currency → report_currency)
-          2. X1: tasa de la moneda de la transacción (source_currency → report_currency) como fallback
-          3. 1.0: sin conversión si ninguna tasa está disponible
-        interchange_fee_amount_itx es el importe de tarifa calculado (campo T3.calculated_value
-        en Standard 1.0).
+    · itx_amt: SUM(COALESCE(X1.exchange_value, 1) * interchange_fee_amount_itx)
+        Importe total de tarifas de intercambio en moneda de reporte. Usa la
+        misma tasa X1 que trx_amt (source_currency → report_currency), ya
+        que interchange_fee_amount_itx (= T3.calculated_value) ya está en
+        source_currency — ver gotchas.md.
     """
     log_info("Aggregating results (GROUP BY 12 dimensions)...")
 
@@ -937,13 +896,9 @@ def aggregate_results(df: DataFrame) -> DataFrame:
         ).alias("trx_amt"),
 
         # itx_amt: importe de tarifa de intercambio convertido a moneda de reporte
-        # Cascada: X2 (moneda de tarifa) → X1 (moneda de transacción) → 1.0 (sin conversión)
+        # (misma tasa X1 que trx_amt — interchange_fee_amount_itx ya está en source_currency)
         F.sum(
-            F.coalesce(
-                F.col("x2_exchange_value"),
-                F.col("x1_exchange_value"),
-                F.lit(1.0)
-            ) *
+            F.coalesce(F.col("x1_exchange_value"), F.lit(1.0)) *
             F.coalesce(F.col("interchange_fee_amount_itx"), F.lit(0.0))
         ).alias("itx_amt"),
     )

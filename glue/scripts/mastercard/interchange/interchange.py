@@ -1278,7 +1278,7 @@ def calculate_mastercard_fee_pyspark(
     # STEP 2
     # Cargar tipos de cambio Mastercard: rate_ccy -> trx_ccy
     # ============================================================================
-    ex_settle = (
+    ex_rate = (
         df_exchange_rate
         .filter(F.upper(F.col("brand")) == F.upper(F.lit(brand_fx_eval)))
         .select(
@@ -1287,7 +1287,7 @@ def calculate_mastercard_fee_pyspark(
             F.col("exchange_value").cast("double").alias("exchange_value_num"),
         )
         .dropDuplicates(["currency_from_u", "currency_to_u"])
-        .alias("ex_settle")
+        .alias("ex_rate")
     )
 
     # ============================================================================
@@ -1298,9 +1298,9 @@ def calculate_mastercard_fee_pyspark(
     joined = (
         a.alias("a")
         .join(
-            F.broadcast(ex_settle),
-            (F.col("ex_settle.currency_from_u") == F.col("a.rate_currency_u"))
-            & (F.col("ex_settle.currency_to_u") == F.col("a.trx_currency_u")),
+            F.broadcast(ex_rate),
+            (F.col("ex_rate.currency_from_u") == F.col("a.rate_currency_u"))
+            & (F.col("ex_rate.currency_to_u") == F.col("a.trx_currency_u")),
             "left",
         )
     )
@@ -1317,7 +1317,7 @@ def calculate_mastercard_fee_pyspark(
             | (F.col("a.rate_currency_u") == F.col("a.trx_currency_u")),
             F.lit(1.0),
         )
-        .otherwise(F.col("ex_settle.exchange_value_num"))
+        .otherwise(F.col("ex_rate.exchange_value_num"))
     )
 
     # ============================================================================
@@ -1360,10 +1360,7 @@ def calculate_mastercard_fee_pyspark(
         .when(F.col("a.rate_variable_num").isNull(), F.lit(None).cast("double"))
         .when(F.col("a.amount_transaction_num").isNull(), F.lit(None).cast("double"))
         .when(
-            (F.col("a.rate_currency_u").isNotNull())
-            & (F.col("a.rate_currency_u") != "")
-            & (F.col("a.rate_currency_u") != F.col("a.trx_currency_u"))
-            & F.col("ex_settle.exchange_value_num").isNull(),
+            rate_fixed_trx.isNull() | rate_min_trx.isNull() | rate_cap_trx.isNull(),
             F.lit(None).cast("double"),
         )
         .otherwise(
@@ -1458,65 +1455,72 @@ def write_single_parquet(df: DataFrame, final_file_path: str, region_name: str) 
  
         tmp_prefix = f"{final_key_base}_{tmp_suffix}/"
         tmp_uri = f"s3a://{final_bucket}/{tmp_prefix}"
- 
+
+        try:
+            (
+                df.coalesce(1)
+                .write
+                .mode("overwrite")
+                .parquet(tmp_uri)
+            )
+
+            response = s3.list_objects_v2(Bucket=final_bucket, Prefix=tmp_prefix)
+            part_keys = [
+                obj["Key"]
+                for obj in response.get("Contents", [])
+                if obj["Key"].endswith(".parquet") and "/part-" in obj["Key"]
+            ]
+
+            if not part_keys:
+                raise RuntimeError(f"No se encontró part parquet en {tmp_uri}")
+
+            s3.copy_object(
+                Bucket=final_bucket,
+                CopySource={"Bucket": final_bucket, "Key": part_keys[0]},
+                Key=final_key,
+            )
+
+            log(f"[WRITE] OK -> s3://{final_bucket}/{final_key}")
+        finally:
+            # Best-effort: limpia el prefijo temporal exista lo que exista
+            # ahi (marcador de directorio, part-files, nada) — corre tanto en
+            # el camino feliz como si `write`/`list`/`copy` fallo a mitad de
+            # camino. Relista en vez de reusar `response`: si el fallo ocurrio
+            # antes de esa linea, la variable ni existe.
+            cleanup = s3.list_objects_v2(Bucket=final_bucket, Prefix=tmp_prefix)
+            leftover = [{"Key": obj["Key"]} for obj in cleanup.get("Contents", [])]
+            if leftover:
+                s3.delete_objects(
+                    Bucket=final_bucket,
+                    Delete={"Objects": leftover},
+                )
+        return
+
+    final_path = Path(final_file_path)
+    tmp_dir = final_path.parent / tmp_suffix
+
+    try:
         (
             df.coalesce(1)
             .write
             .mode("overwrite")
-            .parquet(tmp_uri)
+            .parquet(str(tmp_dir))
         )
- 
-        response = s3.list_objects_v2(Bucket=final_bucket, Prefix=tmp_prefix)
-        part_keys = [
-            obj["Key"]
-            for obj in response.get("Contents", [])
-            if obj["Key"].endswith(".parquet") and "/part-" in obj["Key"]
-        ]
- 
-        if not part_keys:
-            raise RuntimeError(f"No se encontró part parquet en {tmp_uri}")
- 
-        part_key = part_keys[0]
- 
-        s3.copy_object(
-            Bucket=final_bucket,
-            CopySource={"Bucket": final_bucket, "Key": part_key},
-            Key=final_key,
-        )
- 
-        delete_objects = [{"Key": obj["Key"]} for obj in response.get("Contents", [])]
-        if delete_objects:
-            s3.delete_objects(
-                Bucket=final_bucket,
-                Delete={"Objects": delete_objects},
-            )
- 
-        log(f"[WRITE] OK -> s3://{final_bucket}/{final_key}")
-        return
- 
-    final_path = Path(final_file_path)
-    tmp_dir = final_path.parent / tmp_suffix
- 
-    (
-        df.coalesce(1)
-        .write
-        .mode("overwrite")
-        .parquet(str(tmp_dir))
-    )
- 
-    part_files = list(tmp_dir.glob("part-*.parquet"))
-    if not part_files:
-        raise RuntimeError(f"No se encontró part parquet en {tmp_dir}")
- 
-    final_path.parent.mkdir(parents=True, exist_ok=True)
- 
-    if final_path.exists():
-        final_path.unlink()
- 
-    shutil.move(str(part_files[0]), str(final_path))
-    shutil.rmtree(tmp_dir, ignore_errors=True)
- 
-    log(f"[WRITE] OK -> {final_path}")
+
+        part_files = list(tmp_dir.glob("part-*.parquet"))
+        if not part_files:
+            raise RuntimeError(f"No se encontró part parquet en {tmp_dir}")
+
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if final_path.exists():
+            final_path.unlink()
+
+        shutil.move(str(part_files[0]), str(final_path))
+
+        log(f"[WRITE] OK -> {final_path}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
  
 def build_output_file_path(
     *,

@@ -1,92 +1,228 @@
 # Pendientes del proyecto
 
-Checklist vivo — solo tareas activas. Lo resuelto se documenta en `decisions.md`/`gotchas.md` (o en la memoria de usuario correspondiente) y se borra de aquí.
-Última actualización: 2026-07-10.
+Checklist vivo — solo tareas activas de **desarrollo de código/pipeline**
+(no sincronización ni documentación de scripts — eso se trackea en la
+memoria de usuario: ver `push_sync_scripts_design.md` e
+`itx_document_script_skill.md`). Lo resuelto se documenta en
+`decisions.md`/`gotchas.md` (o en la memoria de usuario correspondiente)
+y se borra de aquí — no se acumulan items completados con `[x]`.
+Última actualización: 2026-07-11.
 
 ---
 
 ## Pipeline Visa — residuales conocidos (bajos, aceptados)
 
-- [ ] **ATM NO AF + ATM DCC NO AF (SBSA):** 2,015 trx "ATM NO AF" (+59,988 ZAR) + 739 "ATM DCC NO AF" (+3,590 ZAR), count_legacy=0 en ambas. Total ~+63.6K ZAR de 179.7M (0.035%). Investigar qué regla asignaba legacy. Aún no revisado (2026-07-09) — queda pendiente para después.
-- [ ] **ATM JPY rule 1055 vs 1065** (EBGR, 1 transacción): `glue-vi-interchange` asigna 1055 en vez de 1065 — fee_fixed=0.50 USD faltante. Investigar campo diferenciador en `visa_rules`.
+- [ ] **ATM NO AF + ATM DCC NO AF (SBSA):** ~+63.6K ZAR de 179.7M
+  (0.035%), count_legacy=0 en ambos casos. Investigar qué regla asignaba
+  legacy. Sin revisar aún.
+- [ ] **ATM JPY rule 1055 vs 1065 (EBGR, 1 transacción):**
+  `glue-vi-interchange` asigna la regla equivocada, fee_fixed=0.50 USD
+  faltante. Investigar campo diferenciador en `visa_rules`.
 
 ---
 
 ## Pipeline Mastercard — residual conocido (bajo, aceptado por ahora)
 
-- [ ] **jurisdiction_code NULL-vs-off-us (SBSA, MC):** comparativo `get_transaction.py` agrupado por `jurisdiction_code` muestra `NULL`=249 (nuevo) vs 7,326 (legacy) y `off-us`=+6,812 de más en el nuevo — legacy arma `dh_mastercard_calculated_field_*` con INNER JOIN contra IAR (deja esas ~6,800 transacciones sin clasificar), nuestro LEFT JOIN sí las clasifica. Causa parcial confirmada y cuantificada: `calculate_pre2()` usa un envelope de 9 dígitos del PAN (no el PAN real) para el range-join IAR, dando falsos positivos cuando un prefijo de 9 dígitos tiene sub-rangos IAR angostos con huecos — mide ~11% del gap (~764 de 6,812 transacciones, proyectado). Descartado: diferencia de contenido en la tabla IAR (idéntica, 186,454 rangos activos en ambos sistemas). Confirmado que el fix de máscara de PAN y el fix de schema Arrow (ambos reprocesados 2026-07-09) NO tocan este gap — comparativo regenerado dio byte-idéntico al anterior. **89% del gap (~6,000 transacciones) sigue sin causa identificada.** Impacto en dólares mínimo (`interchange_fees_amount_diff` MC = +10,001.28 ZAR de 221.9M, 0.0045%). Detalle completo → `.claude/memory/gotchas.md`. Investigación pausada por bajo impacto — si se retoma: comparar dedup IAR fila-por-fila (no solo conteo) para el residual chico de intra/interregional (+202/+63); investigar el 89% restante.
+- [ ] **jurisdiction_code NULL-vs-off-us (SBSA, MC):** `off-us` con
+  +6,812 de más vs legacy (nuestro LEFT JOIN contra IAR clasifica
+  transacciones que el INNER JOIN de legacy deja sin clasificar). ~11%
+  del gap explicado por el envelope de 9 dígitos del PAN en
+  `calculate_pre2()`; ~89% restante (~6,000 transacciones) sin causa
+  identificada. Impacto en dólares mínimo (+0.0045%). Detalle completo →
+  `.claude/memory/gotchas.md`. Investigación pausada por bajo impacto.
 
 ---
 
-## Pipeline Mastercard — cambios en progreso (sin commitear)
+## Pipeline Mastercard — cambios desplegados sin validar
 
-- [ ] **glue-mc-interchange — rewrite de `calculate_mastercard_fee_pyspark` (moneda del fee):** cambio local sin commitear en `glue/scripts/mastercard/interchange/interchange.py`. Pasa `calculated_fee` de un esquema de 2 pasos a siempre estar en `trx_ccy` (DE_49), 1 paso. Falta: subir a S3, ejecutar `glue-mc-interchange` (`tst_files/reprocessing/reprocess_mc_interchange.py`), validar contra legacy, limpiar columna `settlement_currency_u` sin uso, revisar si reabre los residuales ATM JPY/ATM NO AF de arriba. Detalle en memoria de usuario `mc_interchange_fee_currency_rewrite.md`.
+**Diff revisado 2026-07-20** (`git diff` de los 8 archivos con cambios sin commitear): los 4 scripts de código (`interchange.py`, `get_transaction.py`, `mc_data_quality.py`, `vi_data_quality.py`) coinciden exacto con lo documentado abajo — sin código de debug, sin cambios inesperados. Los 4 compilan limpio (`py_compile`). Los 2 `args.json` modificados son solo cambios de `TempDir` (reorganización de paths en AWS vía sync, trivial). `gotchas.md`/`pending.md` son solo inserciones de documentación. Listo para commit — pendiente de que el usuario lo haga.
+
+- [ ] **glue-mc-interchange — rewrite de `calculate_mastercard_fee_pyspark`
+  (moneda del fee) — YA COMMITEADO Y DESPLEGADO, verificado 2026-07-14**
+  (corrección: se creía "cambio local sin commitear", no lo era). El
+  rewrite (`calculated_fee` siempre en `trx_ccy`/DE_49, en 1 paso) está
+  commiteado desde `0d9ae133` ("Update 20260705 - Scheme Fee 1st
+  Version", 2026-07-05/06) y confirmado desplegado en AWS (`aws s3api
+  head-object` sobre el script en `s3-reference`: `LastModified
+  2026-07-11`, mismo día del rollout de `push-glue.ps1`). Sigue
+  pendiente lo real: (1) no hay ningún comparativo contra legacy
+  corrido DESPUÉS de este cambio — el último comparativo MC (2026-06-30,
+  +10,001 ZAR/+0.0045%) es anterior al rewrite y valida la lógica vieja
+  de 2 pasos, no esta; (2) columna `settlement_currency_u` (línea ~1274)
+  queda calculada y confirmada sin ningún uso posterior — candidata a
+  limpieza; (3) sin revisar si esto reabre/explica los residuales ATM de
+  arriba. Detalle completo → memoria de usuario
+  `mc_interchange_fee_currency_rewrite.md` (desactualizada en el punto
+  de "sin commitear", el resto sigue vigente).
+- [ ] **get_transaction.py / mc_data_quality.py — fix de moneda del fee
+  MC aplicado localmente (2026-07-14), sin desplegar ni validar.**
+  Ambos asumían `calculated_value` en `rate_currency` (comportamiento
+  viejo); ya se corrigieron para usar `trx_ccy`/DE_49 (decisión tomada
+  con el usuario: mantener el rewrite de interchange y actualizar los
+  reportes, en vez de revertir el rewrite). **Ojo:** el SP legacy real
+  (`sql/get_mastercard_transactions.sql`) sí usa `rate_currency` — este
+  fix hace que `interchange_fees_amount`/validación MC OUT YA NO
+  coincida con legacy en transacciones cross-currency (antes sí
+  coincidía). Falta: (1) correr comparativo real contra legacy para
+  cuantificar ese residual nuevo y aceptado; (2) subir ambos scripts a
+  S3 vía `push-glue.ps1`; (3) commitear (lo hace el usuario). Detalle
+  completo → `.claude/memory/gotchas.md`.
+- [ ] **vi_data_quality.py — mismo fix de moneda aplicado a Visa
+  (2026-07-14), sin desplegar ni validar.** `itx_amt` (BASEII) usaba
+  `interchange_fee_currency` para convertir el fee, cuando
+  `interchange_fee_amount_itx` ya está en `source_currency` desde
+  siempre (no hubo rewrite en Visa, el script nunca se alineó con esa
+  convención). Corregido a usar solo `X1`/`xr1_rate` (misma tasa que
+  `trx_amt`), eliminado el join `X2` redundante. Riesgo bajo — el job
+  solo tiene un smoke test, nunca se validó `itx_amt` a fondo contra
+  legacy. Falta: subir a S3, correr con datos reales y comparar
+  antes/después. Detalle completo → `.claude/memory/gotchas.md`.
+- [ ] **Plan de despliegue EJECUTADO para SBSA (2026-07-15/16) — falta
+  correr la comparación y EBGR queda pendiente.** Los 4 scripts
+  (`interchange.py`, `get_transaction.py`, `mc_data_quality.py`,
+  `vi_data_quality.py`) confirmados subidos a S3 (`head-object`:
+  `interchange.py` 2026-07-16T15:52, los otros 3 el 2026-07-15T19:31).
+  `glue-mc-interchange` reprocesado para SBSA enero 2026 el 2026-07-16
+  ~10:42 (104/104 SUCCEEDED). `glue-get-transaction` corrido con los
+  cambios ya desplegados: `jr_0a90f54d...` (SBSA, `report_suffix=
+  sbsa_202601`, `--scheme_fee false`, 2026-07-16 16:24–16:40,
+  SUCCEEDED) → parquet en `s3-analytics/SBSA/reports/
+  report_transactions_SBSA_sbsa_202601.parquet/` (3.0 GiB). Antes de
+  correr ese job se respaldó el reporte SBSA anterior (pre-fix, del
+  2026-07-09) como `tst_files/reporting/sbsa/
+  report_transactions_SBSA_sbsa_202601_BEFORE_feefix.parquet`. El nuevo
+  se descargó el 2026-07-17 como `..._AFTER_feefix.parquet`.
+  **A/B interno (2026-07-17, `compare_before_after_feefix.py`, lógica
+  vieja vs nueva mismo dataset):** VI sin diferencia; MC
+  `interchange_fees_amount` -11,733.14 ZAR/-0.0051%, concentrado en
+  `jurisdiction_code=intraregional`, `nulls_fee` sin cambio.
+  **Validación contra legacy (2026-07-17, `compare_sbsa_after_feefix.py`
+  — copia de `compare_sbsa.py` apuntando al parquet post-fix, cache
+  legacy separada `legacy_acc_cache_sin_cuotas.pkl`):** MC
+  `interchange_fees_amount` **-1,252.82 ZAR de 221.9M (-0.00056%)** —
+  mejora clara vs. el baseline 2026-06-30 (+10,001 ZAR/+0.0045% con la
+  lógica vieja), cambió de signo y se achicó ~8x. VI sin cambio
+  (+68,285/+0.038%, residual ya conocido ATM NO AF/DCC). El gap
+  `jurisdiction_code` NULL-vs-off-us de MC confirmado sin cambio (no lo
+  toca el fix de moneda, es problema de join en `calculate_pre2()`).
+  `scheme_fees_amount` 0=0 en ambos lados (columna existe en la tabla
+  legacy pero sin poblar). **EBGR sigue sin reprocesar/re-comparar**
+  (todo esto fue solo para SBSA) — pero confirmado (2026-07-17, código +
+  datos S3) que es de bajo valor esperado: `get_transaction.py` solo lee
+  `calculated_value` (el campo que cambia con este fix) para archivos
+  **OUT**; los **IN** usan `amounts_transaction_fee_7_pds_146_7`, un
+  campo no afectado. EBGR es abrumadoramente IN — `s3-operational/EBGR/
+  MC/IPM_1240/`: 132 archivos IN (5.05 GB) vs 21 archivos OUT (2.66 MB
+  total, ~0.05% del volumen), aunque sí hay OUT en 17 fechas de enero
+  2026 (no faltan por completo). El residual esperado de repetir el
+  ciclo en EBGR sería ínfimo — de baja prioridad, no descartado del
+  todo. Sigue sin decidirse si esto reabre los residuales ATM de
+  `pending.md`. Detalle completo → memoria de usuario
+  `mc_interchange_fee_currency_rewrite.md`.
 
 ---
 
-## Reporting (`get_transaction.py`)
+## Reporting (`get_transaction.py` / `scheme_fee.py`)
 
-- [x] **`scheme_fees_amount` (cuotas) — unificación get_transaction.py + scheme_fee.py — VALIDADO END-TO-END (2026-07-10) con costos dummy.** Falta solo validar con costos REALES (ver pendiente al final).
-
-  **Diseño:** `load_scheme_fee_costs(client_id, start_date, analytics_bucket)` en `get_transaction.py` lee `s3-analytics/{client}/scheme_fee/final/{report_month}/detail/` (`report_month` derivado de `start_date`, asume rango dentro de un único mes calendario), traduce `app_hash_file→file_id`, `app_id→row_id`, `business_mode_id→business_mode_code` (A/I), `unitary_scheme_fee_cost→scheme_fees_amount`. En `process_client_range()`, solo si `--scheme_fee=true`: `LEFT JOIN` por `(file_id, row_id, business_mode_code)`, `fillna(0.0)` si no hay match (decisión deliberada — legacy deja `NULL`, ver razón abajo).
-
-  **Diseño del join VALIDADO contra el SQL legacy real** (no solo contra los scripts EC2 de scheme fee): `sql/get_visa_base_ii_transactions.sql`, `get_visa_sms_transactions.sql`, `get_mastercard_transactions.sql` (invocados desde `sql/generate_transaction_table.sql`, el SP real). Legacy hace `LEFT JOIN mh_transaction_scheme_fee S1 ON app_hash_file+app_id+transaction_brand` (sin `table_description`, genera fan-out temporal en transacciones on-us con duplicado) → filtra `table_description <> '...ON-US DUP...'` para quedarse con la original → segundo join separado, filtrado a `table_description='...ON-US DUP...'`, para el costo del duplicado. Nuestro join `(file_id, row_id, business_mode_code)` es equivalente matemático (business_mode_id es único por fila, máx. 2 filas por file_id+row_id) — un solo join en vez de join+where+join. Confirmado también: el gating `dup_on_us and SCHEME_FEE` coincide literal con `duplicate_on_us_flag IS TRUE AND param_scheme_fee IS TRUE` de legacy; legacy tampoco niega `scheme_fees_amount` en reversales (solo `transaction_amount`/`interchange_fees_amount`); `transaction_brand` en el join legacy es redundante en el pipeline nuevo porque `file_id`(=content_hash) ya es único por archivo físico.
-
-  **`table_description` corregido a los literales exactos del legacy** (`getquery.py`) en `scheme_fee.py`: VISA BASEII `"VISA ACQ"`/`"VISA ISS"` (antes: `"VISA"` fijo, sin distinguir), dup `"VISA ON-US DUP (ACQ TO ISS)"`; SMS `"VISA SMS"` (sin cambio) / dup `"VISA ON-US DUP (SMS TO ISS)"`; MasterCard `"MASTERCARD ISS AND ACQ"` (antes `"MasterCard"`) / dup `"MASTERCARD ON-US DUP (ACQ TO ISS)"`. `_apply_duplicate_on_us()` recibe el literal exacto por brand como parámetro. No afecta `GROUP_DIMS` (el reporte agregado no cambia, solo el detalle).
-
-  **Bug real encontrado y corregido:** `get_client_config()` en `get_transaction.py` casteaba mal `dup_on_us_visa`/`dup_on_us_mc` con `bool(item.get(...))` — `bool("FALSE")` es `True` en Python. Afectaba a EBGR/NXGR/DEMO (guardan el flag como string literal `"FALSE"` en DynamoDB), enmascarado hasta ahora porque el default de `--scheme_fee` en AWS es `"false"`. Corregido con el mismo parseo explícito que ya usaba `scheme_fee.py`. De paso corregido `report_currency` (afecta a BTRLRO, campo presente pero vacío).
-
-  **Validación real ejecutada (2026-07-10), SBSA/202601** — ambos scripts subidos a S3 y corridos de punta a punta: `scheme_fee.py --mode generate --force true` (452,531 filas de reporte) → CSV IN simulado con costos dummy (`txn_sfc`=0.25% de `txn_amt`) → `--mode read` (0 filas con costo NULL) → `get_transaction.py --scheme_fee true` (120,147,824 filas, 99.9994% con `scheme_fees_amount` poblado — solo 758 filas sin match). Comparado agregadamente contra `analytics.report_transactions_sbsa_202601_tst_sf` (tabla legacy real, corrida por el usuario con `param_scheme_fee=true`, costos REALES):
-  - **MC: count match exacto** (82,358,209=82,358,209), `transaction_amount` exacto, `interchange_fees_amount` diff=+10,001.28 (+0.0045%) — **idéntico al residual ya conocido y aceptado antes de este trabajo**, sin relación con scheme_fee.
-  - **VI: diffs 100% explicados por residuales ya conocidos, ninguno nuevo.** `count` diff=+38,155, de los cuales 37,616 son el gap ya documentado de `jurisdiction_code=""` (INNER JOIN de ARDEF en legacy). `interchange_fees_amount` diff=+68,285.41 (+0.038%), concentrado en `jurisdiction=interregional` — consistente con el residual ya conocido de ATM NO AF/ATM DCC NO AF.
-  - `scheme_fees_amount` no es comparable en monto (dummy vs costos reales de legacy) — la validación de VALOR real queda pendiente (ver abajo).
-  - **Conclusión: el mecanismo de duplicado on-us + join de costos no introduce ningún problema nuevo** — todos los diffs observados ya existían y estaban aceptados antes de activar scheme_fee.
-  Scripts (`tst_files/`, gitignored): `scheme_fee_reports/run_scheme_fee_union_test.py` (orquestador AWS), `scheme_fee_reports/compare_scheme_fee_union_sbsa.py` (comparativa vs legacy). Reporte: `scheme_fee_reports/union_test/comparativo_scheme_fee_union_sbsa.md`. Muestras Parquet refrescadas en `scheme_fee_parquet_samples/{generate_state,read_final}/`.
-
-  **Pendiente real que queda:**
-  - Validar con costos REALES (no dummy) una vez que haya un ciclo real `--mode read` con el CSV devuelto por el equipo externo.
-  - Reactivar SMS en `get_transaction.py` (comentado deliberadamente, decisión del usuario 2026-07-10) — mientras tanto, los `scheme_fees_amount` de las filas SMS de `scheme_fee.py` (que sí tiene SMS activo) no se propagan a ningún lado.
-  - ~~Commitear a git todos los cambios de esta sesión~~ — hecho (`5cf059d`, `8f2183c`, ver sección Scheme Fee más abajo).
-- [x] **REACTIVAR BASEII y MC en `process_client_range()`** (2026-07-09) — hecho, código y S3 sincronizados.
-- [x] **SMS transform — activado y validado (2026-07-09)** — `count` y `transaction_amount` cuadran exacto contra `get_visa_sms_transactions()` real (SBSA enero 2026): 1,472,615=1,472,615, $1,059,497,522.78 exacto. Bug real encontrado y corregido (`xr3_rate` hardcodeado a USD para el fallback de `cryptogram_amount`, revertido un intento fallido de usar `xr2_rate` en fees que causaba doble conversión). Detalle en `gotchas.md`.
-- [ ] **SMS vuelve a estar comentado en `process_client_range()`** (2026-07-09, a pedido del usuario) — mientras se trabaja en la unificación `get_transaction.py`+`scheme_fee`. Reactivar cuando se retome (el fix ya está en el código, solo comentado). No se corrió la validación final BASEII+SMS+MC juntos (el job se canceló) — pendiente confirmar que la unión de los 3 frames no rompe nada cuando se reactive.
-- [ ] **`interchange_fees_amount` de SMS +60.55% de más, concentrado 100% en `transaction_type_id=22`** (ATM cash withdrawal) — no es bug de `get_transaction.py` (ya validado), es del cálculo de fee en `glue-vi-interchange` para el `type_record` SMS. Ver `gotchas.md` para el desglose y candidatos de causa. Pendiente investigar y reprocesar de ser necesario — no bloquea el resto del reporting.
-
----
-
-## Scheme Fee (cuotas) — `glue-scheme-fee`
-
-`--mode generate` **validado end-to-end** (2026-07-08): auditoría campo por campo completa contra el legacy (`getquery.py`/`managment.py`), residuales explicados y aceptados (VISA: INNER JOIN de ARDEF en legacy que nuestro LEFT JOIN no replica, +0.03%; MC: swap DE_4/DE_5 en transacciones cross-currency, decisión de mantenerlo — ver `decisions.md`). Historia completa de diseño, bugs encontrados/corregidos y validaciones en memoria de usuario `scheme_fee_job_design.md`.
-
-`--mode read` **validado end-to-end** (2026-07-08). Se encontraron y corrigieron 2 bugs reales durante la validación:
-1. Join `detail_df.join(cost_by_group, on=GROUP_DIMS, how="left")` en `update_report_and_propagate()` usaba igualdad estándar de Spark (`NULL == NULL` → false), dejando 3.2% de las filas de detalle (3,895,101 de 121,072,180) sin costo propagado. Fix: `eqNullSafe` columna por columna.
-2. Ese mismo fix reveló un segundo bug: `report_df.toPandas()` en `run_generate()` convertía `range_program_id` (int32, con nulls) a `float64` con NaN — al reconvertir a Spark, ese NaN se persistía como valor real (no NULL), rompiendo el `eqNullSafe` para esos 755 grupos (40,302 filas). Fix: sanitizar NaN→None antes de `spark.createDataFrame()`.
-
-De paso se corrigió también el `app_id` de Mastercard en `transform_mastercard_scheme_fee()` (`F.monotonically_increasing_id()` → `F.col("ref_id")`), necesario para poder cruzar el costo de scheme fee contra `get_transaction.py` a nivel de transacción individual.
-
-Ambos fixes desplegados a S3 y **re-validados con una corrida real completa** (`--mode generate --force true` + `--mode read`, SBSA/202601): 0 filas con costo NULL (antes 40,302), y 5/5 transacciones MC de muestra cruzadas exitosamente contra el operational real por `content_hash`+`ref_id`. Detalle completo en memoria de usuario `scheme_fee_job_design.md` y en `.claude/memory/scheme_fee_generate_read_pipeline.md`.
-
-- [x] **Commitear a git** — hecho en 2 commits del usuario, pusheados a `main`: `5cf059d` ("Fixes Clean, GT & SF", 2026-07-10) con `lambdas/visa/clean` + `lambdas/mastercard/clean` (fix máscara account_number/pan_de_2), `lambdas/mastercard/store` (fix schema CAL/ITX), `glue/scripts/mastercard/calculate/calculate.py` (fix schema Arrow en `save_parquet()`) y una primera tanda de `get_transaction.py`/`scheme_fee.py`; y `8f2183c` ("Unify GT & SF", 2026-07-10) con el resto de `get_transaction.py` (fix `get_client_config()` dup_on_us/report_currency + join `scheme_fees_amount`) y `scheme_fee.py` (`table_description` exacto a legacy). Verificado con `git log`/`git show --stat` — ambos commits contienen exactamente los archivos esperados.
-- [ ] **Retirar `.claude/memory/scheme_fee_generate_read_pipeline.md`** (marcado como temporal) una vez que Scheme Fee se dé por cerrado — fusionar lo que siga siendo relevante a `decisions.md`/`gotchas.md`.
+- [ ] **Validar `scheme_fees_amount` con costos REALES** (no dummy) —
+  pendiente de un ciclo real `--mode read` con el CSV devuelto por el
+  equipo externo de cuotas. Diseño y validación estructural ya cerrados
+  (ver `project_status.md` / memoria de usuario `scheme_fee_job_design.md`).
+- [ ] **Reactivar SMS en `process_client_range()`** — comentado a
+  propósito (2026-07-09) mientras se completaba la unificación con
+  scheme_fee; el fix ya está en el código, solo falta descomentar y
+  re-validar la unión BASEII+SMS+MC juntos (la última corrida con los 3
+  frames activos se canceló antes de confirmar que no rompe nada).
+- [ ] **`interchange_fees_amount` de SMS +60.55% de más**, concentrado
+  100% en `transaction_type_id=22` (ATM cash withdrawal) — bug en
+  `glue-vi-interchange` (asignación de fee), no en `get_transaction.py`.
+  Detalle completo → `.claude/memory/gotchas.md`. No bloquea el resto del
+  reporting.
+- [ ] **Retirar `.claude/memory/scheme_fee_generate_read_pipeline.md`**
+  (marcado como temporal) una vez que Scheme Fee se dé por cerrado (ver
+  pendiente de costos reales arriba) — fusionar lo que siga siendo
+  relevante a `decisions.md`/`gotchas.md`.
 
 ---
 
 ## Infraestructura AWS
 
-- [ ] **Rol IAM `itx-lambda-extract-role`** — `lmbd-vi-extract` comparte rol del router. Crear rol propio con permisos mínimos.
-- [ ] **Rol IAM `itx-glue-crawler-ebgr-role`** — crawler Mastercard sin rol propio.
-- [ ] **Agregar `s3-reference/currency/` como target** a un crawler existente (ej. `itl_0004_itx_dev_02_glue_crawler_exchange_rates`) o crear uno dedicado — baja prioridad. El job `glue-exchange-rates` lee el contenido en vivo (no depende del catálogo), así que solo protege contra un futuro cambio de schema en `currency/`.
+- [ ] **Rol IAM `itx-lambda-extract-role`** — `lmbd-vi-extract` comparte
+  rol del router. Crear rol propio con permisos mínimos.
+- [ ] **Rol IAM `itx-glue-crawler-ebgr-role`** — crawler Mastercard sin
+  rol propio.
+- [ ] **Agregar `s3-reference/currency/` como target** a un crawler
+  existente (ej. `itl_0004_itx_dev_02_glue_crawler_exchange_rates`) o
+  crear uno dedicado — baja prioridad.
 
 ---
 
-## Documentación / cleanup legacy
+## Housekeeping S3 (bajo impacto, no urgente)
 
-- [ ] **Eliminar archivos con convención antigua** — `.env.example`, `step-functions/README.md`, `lambdas/router/README.md`, `infrastructure/deploy.sh`, `iam/README.md`, `CHANGELOG.md`. Recrear README.md por carpeta con nomenclatura actual antes de eliminar.
-- [ ] **`infrastructure/terraform/stepfunctions.tf`** — define 1 SFN (`itx_main_orchestrator`) pero AWS tiene 2 (`sfn-vi`, `sfn-mc`). Actualizar a 2 recursos antes de reescribir.
-- [ ] **Renombrar crawlers/databases Glue con prefijo `itx-` consistente** — los 16 objetos planeados en `glue/GLUE_CATALOG_CREATION.md` existen pero con nombres reales que omiten `intchg`. Ver sección "Estado de verificación" de ese archivo.
+- [ ] **Carpetas `_$folder$` en Visa (staging/reference)** — marcador 0 bytes que
+  Hadoop/Spark crea por cada partición nueva al escribir con el writer nativo
+  de Spark (`df.coalesce(1).write.parquet(path)`, usado en
+  `visa/calculate/calculate.py` y `visa/interchange/interchange.py`). Se
+  regenera en cada corrida nueva — borrar los existentes no sirve de nada
+  sin cambiar el mecanismo de escritura. Investigado 2026-07-16: MC no lo
+  sufre porque `mastercard/calculate/calculate.py` (`save_parquet`, linea
+  ~1374) evita el writer nativo de Spark — hace `toPandas()` + escribe con
+  PyArrow directo al path exacto (sin pasar por el committer de Hadoop que
+  crea el marcador) — pero esa tecnica no es segura para Visa por volumen
+  (`toPandas()` colapsa todo a memoria del driver; los archivos de Visa
+  cubren la corrida completa, no un mensaje individual como MC). **La
+  alternativa que sí escalaria:** el patron `write_single_parquet()` de
+  `mastercard/interchange/interchange.py` (el mismo que ya se le agrego
+  `try/finally`) — escribe con el writer nativo de Spark (distribuido, sin
+  colapsar a pandas) a un prefijo temporal, y solo copia el part-file
+  resultante al nombre final via `copy_object` (boto3, sin pasar los datos
+  por el driver). Aplicar ese mismo patron a `visa/calculate.py`/
+  `visa/interchange.py` eliminaria los `_$folder$` sin el riesgo de OOM de
+  la tecnica de MC-calculate. No evaluado aun si vale la pena el esfuerzo
+  vs. el beneficio (es cosmetico, 0 bytes, no rompe nada hoy).
+
+---
+
+## Cleanup legacy (convención antigua)
+
+- [ ] **Revisar los 3 "legacy sin reemplazo" — NO son igual de descartables**
+  (verificado 2026-07-13, leyendo el contenido real de los 3, no solo el
+  nombre):
+  - `CHANGELOG.md`: sin valor, congelado en v1.0.0 (2026-04-08), nunca se
+    actualizó. Todo lo que dice ya lo cubren `decisions.md`/`gotchas.md`/
+    este mismo archivo de forma viva. Borrar sin reemplazo, esto sí está
+    confirmado.
+  - `.env.example`: **SÍ sirve** — ya tiene casi toda la convención
+    actual (`itl-0004-itx-dev-intchg-02-*`) y el `README.md` raíz lo
+    referencia en el paso de Deploy (`cp .env.example .env`). Solo 2
+    fixes, no borrar: el ARN de Step Function apunta al viejo
+    `itx-main-orchestrator` en vez de `sfn-vi`/`sfn-mc` (y falta variable
+    para la 2da SFN), y falta `DYNAMODB_TABLE_MASTERCARD_FIELDS`.
+  - `infrastructure/deploy.sh`: dudoso, no descartar sin decidir. Cubre
+    solo ~30% de la infraestructura actual (nada de Mastercard, ARDEF/
+    IAR, exchange-rates, 7 de los 9 Glue jobs, 1 sola Step Function) con
+    nombres viejos — no reproduce el pipeline real si se corre hoy. Pero
+    Terraform TAMPOCO está completo (ver el pendiente de
+    `stepfunctions.tf` abajo) — hoy ningún camino de IaC despliega el
+    pipeline completo a un ambiente nuevo, que es justo lo que va a
+    necesitar el pendiente de "Ambiente empresarial" más abajo. Decidir:
+    ¿actualizar deploy.sh a la paridad actual, o abandonarlo a favor de
+    completar Terraform? No decidir por default a "borrar sin más".
+- [ ] **`infrastructure/terraform/stepfunctions.tf`** — define 1 SFN
+  (`itx_main_orchestrator`) pero AWS tiene 2 (`sfn-vi`, `sfn-mc`).
+  Actualizar a 2 recursos antes de reescribir.
+- [ ] **Renombrar crawlers/databases Glue con prefijo `itx-` consistente**
+  — los 16 objetos planeados en `glue/GLUE_CATALOG_CREATION.md` existen
+  pero con nombres reales que omiten `intchg`. Ver sección "Estado de
+  verificación" de ese archivo.
+- [ ] **Carpeta `sqs/` completamente vacía** (verificado 2026-07-15) — el
+  pipeline actual no usa SQS (reemplazado por eventos S3 + Step
+  Functions, ver CLAUDE.md). Candidato a eliminar si se confirma que es
+  remanente del scaffolding inicial — no decidido todavía.
 
 ---
 
 ## Ambiente empresarial
 
-- [ ] **Testing end-to-end en ambiente empresarial** — pendiente cuando el ambiente esté disponible.
+- [ ] **Testing end-to-end en ambiente empresarial** — pendiente cuando
+  el ambiente esté disponible.
