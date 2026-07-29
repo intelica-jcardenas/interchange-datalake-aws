@@ -323,7 +323,8 @@ def _rename_rules(rules_pd: pd.DataFrame, type_record: str) -> pd.DataFrame:
             "acquirer_country", "acquirer_region", "authorized_amount",
             "business_format_code", "merchant_vat", "national_tax_indicator",
             "prepaid_card_indicator", "summary_commodity",
-            "transaction_code_qualifier", "type_purchase"
+            "transaction_code_qualifier", "type_purchase",
+            "settlement_flag", "token_requestor_id", "cashback",
         ]
     else:
         return rules_pd
@@ -428,7 +429,7 @@ CONDITIONS_TO_SKIP = {
     "fee_descriptor", "fee_description", "fee_currency", "fee_variable",
     "fee_fixed", "fee_min", "fee_cap", "jurisdiction", "fee_program",
     "guide_date", "fpi", "cod_hierarchy", "program_default",
-    "source_currency_code_alphabetic", "cashback", "message_identifier",
+    "source_currency_code_alphabetic", "message_identifier",
     "validation_code", "v_i_p_full_financial_message_sets", "sender_data",
     "additional_sender_data", "settlement_service", "other_criteria_applies"
 }
@@ -444,6 +445,8 @@ COLUMN_GROUP_SPACE = {
     "moto_eci_indicator", "acceptance_terminal_indicator", "merchant_vat",
     "mail_telephone_or_electronic_commerce_indicator"
 }
+
+COLUMN_GROUP_YES_NO = {"cashback"}
 
 
 def _apply_default(
@@ -564,6 +567,43 @@ def _apply_greater_less(
     return batch
 
 
+def _apply_yes_no(
+    condition_name: str,
+    condition_value: str,
+    batch: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Evalúa una condición de COLUMN_GROUP_YES_NO (`cashback`) — columnas que
+    en `visa_rules` se expresan como bandera "Yes"/"No" pero cuyo campo
+    transaccional real es un monto (ej. `cashback`, monto con 2 decimales).
+    Replica `visa_interchange_rule_assign` (`adapters.py`, legacy real):
+    "No" → monto == 0; cualquier otro valor ("Yes") → monto > 0.
+
+    Diferencia con legacy: legacy hace `.astype(int)` antes de comparar, lo
+    que trunca cualquier monto entre 0.01 y 0.99 a 0 (falso "No" para un
+    cashback real pero menor a 1 unidad). Acá se compara el monto numérico
+    tal cual (sin truncar) — corrige ese truncamiento en vez de replicarlo.
+    Nulos se tratan como "sin cashback" (0.0).
+
+    Args:
+        condition_name: Columna de monto a evaluar (siempre `cashback` en
+            la práctica, ver COLUMN_GROUP_YES_NO).
+        condition_value: Valor de la condición tal como viene en
+            `visa_rules`, "Yes" o "No".
+        batch: Sub-batch de transacciones aún sin matchear para esta regla.
+
+    Returns:
+        Subconjunto de `batch` que cumple la condición.
+
+    Ejemplo:
+        _apply_yes_no("cashback", "No", batch)
+    """
+    amounts = pd.to_numeric(batch[condition_name], errors="coerce").fillna(0.0)
+    if condition_value.strip().upper() == "NO":
+        return batch[amounts == 0]
+    return batch[amounts > 0]
+
+
 def _apply_amount_currency(
     condition_name: str,
     condition_value: str,
@@ -651,9 +691,10 @@ def _apply_condition_pandas(
     Despacha la evaluación de una condición de regla al evaluador correcto
     según a qué grupo de columnas pertenece `condition_name`:
     COLUMN_GROUP_GREATER_LESS → `_apply_greater_less`,
-    COLUMN_GROUP_AMOUNT_CURRENCY → `_apply_amount_currency`, cualquier otra
-    columna → `_apply_default` (lista de valores). Condiciones vacías/NaN/
-    "NONE" en la regla se consideran "sin restricción" y no filtran nada.
+    COLUMN_GROUP_AMOUNT_CURRENCY → `_apply_amount_currency`,
+    COLUMN_GROUP_YES_NO → `_apply_yes_no`, cualquier otra columna →
+    `_apply_default` (lista de valores). Condiciones vacías/NaN/"NONE" en la
+    regla se consideran "sin restricción" y no filtran nada.
 
     Args:
         condition_name: Nombre de la condición/columna a evaluar.
@@ -676,6 +717,8 @@ def _apply_condition_pandas(
         return _apply_greater_less(condition_name, condition_value, batch)
     elif condition_name in COLUMN_GROUP_AMOUNT_CURRENCY:
         return _apply_amount_currency(condition_name, condition_value, rule, batch, rates_pd)
+    elif condition_name in COLUMN_GROUP_YES_NO:
+        return _apply_yes_no(condition_name, condition_value, batch)
     else:
         return _apply_default(condition_name, condition_value, batch)
 

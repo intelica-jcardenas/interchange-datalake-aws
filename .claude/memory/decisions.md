@@ -6,6 +6,46 @@ Las decisiones con implementación/validación extensas fueron resumidas aquí �
 
 ---
 
+## Refresh de visa_rules desde excel V37 + 3 fixes en calculate.py/interchange.py — DESPLEGADO Y VALIDADO 2026-07-28
+
+**Decisión:** `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_rules/data.parquet` fue reemplazado por el resultado de re-interpretar `VISA Reglas Intercambio V37.xlsx` (excel legacy más reciente) con una réplica local de `InterchangeRules.read_rules_visa()` (`tst_files/interchange_rules/build_and_compare_rules.py`). El `data.parquet` anterior (cargado 2026-05-18, nunca refrescado desde entonces) quedó respaldado en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_rules_backup_pre_v37_20260728/data.parquet`.
+
+**Por qué:** el excel V37 trae 2 columnas de condición nuevas (`settlement_flag`, `token_requestor_id`) respecto al schema anterior (79→81 columnas), más cambios de contenido (4,260 altas, 213 bajas/renumeraciones, ~2,480 reglas que pasan de `valid_until` abierto a una fecha de cierre real). El hallazgo más relevante: sin el refresh, el pipeline podía seguir aplicando reglas que Visa ya había dado de baja (tratadas como "vigentes hasta hoy" por el `fillna(date.today())` de `load_visa_rules()`).
+
+**3 fixes aplicados en código antes de subir el parquet** (ver `.claude/memory/gotchas.md` para el detalle de investigación de cada uno):
+1. `glue-vi-calculate`: nueva función `calc_token_requestor_id_draft()` — deriva `BLANK`/`VALID`/`INVALID` desde `token_requestor_id_sd`/`_sp` (raw fields ya existentes en `visa_fields`), replicando exacto la lógica de `adapters.py` (`load_visa_interchange`). Agregada a `calculate_baseii_fields()` y a su `output_columns`.
+2. `glue-vi-interchange`: `settlement_flag`/`token_requestor_id` agregados a `drop_cols` de SMS en `_rename_rules()` — ninguno de los 2 existe como campo crudo para `type_record="sms"` en `visa_fields`, así que sin el drop el motor de reglas haría `KeyError` contra un batch SMS si una regla con esa condición activa cayera en esa jurisdicción.
+3. `glue-vi-interchange`: **`cashback` removido de `CONDITIONS_TO_SKIP`** (bug preexistente, no introducido por V37 — la columna ya existía en el schema viejo) + nuevo `COLUMN_GROUP_YES_NO`/`_apply_yes_no()`, replicando el mecanismo real de `visa_interchange_rule_assign` (`adapters.py` línea ~5160: regla "No" → monto `==0`, "Yes"/cualquier otro valor → monto `>0`). Diferencia deliberada vs legacy: no se replica el truncamiento a entero de legacy (`.astype(int)`, que clasificaría mal un cashback real entre 0.01 y 0.99) — se compara el float directamente. También agregado a `drop_cols` de SMS (no existe como campo crudo para SMS).
+
+**Fields explícitamente dejados sin implementar (decisión del usuario):** `message_identifier`/`validation_code` — tienen lógica real en `adapters.py` (`coalesce(t.message_identifier::text,'BLANK')`, etc.) pero el usuario los identificó marcados en el excel con un color que indica "no debe tomarse en cuenta todavía". Quedan en `CONDITIONS_TO_SKIP`, sin tocar.
+
+**Validación antes de subir el parquet (orden crítico — código primero, luego datos):**
+1. Desplegado `calculate.py`/`interchange.py` a S3 (`push-glue.ps1 -Group vi -Force`), confirmado byte a byte contra la versión local.
+2. Smoke test contra las reglas VIEJAS (`glue-vi-calculate` + `glue-vi-interchange`, EBGR `93BF199C85D2DF243AFDABEE5572E8C0`/2026-01-03 y SBSA `7102B505635CCF3C8E8BE335DACA3193`/2026-01-27, encontrados vía Athena por jurisdicción `region_country_code='5'` Europa Intraregional y `region_country_code='ZA'`+`cashback>0` respectivamente) — SUCCEEDED en las 4 corridas, sin errores. Confirmó que el código nuevo no rompe nada contra datos reales antes de tocar la tabla de reglas.
+3. Recién ahí: backup + subida de `visa_rules_new.parquet`, y re-corrida de `glue-vi-interchange` para los mismos 2 archivos — SUCCEEDED ambos (EBGR 484s, SBSA 374s). EBGR: 269,695/269,725 filas matchearon una regla (99.99%), tasa sana.
+
+**Limitación conocida de la validación (aceptada por el usuario):** ninguna transacción de los 2 archivos de prueba matcheó específicamente una de las 7 reglas con `token_requestor_id="Valid"` (categorías AFT/token muy angostas, y el motor es first-match-wins — plausible que jurisdicción Europa ya matcheara con una regla anterior antes de llegar a esas 7). Tampoco se pudo probar `cashback` con matching real — ninguna vigencia de esa regla (ni vieja ni nueva) cubre enero 2026 (la última vigencia cierra 2025-06-30). La validación de "no rompe nada" está confirmada; la validación de "el criterio filtra correctamente cuando debería decidir un match" queda solo a nivel de código + función aislada, no probada end-to-end con datos reales.
+
+**Pendiente:** commitear los cambios (lo hace el usuario). Sin decidir todavía si se reprocesa EBGR/SBSA completos (enero 2026) con las reglas nuevas, ni si se replica en otros clientes.
+
+---
+
+## Por qué join_with_ardef() resuelve solapamientos de rangos ARDEF por transacción, no load_visa_ardef() de forma global (2026-07-27, EN CÓDIGO, SIN DESPLEGAR)
+
+**Decisión:** `load_visa_ardef()` (`glue/scripts/visa/calculate/calculate.py`) ya no intenta dejar el ARDEF sin rangos solapados antes de tocar ninguna transacción — solo deduplica por `low_key_for_range` (`ORDER BY effective_date DESC, table_key DESC`). El DataFrame resultante puede seguir teniendo rangos que se solapan entre sí. `join_with_ardef()` resuelve cuál rango gana **por transacción**, después del join, con el mismo criterio (`effective_date DESC, table_key DESC`).
+
+**Por qué:** investigando el bug de Hallazgo 5b (`product_id` incorrecto en cuentas donde un rango ARDEF viejo y ancho solapa con uno nuevo y angosto — ver `.claude/memory/gotchas.md`), se revisó el adapter real de legacy (`tst_files/python_scripts/adapters.py`, líneas ~2285-2306 y ~2382) para validar un primer intento de fix (self-join a nivel de ARDEF que eliminaba rangos dominados). Se encontró que **legacy nunca pre-resuelve el ARDEF a un conjunto sin solapamiento**: dedupea solo por `low_key_for_range` (CTE `ardef_pre_r`), hace `INNER JOIN` de las transacciones contra TODOS los rangos candidatos vía `BETWEEN`, y resuelve el ganador por transacción con `ROW_NUMBER() OVER (PARTITION BY app_id, app_hash_file ORDER BY app_date_valid DESC, high_key_for_range DESC)`.
+
+El primer intento de fix (self-join eliminando rangos a nivel de ARDEF) resultó tener un problema real: al descartar rangos completos dominados por cualquier rango más nuevo que los solape, puede eliminar un rango que sigue siendo el ganador correcto para el subconjunto de cuentas que el rango más nuevo NO cubre (anidamiento a 3+ niveles con cobertura parcial distinta). Resolver por transacción, como legacy, es la única forma correcta para cualquier profundidad de anidamiento — porque se evalúa fresco contra la cuenta real de cada transacción en vez de eliminar candidatos de forma global.
+
+**Alternativa descartada:** self-join a nivel de ARDEF que elimina rangos dominados por `effective_date` (2 iteraciones intentadas, ver `.claude/memory/gotchas.md`). Descartada por el problema de anidamiento a 3+ niveles arriba, y porque además reveló un bug preexistente en el dedup por `low_key_for_range` (sin desempate real — un empate perfecto en el `ORDER BY`, resultado no determinístico en Spark) que ya afectaba al pipeline antes de cualquier intento de fix.
+
+**Costo aceptado:** `join_with_ardef()` ahora conserva `effective_date`/`table_key` un paso más (hasta después de su dedup post-join, que ya existía en el código original para el caso de múltiples matches dentro del mismo bucket de prefijo) — costo marginal, 2 columnas adicionales en un broadcast join que ya se hacía.
+
+**Estado (actualizado 2026-07-28):** cambio de código aplicado, validado localmente en pandas y en Spark real. Subido a S3 y relanzado contra un archivo real de SBSA (`jr_f84e8113...`, SUCCEEDED) que cubre los 3 casos conocidos a la vez — CAL resultante confirma el flip correcto en los 3 (`402824050`→I, `402824060`→I, `415159016`→F). Reprocesado SBSA VI IN+OUT completo (enero 2026, 156 archivos, calculate→interchange→store) — 156/156 SUCCEEDED en las 3 etapas, 0 fallos. Comparativo final contra legacy (`glue-get-transaction`, `report_suffix=sbsa_202601_hallazgo5bfix`) confirma la mejora: `A/interregional` count -4→+0, `A/intraregional` fee -1,842.80→+28.41, `CEMEA GOLD` ya no aparece en la tabla de diferencias. Sin commitear — ver `.claude/memory/pending.md`.
+
+---
+
 ## Por qué ARDEF e IAR no usan Step Functions
 
 **Decisión:** `lmbd-vi-ardef` y `lmbd-mc-iar` se invocan directamente desde el router (async), sin pasar por Step Functions.

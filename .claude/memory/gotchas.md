@@ -1,5 +1,117 @@
 # Gotchas y problemas conocidos
 
+## glue-vi-calculate: load_visa_ardef() descartaba versiones ARDEF más recientes/específicas por error — BUG NUESTRO, REDISEÑO APLICADO 2026-07-27, VALIDADO END-TO-END 2026-07-28 (SPARK + REPROCESO SBSA + COMPARATIVO CONTRA LEGACY), PENDIENTE COMMIT
+
+**Archivo:** `glue/scripts/visa/calculate/calculate.py` (función `load_visa_ardef`, paso 7, comentario `# ── 7. Eliminar rangos solapados`).
+**Detectado:** 2026-07-24, investigando la categoría "unknown" (mecanismo sin clasificar) del batch de revisión de swaps `product_id` en `A/interregional`/`A/intraregional` (ver Hallazgo 5 en memoria de usuario `vi_vs_legacy_differences_sbsa.md`).
+
+**Síntoma:** el par de reglas `CEMEA GOLD`/`CEMEA INF` (SBSA, `A/intraregional`) mostraba un swap de +35/-30 transacciones sin explicación por los 2 mecanismos ya conocidos (freshness de ARDEF, rango solapado borrado ganando en legacy — ver gotcha de Belarus arriba y Hallazgo 3). Investigado a nivel de cuenta: 21 transacciones (4 BINes: `402824050/052/060/066`) tienen `product_id` calculado como `"P"` cuando debería ser `"I"`.
+
+**Causa raíz confirmada:** el historial ARDEF real para estos BINes tiene 6 versiones a través del tiempo, todas con rangos que se solapan (progresivamente más angostos):
+
+| `effective_date` | rango | `product_id` |
+|---|---|---|
+| 2017-12-06 | 402824000-402824999 | P |
+| 2023-06-05 a 2024-05-03 (4 versiones) | 4028240XX-402824109 | P |
+| **2024-12-06** | **402824050-402824059** | **I** |
+
+El paso 7 de `load_visa_ardef()` elimina rangos solapados de forma **secuencial y voraz**: ordena por `low_key_for_range` ASC y descarta cualquier rango cuyo `low_key_for_range` caiga dentro del `table_key` de un rango YA ACEPTADO anteriormente (via `F.lag("table_key", 1).over(Window.orderBy("low_key_for_range"))`), **sin considerar `effective_date` en absoluto**. Como el rango de 2017 (ancho, `low_key=402824000`) se acepta primero por tener el `low_key` más chico, "se traga" al rango de 2024-12-06 (angosto, `low_key=402824050`, contenido dentro del de 2017) — aunque este último debería ganar por ser más reciente. Esto es inconsistente con el criterio del **paso 5** (dedup por `table_key`, `ORDER BY effective_date DESC`), que sí prioriza correctamente lo más reciente.
+
+**Verificado:** replicando los pasos 5-7 en pandas contra el historial ARDEF real de estos 4 BINes (consultado directo en `operational.dh_visa_ardef` vía la misma lógica de padding/filtrado usada en otros gotchas de ARDEF) — la simulación reproduce exacto el `product_id="P"` incorrecto que el pipeline calcula hoy.
+
+**Alcance confirmado (actualizado 2026-07-25): 30 de 133 cuentas discrepantes revisadas en el batch de Hallazgo 5 (SBSA, enero 2026, bloques `A/interregional`+`A/intraregional`) son este mecanismo — el 100% de las que habían quedado sin clasificar ("unknown").** Dos grupos de BINes distintos, mismo patrón de anidamiento (rango viejo y ancho conteniendo a uno nuevo y angosto):
+- `CEMEA GOLD`/`CEMEA INF` (`A/intraregional`) — 21 cuentas, BINes `402824050/052/060/066` (detalle arriba).
+- `SPR PREMIUM CARD`/`NON PREMIUM CARD` + `SPR PREMIUM ALT`/`NONPREMIUM ALT` (`A/interregional`) — 9 cuentas, BINes `415159011/012/013/014/016`. Historial: rango ancho de 2022-01-27 (`415159000-415159999`, `product_id=L`) conteniendo un rango angosto de 2023-08-02 (`415159010-415159029`, `product_id=F`). Replicado el paso 7 viejo con `tst_files/debug_scripts/ardef_history_415159.py` (lectura boto3 directa de `visa_ardef/data.parquet` + `operational.dh_visa_ardef`) — reproduce exacto el `product_id="L"` observado. Una investigación previa (2026-07-24) había dejado este grupo como "sin resolver" por un error en una replicación manual anterior (no re-derivable); la re-verificación con datos crudos reales confirma que es el mismo mecanismo.
+
+**Historial del fix (3 iteraciones, la 3ra es la version final):**
+
+1. **v1 (2026-07-25):** paso 7 reescrito de sweep secuencial a self-join `left_anti` a nivel de ARDEF (elimina rangos dominados por otro rango solapado más reciente), desempate `low_key_for_range ASC`.
+2. **v2 (2026-07-27, ajuste menor):** desempate cambiado a `table_key DESC` para calzar con el desempate real de legacy (`high_key_for_range DESC`).
+3. **v3 (2026-07-27, REDISEÑO, version final):** al revisar el adapter real de legacy (`tst_files/python_scripts/adapters.py`, líneas ~2285-2306 y ~2382) se encontraron 2 problemas que v1/v2 no resolvían:
+   - **El paso 6 (dedup por `low_key_for_range`, previo al paso 7) no tenía desempate real** — ordenaba por la misma columna por la que particionaba (`Window.partitionBy("low_key_for_range").orderBy("low_key_for_range")`), un empate perfecto sin criterio de desempate. Validado con datos reales de CEMEA (`ardef_history_402824.py`): tras el dedup por `table_key` (paso 5 viejo) sobrevivían DOS filas con el mismo `low_key_for_range=402824050` (una vieja `P` eff=2024-05-03, la correcta `I` eff=2024-12-06) — cuál de las dos sobrevivía el paso 6 era no determinístico en Spark, y si sobrevivía la vieja, el self-join del paso 7 (v1/v2) no tenía ninguna fila `I` que priorizar — el fix podía fallar silenciosamente por pura suerte del orden de ejecución.
+   - **El self-join a nivel de ARDEF (v1/v2) resuelve mal el anidamiento a 3+ niveles con cobertura parcial distinta** — al descartar rangos completos que son dominados por CUALQUIER rango más nuevo que los solape, puede eliminar un rango que sigue siendo el ganador correcto para el subconjunto de cuentas que el rango más nuevo NO cubre (ej. rango A ancho/viejo, B mediano/nuevo cubre la mitad de A, C angosto/nuevo cubre solo parte de B — el self-join descarta A y B enteros, dejando cuentas cubiertas solo por A o solo por B sin ningún rango).
+
+   **Causa raíz real de fondo:** el diseño de `load_visa_ardef()` (desde el código original, antes de cualquier fix) intentaba pre-resolver el ARDEF a un conjunto de rangos SIN solapamiento, de forma global, antes de tocar ninguna transacción. **Legacy nunca hace esto.** El adapter real de legacy (`adapters.py`): (a) dedup por `low_key_for_range` únicamente (`ROW_NUMBER() OVER (PARTITION BY low_key_for_range ORDER BY app_date_valid DESC, delete_indicator, high_key_for_range DESC)`, CTE `ardef_pre_r`) — el resultado SIGUE teniendo rangos solapados entre sí; (b) hace un `INNER JOIN` de las transacciones contra TODOS esos rangos candidatos vía `BETWEEN`; (c) resuelve el ganador **por transacción**, después del join (`ROW_NUMBER() OVER (PARTITION BY app_id, app_hash_file ORDER BY app_date_valid DESC, high_key_for_range DESC)`).
+
+**Fix final aplicado (local, v3, 2026-07-27, sin subir a S3/desplegar/commitear):**
+- `load_visa_ardef()`: los pasos 5+6+7 (dedup por `table_key`, dedup sin desempate por `low_key_for_range`, self-join de eliminación de solapados) se reemplazan por **un solo paso**: dedup por `low_key_for_range`, `ORDER BY effective_date DESC, table_key DESC` — replica exacto la CTE `ardef_pre_r` de legacy (el desempate por `delete_indicator` de legacy no hace falta porque nuestro paso 1 ya filtra `delete_indicator=' '` — diferencia intencional, no replicamos el bug `deleted_range` de legacy). El DataFrame resultante **puede seguir teniendo rangos solapados** — ya no se intenta eliminarlos aquí. `effective_date` se agrega a los campos seleccionados (antes se descartaba) porque `join_with_ardef()` la necesita.
+- `join_with_ardef()`: el dedup posterior al join (que YA EXISTÍA, para el caso de que una cuenta cayera en más de un rango dentro del mismo bucket) cambia su criterio de desempate de `ardef_country DESC NULLS LAST` (arbitrario) a `effective_date DESC NULLS LAST, table_key DESC NULLS LAST` (`Window.partitionBy("record")`) — replica exacto el `ROW_NUMBER()` de legacy por transacción. `table_key`/`effective_date` se conservan hasta después de este dedup (antes se descartaban justo después del join) y se dropean al final.
+
+**Validación local (pandas, 2026-07-27, sin Spark/AWS):** replicado el diseño completo (dedup único + resolución en el join) contra los datos crudos reales de ambos grupos (`ardef_history_402824.py`, `ardef_history_415159.py`):
+- CEMEA: cuenta `402824050` matchea 4 rangos candidatos tras el dedup único, gana el de `eff=2024-12-06` → `product_id="I"` (correcto, antes daba `"P"`). Cuenta `402824060` (grupo D, funding_source distinto): mismo resultado, gana `eff=2024-12-06` → `"I"`.
+- `415159xxx`: cuentas `011/013/014/016` matchean 2 rangos candidatos, gana el de `eff=2023-08-02` → `product_id="F"` (correcto, antes daba `"L"`).
+- Ambos casos deterministas, sin depender de ningún orden de ejecución arbitrario de Spark.
+
+**Validado en Spark real (2026-07-28):** `py_compile` OK, validación local en pandas OK, script subido a S3 (`LastModified=2026-07-28T03:09:34Z`). Se armó un payload de prueba (`tst_files/glue_args/vi-calculate-hallazgo5b-test-args.json`) apuntando a un único archivo real de SBSA (`file_id=AB21B95BFF579E50318D74C9449A89EC`, OUT, 2026-01-06) que casualmente cubre los 3 casos conocidos a la vez (confirmado antes vía Athena) y se relanzó `glue-vi-calculate` (`jr_f84e8113eb645a01f0e7fef04d3483ca3f892f534cd3cfb691f3d4fd7df565d3`, SUCCEEDED, 136s, sin error). Leyendo el CAL resultante directo de S3 (join `record` CLN↔CAL, ya que el CAL no lleva `account_number`):
+
+| `account_number` | BIN | `product_id` (con el fix) | Antes del fix |
+|---|---|---|---|
+| 4028240500000000 | 402824050 | **I** | P |
+| 4028240600000000 | 402824060 | **I** | P |
+| 4151590160000000 | 415159016 | **F** | L |
+
+Los 3 casos flipean exactamente como predijo la validación local en pandas — sin ningún ajuste adicional de código.
+
+**Reproceso masivo completado (2026-07-27/28):** SBSA VI IN+OUT enero 2026 (156 archivos) reprocesado completo con los 3 scripts ya existentes (`reprocess_vi_calculate.py`, `reprocess_vi_interchange.py`, `reprocess_vi_store.py`, cada uno ya preconfigurado para este mismo rango) — **156/156 SUCCEEDED en las 3 etapas, 0 fallos**. Verificado explícitamente antes de lanzar `interchange` que los 156 CAL reprocesados tenían `LastModified` fresco (cruzando cada entrada del log de calculate contra su ruta real en S3, no solo una muestra) — 0 problemas.
+
+**Comparativo final contra legacy (2026-07-28):** `glue-get-transaction` corrido para SBSA sobre el operational ya reprocesado (`report_suffix=sbsa_202601_hallazgo5bfix`, `--scheme_fee false`) y comparado contra `analytics.report_transactions_sbsa_202601_tst` (mismo script usado para el comparativo `byfix` de Hallazgo 4, adaptado en `tst_files/reporting/sbsa/vi_jurisdiction_business_rules_hallazgo5bfix.py`):
+- `A/interregional`: count_diff mejoró de **-4 a +0** (exacto).
+- `A/intraregional`: fee_diff mejoró de **-1,842.80 a +28.41** (practicamente exacto). `CEMEA GOLD` ya no aparece en la tabla de diferencias (por debajo del umbral de filtro, coincide casi exacto con legacy); `CEMEA INF` queda con un residuo de solo +5 sobre 8,739 (0.06%).
+- Fee total `off-us`: **+6,089.08** — coincide EXACTO con lo que había predicho la cuantificación independiente de Hallazgo 2 (+$6,089.08 esperado), validación cruzada entre ambos hallazgos.
+
+**Hallazgo metodológico sobre el grupo `415159xxx` (`SPR PREMIUM CARD`/`NON PREMIUM CARD`+`SPR PREMIUM ALT`/`NONPREMIUM ALT`):** la hipótesis original (que `product_id="F"` movería estas 9 cuentas a la familia `SPR PREMIUM CARD`) era incorrecta. Verificado en el reporte nuevo (filtro `issuer_bin_8=41515901`) que estas transacciones siguen clasificadas como `NON PREMIUM CARD`/`NONPREMIUM ALT` tras el fix — pero consultando legacy directamente para las mismas cuentas (`analytics.report_transactions_sbsa_202601_tst`, mismo filtro), **legacy también las clasifica exactamente igual** (`NON PREMIUM CARD`/`NONPREMIUM ALT`, `product_code=F`). El fix corrigió `product_id` a `F` correctamente y el resultado final coincide exacto con legacy — la hipótesis de a qué familia de regla se moverían era errada, pero el resultado real es correcto. No indica un problema del fix, solo una corrección al modelo mental de cómo `product_id` se traduce a `interchange_rule` para este grupo específico.
+
+**Pendiente explícito:** no se midió el impacto en performance de mantener `effective_date`/`table_key` un paso más en `join_with_ardef()` (no debería ser significativo). Sin commitear.
+
+**Si vuelve a aparecer** (un `product_id` que no calza con la versión ARDEF más reciente/específica para una cuenta, y no es un caso de rango borrado): sospechar de este mismo mecanismo — verificar el historial completo (sin dedup) de `operational.dh_visa_ardef` para el BIN en cuestión, buscando un rango angosto y reciente CONTENIDO dentro de uno más viejo y ancho. Si el fix v3 ya está desplegado y el problema persiste, revisar si `join_with_ardef()` está usando el desempate correcto (`effective_date DESC, table_key DESC`) y si `effective_date`/`table_key` llegan sin nulls al dedup.
+
+Detalle completo (metodología del batch, otros casos revisados) → memoria de usuario `vi_vs_legacy_differences_sbsa.md`, Hallazgo 5b.
+
+---
+
+## country/data.parquet (s3-reference): visa_region_code incorrecto para Belarus (BY) y Martinica (MQ) — causaba swap intraregional↔interregional en Visa — RESUELTO Y VALIDADO
+
+**Archivo:** `s3://itl-0004-itx-dev-intchg-02-s3-reference/country/data.parquet` (tabla de referencia `country`, columna `visa_region_code`). Consumida por `glue/scripts/visa/calculate/calculate.py` (`calc_jurisdiction_draft`/`calc_jurisdiction_sms`, vía `load_country_table()`).
+**Detectado:** 2026-07-22, investigando el swap `interregional`/`intraregional` en el comparativo VI SBSA enero 2026 (`interregional +452` / `intraregional -458` en la vista general por jurisdicción).
+
+**Síntoma:** al agrupar todo el operational VI de SBSA (156 archivos, enero 2026) por BIN + `jurisdiction` y cruzar contra legacy (mismo agrupamiento vía las tablas UNION `dh_visa_transaction_sbsa_{in,out}` + `dh_visa_transaction_calculated_field_sbsa_{in,out}`), se encontraron **60 BINes / 420 transacciones** donde el pipeline nuevo clasifica `interregional` y legacy `intraregional` — 100% consistente, sin mezcla. Los 60 BINes resultaron ser **exclusivamente `ardef_country='BY'`** (Belarús).
+
+**Causa raíz:** `calc_jurisdiction_draft()` compara `merchant_region_code` (de `merchant_country_code`) vs `ardef_region` (de `ardef_country`), ambos derivados de la MISMA tabla `country/data.parquet` (`visa_region_code`) mediante 2 joins — no de la columna `region` del ARDEF (esa está comentada/sin usar en `load_visa_ardef()`, línea 220). Comparando la tabla `country` completa (251 países) contra `operational.m_country` de legacy (con casteo numérico correcto — un primer intento con comparación por string dio 251 falsos positivos por padding de ceros/float-vs-int), la diferencia real fue de **solo 2 países**:
+
+| `country_code` | región NEW (antes del fix) | región LEGACY | nombre de región (legacy `m_region`) |
+|---|---|---|---|
+| BY (Belarús) | 5 | **7** | 7 = Central Europe Middle East Africa (CEMEA) |
+| MQ (Martinica) | **0** | 5 | 0 = unassigned; 5 = Europe |
+
+Belarús pertenece realmente a CEMEA en la estructura de Visa — nuestra tabla tenía `5` (Europa Occidental), un dato incorrecto. Martinica (territorio francés de ultramar) legacy la clasifica `5=Europe`; la nuestra tenía `0=unassigned` — un hueco de datos. A diferencia de otros gotchas de este tipo (ver el de `visa_ardef`/`product_id` más abajo, donde legacy quedaba desactualizado), **acá el dato incorrecto estaba de nuestro lado** — confirmado: 0 países faltantes/de más entre ambas tablas (251/251 coinciden salvo estos 2), y `mastercard_region_code` coincide 100% (el problema es exclusivo de Visa).
+
+**Fix aplicado (2026-07-22):** corregido `country/data.parquet` (`BY: visa_region_code 5→7`, `MQ: 0→5`, mismo schema Arrow preservado). Reproceso completo SBSA VI enero 2026 (156 archivos IN+OUT): `glue-vi-calculate` → `glue-vi-interchange` → `lmbd-vi-store` → `glue-get-transaction` (`report_suffix=sbsa_202601_byfix`), cada etapa verificada con `LastModified` real en S3 antes de avanzar.
+
+**Validación:** el swap quedó prácticamente resuelto — bloque `A` (OUT): `interregional +416→-4`, `intraregional -422→-2`; bloque `I` (IN): `+36→0` y `-36→0` **exactos**. Impacto en $ casi neutro (esperado, era un problema de conteo/clasificación, no de monto): fee total VI +68,285.41→+68,916.28 ZAR (+630.87, +0.0004pp). MC no se tocó (`mastercard_region_code` sin cambios, sigue en -1,252.82).
+
+**Si vuelve a aparecer** (un swap consistente intra↔inter concentrado en BINes de un solo país emisor, o en transacciones de un solo país comercio): comparar `country/data.parquet` completo contra `operational.m_country` de legacy con casteo numérico correcto (cuidado con falsos positivos de padding de ceros/float-vs-int) — candidato directo a un país con `visa_region_code` mal cargado.
+
+Detalle completo (metodología BIN-level, scripts, tabla completa de hallazgos) → memoria de usuario `vi_vs_legacy_differences_sbsa.md`, Hallazgo 4.
+
+---
+
+## get_transaction.py (MC): file_id cambió de convención en el commit "Unify GT & SF" (2026-07-10) — reportes viejos y nuevos no son comparables fila-a-fila por file_id — CONFIRMADO, NO ES BUG
+
+**Archivo:** `glue/scripts/reports/get_transaction/get_transaction.py` (`transform_mastercard`, línea ~955) y `glue/scripts/reports/scheme_fee/scheme_fee.py` (líneas 776/983/1186 — `app_hash_file`)
+**Detectado:** 2026-07-20, intentando cruzar fila a fila un reporte SBSA generado el 2026-07-09 (`..._BEFORE_feefix.parquet`) contra uno generado el 2026-07-16 (`..._AFTER_feefix.parquet`) para revisar en detalle el efecto del fix de moneda del fee MC.
+
+**Síntoma:** un join por `file_id + row_id` (o incluso `file_id` extrayendo el prefijo + `row_id`) entre ambos reportes da **0 filas** — ni una sola coincide, pese a ser el mismo cliente/mes/marca.
+
+**Causa:** el reporte del 2026-07-09 (`BEFORE`) usa para MC un `file_id` compuesto tipo `HASH32CHARS_numeroslargos` (probablemente derivado del `file_id` nativo de DynamoDB o del nombre de archivo `{file_id}_{bloque}_{mti}.parquet`). El reporte del 2026-07-16 (`AFTER`) usa `file_id = content_hash` puro (32 chars hex), que es la convención **actual y correcta** — confirmado en el código vigente (`F.col("content_hash").cast(StringType()).alias("file_id")`, línea 955) y documentado explícitamente en el docstring de `read_operational_all()` (línea ~208-214: *"No se deriva 'file_id' del nombre del archivo... en Mastercard el nombre completo del archivo no es el content_hash"*).
+
+**No es un bug — es una corrección ya aplicada.** Coincide con el commit `8f2183c` ("Update 20260710 - Unify GT & SF", 2026-07-10), que estandarizó `get_transaction.py` para usar `content_hash` como `file_id`, alineado con `scheme_fee.py` (que ya usa `content_hash → app_hash_file` desde su diseño — ver docstring en `scheme_fee.py` líneas 382-390, que documenta exactamente este mismo problema y por qué se resolvió así: *"content_hash/file_id pueden diferir tras un reproceso... acá se usa directamente la columna 'content_hash' original... es la llave que se necesitará más adelante para cruzar contra get_transaction.py"*). Verificado que **ambos scripts, en su versión actual, usan la misma convención** (`content_hash` como origen, `record`/`ref_id` como fila) — el cruce GT↔SF funciona correctamente hoy.
+
+**Impacto práctico:** cualquier comparación fila-a-fila entre un reporte de MC generado ANTES del 2026-07-10 y uno generado DESPUÉS fallará silenciosamente (0 matches, no error) si se usa `file_id` como llave. Los comparativos agregados (`GROUP BY` + `SUM`/`COUNT`, como los usados contra legacy) no están afectados — solo joins fila-a-fila entre dos reportes propios.
+
+**Si vuelve a aparecer (join entre dos reportes de `get_transaction.py` da 0 filas inesperadamente):** verificar la fecha de generación de cada reporte relativa a `8f2183c` (2026-07-10) antes de sospechar de otra causa.
+
+---
+
 ## vi_data_quality.py (BASEII) usaba interchange_fee_currency para convertir itx_amt — mismo error de moneda que MC, ya corregido en get_transaction.py — FIX APLICADO LOCALMENTE, SIN DESPLEGAR NI VALIDAR
 
 **Archivo:** `glue/scripts/reports/vi_data_quality/vi_data_quality.py` (funciones `join_with_exchange_rates` y `aggregate_results`, sección BASEII — el bloque VSS de `aggregate_vss_results` no está afectado).
@@ -106,7 +218,34 @@ Un intento anterior de esta función reemplazó el hardcode de moneda USD (que e
 
 **Impacto en dólares:** mínimo — `interchange_fees_amount_diff` de MC es +10,001.28 ZAR sobre 221.9M (0.0045%), ya documentado como residual aceptado en `pending.md`.
 
-**Estado:** Investigación pausada por decisión del usuario — impacto bajo, no justifica seguir cavando ahora. Si se retoma: comparar el dedup IAR fila-por-fila (no solo conteo) entre nuestro sistema y legacy para cerrar el residual de intra/interregional; investigar el 89% restante del gap NULL-vs-off-us (causa aún desconocida).
+**Actualización 2026-07-20 — confirmado con lectura directa del SQL legacy (`adapters.py`, `mastercard_load_calculated_field_dh`), descartadas 2 hipótesis alternativas:**
+- **Dedup previo de IAR (por `low_key_for_range`):** IDÉNTICO entre sistemas. Legacy (línea 2741): `row_number() over (partition by low_key_for_range order by app_date_valid desc, card_program_priority) rn`. Nuevo (`prepare_iar()`, `calculate.py` línea 446-546): mismo partition/order. Descartado como causa.
+- **Desempate posterior al join** (cuando una transacción matchea más de un rango IAR): también IDÉNTICO. Legacy (línea 2906-2907): `row_number() over (partition by a.app_id, a.app_hash_file order by a.app_date_valid desc, a.high_key_for_range desc) n`. Nuevo (`calculate_pre2()` PASO 4, línea 797-806): `Window.partitionBy("ref_id","file_id","file_idn").orderBy(app_date_valid.desc_nulls_last(), high_key_for_range.desc_nulls_last())`. Mismo partition semántico (llave de transacción), mismo order by. Descartado como causa. (Confirma además que legacy SÍ puede generar matches múltiples por transacción — consistente con los "541 pares de rangos IAR que se solapan" ya documentados — y los resuelve con el mismo criterio que nosotros.)
+- **Con las 2 alternativas descartadas, la única diferencia estructural real que queda es el join en sí:** legacy usa PAN completo exacto (`left(rpad(pan,18,'0'),18)::numeric`) con `a.num_card >= low_key AND a.num_card <= high_key` en un **INNER JOIN** (línea 2862-2864, descarta filas sin match exacto). El pipeline nuevo usa el envelope de 9 dígitos en un **LEFT JOIN** por overlap de rango (más amplio, encuentra match con más frecuencia — a veces incorrecto — y nunca descarta filas, quedan `NULL`).
+- **Conexión nueva:** este mismo mecanismo (no solo el gap agregado `jurisdiction_code` NULL-vs-off-us) también explica las diferencias de *conteo* (no solo de fee) encontradas por `interchange_rule` en el comparativo `get_transaction.py` vs legacy de 2026-07-17 para reglas intraregionales/interregionales específicas (`6-61`: +85 transacciones, `6-YX`: +115, `9-YG`: +61) — mismo síntoma, mismo origen, visto desde otro corte de agregación.
+**Corrección 2026-07-20 (misma sesión, medición repetida con muestra 15x más grande) — la hipótesis de arriba ERA INCORRECTA:** se repitió la medición directa PAN-exacto-vs-envelope con los 78 archivos completos MC OUT de SBSA enero 2026 (31,745,770 transacciones reales, vs 2,012,393 de la medición original de 9 archivos) — script `tst_files/debug_scripts/measure_iar_envelope_vs_exact.py`, IAR real completo (885,695 filas → 187,322 rangos activos tras dedup, fecha de referencia 2026-01-31). Resultado: **402 discrepancias envelope-vs-exacto (0.0013%)** → proyectado a MC completo (~76.9M txn/mes) ≈ **974 transacciones** — prácticamente el MISMO orden de magnitud que la medición original (~764). Con 15x más datos, la proyección NO subió — el envelope es una causa real pero consistentemente chica (~11-14% del gap de 6,812), **no una causa subestimada por poca muestra** como se infirió antes. Desglose: 281 falsos positivos (envelope matchea donde exacto no), 121 con país distinto, 0 falsos negativos (esperado, el envelope siempre es superset del área exacta).
+
+**CAUSA RAÍZ REAL ENCONTRADA 2026-07-20 (misma sesión) — NO es un problema del pipeline nuevo, es un hueco de extracción en legacy:**
+
+Se consultó directamente PostgreSQL PRD, tablas `operational.dh_mastercard_calculated_field_sbsa_{in,out}_202601*` (62 tablas, una por fecha/dirección — la fuente real de `jurisdiction` en legacy, previa a cualquier reporte). Hallazgos:
+
+1. **`jurisdiction IS NULL` en legacy = 7,326** (excluyendo 2026-01-16) — coincide EXACTO con el `jurisdiction_code=NULL` visto en el reporte final (`analytics.report_transactions_sbsa_202601_tst`). Confirma que el NULL se origina en esta etapa (jurisdiction assignment), no más abajo en la cadena.
+2. **De esas 7,326, solo 416 tienen `iar_country IS NULL`** (sin match real de IAR — la causa que veníamos asumiendo). **Las otras 6,910 SÍ tienen `iar_country` resuelto** (casi todas `iar_country='ZAF'`, `jurisdiction_region='6'` = CEMEA) — el join contra IAR funcionó perfectamente. La hipótesis "NULL = sin match de IAR" (base de toda la investigación previa del envelope) **era incorrecta para el 94% de los casos.**
+3. **La causa real:** para esas ~6,910 filas (6,812 en IN + ~98 en OUT), `card_acceptor_country_code` (DE 43, país del comercio) está **vacío (`''`)** en la tabla legacy `dh_mastercard_data_element_sbsa_*` (verificado con JOIN directo por `app_id`, 62 tablas de enero) — 6,784 vacío puro + 28 con basura (`'on '`). Como `''` no matchea ningún código en `m_country`, el join `ac` de legacy falla → `ac.region=NULL` → ni `bc.region=ac.region` ni `bc.region<>ac.region` pueden evaluar a verdadero (comparar contra NULL en SQL nunca da TRUE/FALSE) → ninguna rama del CASE (intra/inter) dispara → `jurisdiction=NULL`. Todas estas filas tienen `settlement_indicator_1='M'`.
+4. **Verificado que NUESTRO pipeline NO tiene este hueco:** se leyó `card_acceptor_country_code_de_43_6` directo del CLN (`400_IPM_1240_CLN`, SBSA IN 2026-01-01, 1.64M filas reales) — **0 filas vacías/nulas**, siempre con un código de país válido (`ZAF`, `NLD`, `IRL`, etc.). El parser del IPM del pipeline nuevo extrae correctamente el campo donde el de legacy lo deja en blanco.
+5. **El número cuadra exacto:** 6,812 (NULL en legacy, dirección IN) es LITERALMENTE la misma cifra que "off-us +6,812 de más en el nuevo" del gap original — no es coincidencia, es la misma población de transacciones.
+
+**Conclusión:** el pipeline nuevo no tiene un bug de sobre-clasificación — **legacy tiene un hueco de extracción del campo DE 43 (país del comercio)** para un subconjunto específico de transacciones (asociadas a `settlement_indicator_1='M'`), que le impide clasificar la jurisdicción. El pipeline nuevo extrae ese campo correctamente y por eso SÍ puede clasificar esas transacciones (correctamente, como `off-us` — mismo país emisor/comercio, distinta institución). El envelope de 9 dígitos (~974 transacciones) y este hueco de extracción de legacy (~6,812+) juntos explican prácticamente el 100% del gap de 6,812-7,326 documentado.
+
+**Desglose por MTI (verificado 2026-07-20, mismo día):** de los 7,187 casos legacy con este problema — `1240 IN`: 6,812, `1240 OUT`: 254, `1442 OUT`: 121 (`1442 IN`: 0). Verificado el mismo campo (`card_acceptor_country_code_de_43_6`) en nuestro CLN para las 4 combinaciones MTI+dirección:
+- `1240 IN` (1.64M filas muestreadas): 0 vacías.
+- `1240 OUT` (31,745,770 filas — el mes completo): 0 vacías.
+- `1442 IN` (475 filas, mes completo): 0 vacías.
+- `1442 OUT` (227 filas, mes completo): **2 vacías** — única excepción encontrada.
+
+**Conclusión final:** el pipeline nuevo replica el hueco de legacy en solo 2 de ~7,187 transacciones (0.03%), ambas en `1442 OUT` (el MTI de menor volumen para SBSA, ~0.03% del total). Residual real pero insignificante — no cambia la conclusión: el gap está prácticamente 100% explicado por el hueco de extracción de legacy, con una excepción mínima de 2 casos que técnicamente también producirían `NULL` en nuestro sistema (en vez de `off-us`), y por lo tanto no contarían hacia el "+6,812 de más" atribuido a legacy.
+
+**Estado:** Causa raíz identificada con alta confianza y evidencia directa (consultas reales a PRD + datos completos del CLN, no muestras parciales, para 3 de las 4 combinaciones MTI+dirección). No hay nada que arreglar en el pipeline nuevo por este motivo — el residual de 2 transacciones no amerita acción. Cierra la investigación de este gap.
 
 ---
 

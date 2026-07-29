@@ -129,12 +129,22 @@ def load_visa_ardef(reference_bucket: str, file_date: date) -> DataFrame:
     Pasos (ver comentarios inline numerados en el código para el detalle de
     cada uno): filtrar por delete_indicator, convertir effective_date/
     valid_until a DateType, filtrar por vigencia contra file_date, castear
-    las llaves de rango a numérico, deduplicar por table_key y por
-    low_key_for_range (quedándose con la versión más reciente), eliminar
-    rangos solapados, seleccionar los campos necesarios, renombrar
-    product_id→ardef_product_id (evita colisión en joins) y cachear el
-    resultado (se usa múltiples veces en calculate_baseii_fields/
-    calculate_sms_fields).
+    las llaves de rango a numérico, deduplicar por low_key_for_range
+    (quedándose con la versión más reciente — replica exacto la CTE
+    `ardef_pre_r` de legacy, ver `adapters.py`), seleccionar los campos
+    necesarios, renombrar product_id→ardef_product_id (evita colisión en
+    joins) y cachear el resultado (se usa múltiples veces en
+    calculate_baseii_fields/calculate_sms_fields).
+
+    A diferencia de versiones anteriores, este DataFrame NO garantiza rangos
+    sin solapamiento entre sí — igual que legacy, distintos low_key_for_range
+    pueden seguir cubriendo la misma cuenta (ej. un rango viejo y ancho junto
+    a uno nuevo y angosto anidado dentro). La resolución de qué rango gana
+    para cada transacción ocurre en `join_with_ardef()`, después del join,
+    usando el mismo criterio que legacy (`effective_date` más reciente,
+    empate por rango más ancho) — ver ese docstring y la decisión "Por qué
+    join_with_ardef() resuelve solapamientos por transacción" en
+    `decisions.md`.
 
     Args:
         reference_bucket: Bucket S3 de referencia.
@@ -183,53 +193,74 @@ def load_visa_ardef(reference_bucket: str, file_date: date) -> DataFrame:
         .withColumn("low_key_for_range", F.col("low_key_for_range").cast(LongType())) \
         .withColumn("table_key", F.col("table_key").cast(LongType()))
  
-    # ── 5. Deduplicar por table_key (effective_date más reciente) ─────────────
-    w_table_key = Window.partitionBy("table_key").orderBy(
-        F.col("effective_date").desc(),
-        F.col("low_key_for_range").asc()
-    )
-    ardef = ardef \
-        .withColumn("_rn", F.row_number().over(w_table_key)) \
-        .filter(F.col("_rn") == 1) \
-        .drop("_rn")
- 
-    # ── 6. Deduplicar por low_key_for_range ───────────────────────────────────
+    # ── 5. Deduplicar por low_key_for_range (version mas reciente gana) ───────
+    # Replica exacto la deduplicacion real de legacy (adapters.py, CTE
+    # ardef_pre_r): "row_number() over (partition by low_key_for_range order by
+    # app_date_valid desc, delete_indicator, high_key_for_range desc)". El
+    # desempate por delete_indicator de legacy no hace falta aqui porque el
+    # paso 1 ya filtro delete_indicator=' ' -- a diferencia de legacy, que NO
+    # filtra rangos borrados en este punto (bug confirmado de legacy, ver
+    # gotcha "deleted_range" en .claude/memory/gotchas.md; decidimos no
+    # replicarlo).
+    #
+    # Reemplaza dos pasos de versiones anteriores: un dedup por table_key
+    # (Window.partitionBy("table_key")) seguido de un dedup por
+    # low_key_for_range SIN desempate real (ordenaba por la misma columna de
+    # la particion -- un empate perfecto que Spark resuelve de forma no
+    # deterministica). Con datos reales (grupo ARDEF 402824050, ver gotcha
+    # "load_visa_ardef() paso 7...") ese dedup viejo podia dejar sobrevivir
+    # una version vieja en vez de la mas reciente cuando dos filas compartian
+    # low_key_for_range con distinto table_key -- este paso unico lo evita
+    # por diseno, con un solo Window y un desempate explicito.
     w_low_key = Window.partitionBy("low_key_for_range").orderBy(
-        F.col("low_key_for_range").asc()
+        F.col("effective_date").desc(),
+        F.col("table_key").desc()
     )
     ardef = ardef \
         .withColumn("_rn", F.row_number().over(w_low_key)) \
         .filter(F.col("_rn") == 1) \
         .drop("_rn")
- 
-    # ── 7. Eliminar rangos solapados (equivalente a pandas shift(1)) ──────────
-    # lag() sobre low_key_for_range ordenado = previous_table_key de pandas
-    w_overlap = Window.orderBy("low_key_for_range")
-    ardef = ardef \
-        .withColumn("_prev_table_key", F.lag("table_key", 1).over(w_overlap)) \
-        .filter(
-            F.col("_prev_table_key").isNull() |
-            (F.col("low_key_for_range") > F.col("_prev_table_key"))
-        ) \
-        .drop("_prev_table_key")
- 
-    # ── 8. Seleccionar campos necesarios ──────────────────────────────────────
+
+    # ── 6. Rangos solapados: NO se eliminan aqui ───────────────────────────────
+    # Versiones anteriores intentaban dejar el ARDEF sin rangos solapados
+    # antes de tocar ninguna transaccion (primero con un sweep secuencial
+    # buggy, despues con un self-join por effective_date) -- ver gotcha
+    # "load_visa_ardef() paso 7..." en .claude/memory/gotchas.md. Un self-join
+    # que descarta rangos completos resuelve mal el anidamiento a 3+ niveles
+    # con cobertura parcial distinta: puede descartar un rango que sigue
+    # siendo el ganador correcto para el subconjunto de cuentas que el rango
+    # mas nuevo NO cubre.
+    #
+    # Ahora replicamos la arquitectura real de legacy: el ARDEF que devuelve
+    # esta funcion PUEDE seguir teniendo rangos que se solapan entre si
+    # (distinto low_key_for_range, mismo territorio de cuentas). Quien gana
+    # se resuelve en join_with_ardef(), UNA VEZ conocida la cuenta real de
+    # cada transaccion -- exacto el mismo criterio de legacy (adapters.py,
+    # linea ~2382: "row_number() over (partition by app_id, app_hash_file
+    # order by app_date_valid desc, high_key_for_range desc)"). Correcto para
+    # cualquier profundidad de anidamiento, porque se evalua fresco por cada
+    # cuenta en vez de eliminar rangos de forma global.
+
+    # ── 7. Seleccionar campos necesarios ──────────────────────────────────────
+    # effective_date se conserva (a diferencia de versiones anteriores, que la
+    # descartaban aqui) -- join_with_ardef() la necesita para resolver
+    # solapamientos por transaccion (ver paso 6 arriba).
     ardef_fields = [
         "low_key_for_range", "table_key", "account_funding_source",
         "ardef_country",
         # "ardef_region",
         "b2b_program_id", "country",
         "fast_funds", "nnss_indicator", "product_id", "product_subtype",
-        "region", "technology_indicator", "travel_indicator"
+        "region", "technology_indicator", "travel_indicator", "effective_date"
     ]
     existing_fields = [f for f in ardef_fields if f in ardef.columns]
     ardef = ardef.select(existing_fields)
- 
-    # ── 9. Renombrar product_id para evitar conflicto en joins ────────────────
+
+    # ── 8. Renombrar product_id para evitar conflicto en joins ────────────────
     if "product_id" in ardef.columns:
         ardef = ardef.withColumnRenamed("product_id", "ardef_product_id")
- 
-    # ── 10. Cachear — se usa múltiples veces en los joins ─────────────────────
+
+    # ── 9. Cachear — se usa múltiples veces en los joins ─────────────────────
     ardef = ardef.cache()
     count = ardef.count()
     log_info(f"ARDEF loaded: {count:,} valid ranges for date {file_date_str}")
@@ -336,10 +367,15 @@ def join_with_ardef(df: DataFrame, ardef: DataFrame, account_column: str = "acco
     Deriva un prefijo de 3 dígitos del número de cuenta (account_9 / 10^6) y
     del rango ARDEF (explotando cada rango en una fila por cada prefijo que
     abarca), fuerza un broadcast hash join exacto por ese prefijo, y dentro
-    del bucket verifica el rango exacto (>=low_key_for_range,
-    <=table_key). Tras el join, deduplica por record en caso de que un mismo
-    número de cuenta caiga en más de un rango dentro del mismo bucket
-    (se queda con el de ardef_country no-nulo).
+    del bucket verifica el rango exacto (>=low_key_for_range, <=table_key).
+
+    Como `load_visa_ardef()` ya no elimina rangos que se solapan entre sí
+    (ver su docstring), una misma cuenta puede matchear más de un rango ARDEF
+    aquí. Tras el join, se resuelve cuál gana con el mismo criterio que usa
+    legacy por transacción (`adapters.py`, `ROW_NUMBER() OVER (PARTITION BY
+    app_id, app_hash_file ORDER BY app_date_valid DESC, high_key_for_range
+    DESC)`): se prioriza `effective_date` más reciente, empate por `table_key`
+    más ancho (nuestro equivalente a `high_key_for_range`).
 
     Args:
         df: DataFrame CLN a enriquecer (BASEII o SMS).
@@ -389,14 +425,22 @@ def join_with_ardef(df: DataFrame, ardef: DataFrame, account_column: str = "acco
         how="left"
     )
     
-    # Limpieza de columnas temporales
-    df_with_ardef = df_with_ardef.drop("low_key_for_range", "table_key", "account_9", "join_prefix", "prefix_low", "prefix_high")
-    
-    # Deduplicación final (por si ARDEF tenía rangos montados en el mismo bucket)
-    window_dedup = Window.partitionBy("record").orderBy(F.col("ardef_country").desc_nulls_last())
+    # Limpieza de columnas temporales (table_key y effective_date se
+    # conservan hasta despues del dedup -- las necesita el desempate)
+    df_with_ardef = df_with_ardef.drop("low_key_for_range", "account_9", "join_prefix", "prefix_low", "prefix_high")
+
+    # Deduplicación final: una cuenta puede matchear mas de un rango ARDEF
+    # solapado (distinto low_key_for_range, mismo territorio -- ver docstring).
+    # Se resuelve con el mismo criterio que legacy usa por transaccion:
+    # effective_date mas reciente, empate por table_key (rango) mas ancho.
+    window_dedup = Window.partitionBy("record").orderBy(
+        F.col("effective_date").desc_nulls_last(),
+        F.col("table_key").desc_nulls_last()
+    )
     df_with_ardef = df_with_ardef.withColumn("_dedup_rank", F.row_number().over(window_dedup))
     df_with_ardef = df_with_ardef.filter(F.col("_dedup_rank") == 1).drop("_dedup_rank")
-    
+    df_with_ardef = df_with_ardef.drop("table_key", "effective_date")
+
     return df_with_ardef
 
 
@@ -765,8 +809,36 @@ def calc_network_identification_code(df: DataFrame) -> DataFrame:
             F.when(F.trim(F.col("network_identification_code_sp")) != "", F.trim(F.col("network_identification_code_sp")))
         )
     )
- 
- 
+
+
+def calc_token_requestor_id_draft(df: DataFrame) -> DataFrame:
+    """
+    token_requestor_id para BASEII/draft a partir de las variantes SD/SP.
+    BLANK si ambas son null; VALID si alguna tiene un id no-cero; INVALID en
+    el resto (presentes pero en cero).
+
+    Args:
+        df: DataFrame con las columnas token_requestor_id_sd/_sp.
+
+    Returns:
+        df con la columna calc_token_requestor_id ("BLANK"/"VALID"/"INVALID").
+
+    Ejemplo:
+        calc_token_requestor_id_draft(df)
+    """
+    sd = F.col("token_requestor_id_sd")
+    sp = F.col("token_requestor_id_sp")
+    return df.withColumn(
+        "calc_token_requestor_id",
+        F.when(sd.isNull() & sp.isNull(), F.lit("BLANK"))
+         .when(
+             F.coalesce(F.when(sd != 0, sd), F.when(sp != 0, sp)).isNotNull(),
+             F.lit("VALID")
+         )
+         .otherwise(F.lit("INVALID"))
+    )
+
+
 def calc_type_of_purchase(df: DataFrame) -> DataFrame:
     """
     Coalesce de type_of_purchase_fl, _ft
@@ -1870,6 +1942,7 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
     df = calc_network_identification_code(df)
     df = calc_type_of_purchase(df)
     df = calc_surcharge_amount(df)
+    df = calc_token_requestor_id_draft(df)
     
     # 4. Lógica condicional
     log_info("  Calculating conditional fields...")
@@ -1928,10 +2001,11 @@ def calculate_baseii_fields(df: DataFrame, ardef: DataFrame, country_df: DataFra
         F.col("calc_surcharge_amount").alias("surcharge_amount"),
         F.col("calc_technology_indicator").alias("technology_indicator"),
         F.col("calc_timeliness").alias("timeliness"),
+        F.col("calc_token_requestor_id").alias("token_requestor_id"),
         F.col("calc_travel_indicator").alias("travel_indicator"),
         F.col("calc_type_of_purchase").alias("type_of_purchase"),
     ]
-    
+
     result = df.select(output_columns)
     log_info(f"BASEII calculation complete. Output columns: {len(output_columns)}")
     return result
