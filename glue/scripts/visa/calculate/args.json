@@ -4,6 +4,7 @@
                              "--enable-job-insights":  "true",
                              "--conf":  "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
                              "--enable-continuous-cloudwatch-log":  "true",
+                             "--job-bookmark-option":  "job-bookmark-disable",
                              "--job-language":  "python",
                              "--S3_STAGING":  "s3://itl-0004-itx-dev-intchg-02-s3-staging",
                              "--TempDir":  "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/calculate/",

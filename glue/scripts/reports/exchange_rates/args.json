@@ -1,8 +1,8 @@
 ﻿{
     "DefaultArguments":  {
                              "--job-bookmark-option":  "job-bookmark-enable",
-                             "--job-language":  "python",
                              "--enable-job-insights":  "true",
+                             "--job-language":  "python",
                              "--conf":  "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
                              "--enable-continuous-cloudwatch-log":  "true"
                          }

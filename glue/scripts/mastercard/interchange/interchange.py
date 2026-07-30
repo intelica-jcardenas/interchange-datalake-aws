@@ -592,7 +592,7 @@ def build_pre_eval_pyspark(
         F.col("transaction_destination_institution_id_code_de_93").alias("transaction_destination_institution_id"),
         F.col("transaction_type_identifier_pds_43").alias("transaction_type_identifier"),
         F.col("electronic_commerce_indicator_3_pds_52_3").alias("ucaf_collection_id"),
-        F.col("electronic_commerce_indicator_2_pds_52_2").alias("token_flag")                                                    
+        F.col("token_requestor_id_pds_59").cast("string").alias("token_requestor_id")
     )
  
     calc = read_parquet(spark, calc_path, "CAL 1240").select(
@@ -645,7 +645,10 @@ def build_pre_eval_pyspark(
         F.coalesce(F.col("transaction_destination_institution_id"), F.lit("BLANK")).alias("transaction_destination_institution_id"),
         F.coalesce(F.col("transaction_type_identifier"), F.lit("BLANK")).alias("transaction_type_identifier"),
         F.coalesce(F.col("ucaf_collection_id"), F.lit("BLANK")).alias("ucaf_collection_id"),
-        F.coalesce(F.col("token_flag"), F.lit("BLANK")).alias("token_flag"),
+        F.when(F.col("token_requestor_id").isNull(), F.lit("BLANK"))
+         .when(F.substring(F.trim(F.col("token_requestor_id")), 1, 3) == "501", F.lit("1"))
+         .otherwise(F.lit("0"))
+         .alias("token_flag"),
 
         F.coalesce(F.trim(F.col("card_program_indicator")), F.lit("BLANK")).alias("card_program_indicator"),
         F.coalesce(F.trim(F.col("issuer_country")), F.lit("BLANK")).alias("issuer_country"),
@@ -1104,9 +1107,8 @@ def assign_rules_simple(df_eval: DataFrame, df_rules: DataFrame) -> DataFrame:
         _simple_rule_condition("token_flag", "token_flag"),
         _simple_rule_condition("card_program_indicator", "card_program_indicator"),
         _simple_rule_condition("issuer_country", "issuer_country"),
+        _simple_rule_condition("issuer_bin_8", "issuer_bin_8"),
 
-   
-        
         _amount_rule_condition(work.columns),
     ]
  

@@ -3,11 +3,11 @@
         "Name": "itl-0004-itx-dev-intchg-02-glue-vi-data-quality",
         "JobMode": "SCRIPT",
         "JobRunQueuingEnabled": false,
-        "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-test-role",
+        "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-08T08:51:02.242000-05:00",
-        "LastModifiedOn": "2026-07-08T08:51:02.242000-05:00",
+        "LastModifiedOn": "2026-07-30T15:34:34.883000-05:00",
         "ExecutionProperty": {
-            "MaxConcurrentRuns": 50
+            "MaxConcurrentRuns": 1
         },
         "Command": {
             "Name": "glueetl",
@@ -23,21 +23,16 @@
             "--operational_bucket": "itl-0004-itx-dev-intchg-02-s3-operational",
             "--job-language": "python",
             "--dynamodb_table_client": "itl-0004-itx-dev-dynamo-client-02",
-            "--TempDir": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/tmp/vi_data_quality/",
+            "--TempDir": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/vi-data-quality/",
             "--reference_bucket": "itl-0004-itx-dev-intchg-02-s3-reference",
             "--analytics_bucket": "itl-0004-itx-dev-intchg-02-s3-analytics"
         },
-        "Connections": {
-            "Connections": [
-                "itl-0004-itx-dev-intchg-02-glue-vpc-connection"
-            ]
-        },
-        "MaxRetries": 1,
-        "AllocatedCapacity": 2,
-        "Timeout": 20,
-        "MaxCapacity": 2.0,
+        "MaxRetries": 0,
+        "AllocatedCapacity": 10,
+        "Timeout": 2880,
+        "MaxCapacity": 10.0,
         "WorkerType": "G.1X",
-        "NumberOfWorkers": 2,
+        "NumberOfWorkers": 10,
         "GlueVersion": "4.0"
     }
 }

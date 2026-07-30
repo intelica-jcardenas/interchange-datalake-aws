@@ -6,6 +6,46 @@ Las decisiones con implementación/validación extensas fueron resumidas aquí �
 
 ---
 
+## Estandarización de configuración de Glue Jobs (2026-07-30) — encontrada contaminación de consola, corregida en 7 de 9 jobs
+
+**Contexto:** durante el reproceso masivo de MC (token_flag), `glue-mc-calculate` corría archivo por archivo en vez de en paralelo. Investigando eso se encontró configuración desalineada en varios de los 9 Glue jobs del proyecto — no touchada por ningún script nuestro (confirmado revisando qué llamadas se hicieron en la sesión), aparentemente por ediciones manuales vía la consola de AWS Glue Studio en distintos momentos.
+
+**Hallazgo 1 — `glue-mc-calculate` tenía infraestructura muy distinta a sus 3 pares** (`vi-calculate`, `vi-interchange`, `mc-interchange`): `MaxConcurrentRuns=1` (debía ser 50, documentado desde junio), `NumberOfWorkers=10` (vs 2 documentado en `CLAUDE.md`), `MaxRetries=0` (vs 1), `Timeout=2880` min/48h (vs 20). **Corregido:** alineado 100% a `mc-interchange` (`G.1X×2, MaxRetries=1, Timeout=20, MaxConcurrentRuns=50`).
+
+**Hallazgo 2 — `glue-mc-interchange` y `glue-mc-data-quality` tenían `DefaultArguments` contaminados con la misma firma exacta**: parámetros de una ejecución puntual grabados como default permanente (`client_id=SBSA`/`process_date=2026-02-18`/`file_type=IN` en interchange; `CUSTOMER_CODE=EBGR`/`START_DATE`/`END_DATE`/etc. en data-quality), más `s3a://` en vez de `s3://`, y flags de monitoreo (`enable-spark-ui`, `spark-event-logs-path`, `enable-continuous-log-filter`, `spark.eventLog.rolling.enabled`) ausentes en el resto de los jobs — patrón típico de guardar un job desde la consola de Glue Studio después de una prueba manual. **Corregido en ambos** — solo quedan los argumentos de infraestructura (buckets, tablas DynamoDB, `TempDir`, `conf`, logging estándar).
+
+**Hallazgo 3 — `glue-get-transaction` y `glue-scheme-fee` también tenían parámetros de negocio fijos**: `client_code`/`start_date`/`end_date`/`report_suffix`/`scheme_fee` en get-transaction; `client_code`/`report_month`/`mode`/`force`/`in_file_key` en scheme-fee. Por diseño ambos jobs son "un cliente/una decisión por ejecución" (ver decisión "Por qué el reporting job ejecuta un cliente por vez" y el diseño `--mode generate`/`--mode read` de scheme-fee) — nunca deberían tener esto como default. **Corregido en ambos.**
+
+**Estandarización final de los 4 jobs principales** (`vi-calculate`, `vi-interchange`, `mc-calculate`, `mc-interchange`): mismo `Role`, `MaxRetries=1`, `Timeout=20`, `MaxConcurrentRuns=50`, mismos flags base (`enable-metrics`, `enable-job-insights`, `enable-continuous-cloudwatch-log`, `job-bookmark-option: job-bookmark-disable`, `conf`, `job-language`) — única diferencia intencional confirmada: `vi-interchange` en `G.2X × 4` (vs `G.1X × 2` del resto).
+
+**Pendiente de confirmar (no tocado):** `vi-data-quality`/`mc-data-quality` usan `Role: itl-0004-itx-dev-intchg-02-glue-test-role` en vez de `...-glue-role` — probablemente intencional dado que ninguno está integrado a un Step Function todavía, sin confirmar con el usuario. `vi-data-quality` tiene `NumberOfWorkers=10`/`MaxConcurrentRuns=50` (vs 2/1 de sus pares de reportería) — tampoco confirmado si es deliberado. `exchange-rates` tiene `Timeout=30` (vs 2880 del grupo) y `job-bookmark-option: job-bookmark-enable` — evaluado y descartado como problema, calza con su diseño de orquestador/worker en chunks.
+
+**Regla nueva establecida con el usuario:** los scripts de reproceso/automatización NUNCA deben llamar `aws glue update-job` para pasar parámetros de negocio — siempre `Arguments` en `start_job_run` (por-ejecución, no persiste). Cambios de configuración persistente solo a pedido explícito del usuario, mismo nivel de cuidado que los commits de git. Ver memoria de usuario `feedback_no_glue_config_changes_in_scripts.md`.
+
+**Todos los `config.json`/`args.json` locales de los 7 jobs tocados fueron re-sincronizados** desde AWS (`sync-glue.ps1`) — los scripts `.py` en sí no cambiaron, solo la configuración.
+
+---
+
+## Por qué token_flag en glue-mc-interchange se re-deriva de token_requestor_id_pds_59 (no de electronic_commerce_indicator_2_pds_52_2) — DESPLEGADO 2026-07-30, sin validación de match decisivo
+
+**Decisión:** `token_flag` (condición de `mc_rules` usada por `_simple_rule_condition("token_flag", "token_flag")` en `glue-mc-interchange`) ya no se toma directo del campo `electronic_commerce_indicator_2_pds_52_2` — se deriva de `token_requestor_id_pds_59` con la clasificación `"1"` si empieza con `501`, `"0"` si tiene valor pero no empieza así, `"BLANK"` si es null. Además, `mastercard_fields` (DynamoDB) tenía `token_requestor_id_pds_59.type_mti="1644, 1740"` — se ensanchó a `"1240, 1442, 1644, 1740"`.
+
+**Por qué:** revisando qué campos nuevos traía el excel `MASTERCARD Reglas Intercambio V23.xlsx` (ver `.claude/memory/pending.md`), se encontró que `token_flag` (columna ya existente en `mc_rules`, no nueva) se calculaba con un campo semánticamente equivocado (ECI, no Token Requestor ID). La causa raíz completa solo se pudo confirmar consultando `control.t_mastercard_adapter` en PRD (Postgres) — un catálogo de campos IPM real de legacy, análogo a nuestra tabla `mastercard_fields`, que no se conocía hasta esta investigación. Ahí `token requestor id` = PDS 59, sin restricción de MTI (`message_type_identifier IS NULL`). Se confirmó con datos reales (`operational.dh_mastercard_data_element_sbsa_out_20260727`): 856 filas de MTI 1240 con `token_requestor_id=501` — el campo SÍ existe y se puebla para 1240, algo que nuestro propio catálogo no permitía capturar por el `type_mti` mal scopeado.
+
+**Por qué el fix es solo de datos (DynamoDB) + un rename en interchange.py, no un cambio de interpreter/transform:** `lmbd-mc-transform`/`lmbd-mc-extract` ya filtran qué PDS expandir/renombrar dinámicamente leyendo `mastercard_fields` y comparando `type_mti` contra el MTI en curso (`lambdas/mastercard/transform/src/handler.py` línea ~263-268, `extract/src/handler.py` línea ~278) — ensanchar el scope en DynamoDB alcanza para que ambas Lambdas empiecen a producir la columna para 1240/1442, sin tocar su código.
+
+**Costo aceptado — reproceso necesario:** el campo crudo nuevo solo existe en archivos que se vuelvan a pasar por `lmbd-mc-transform` en adelante. Los archivos MC 1240/1442 ya procesados no tienen `token_requestor_id_pds_59` en su CLN hasta que se reprocesen desde transform (no hace falta re-correr el interpreter — el RAW ya trae el TLV completo, `type_mti` solo afecta qué se expande a columna).
+
+**Validación (2026-07-30):** cadena completa `transform→extract→clean→calculate→interchange` corrida contra 2 archivos reales (SBSA `E0C717BF7FC307E63E8E29918E813B02`/2026-01-03, EBGR `1A243466B3AC24A91E3B5376494943B3`/2026-01-05) — 0 errores en las 10 corridas. Dato crudo confirmado en cada etapa (`PDS_59` en TRA → `token_requestor_id_pds_59` en EXT/CLN, valores reales `501xxxxxxxx`). **Sin validar:** ningún match decisivo real contra una regla con `token_flag` activo — en ambos archivos, las transacciones de la jurisdicción relevante ya habían matcheado una regla anterior (first-match-wins) antes de llegar a las reglas con `token_flag`. La lógica de clasificación está verificada por revisión de código 1:1 contra `adapters.py` (`left(token_requestor_id::text,3)='501'`), no por un match end-to-end.
+
+**Alternativa descartada:** mantener `electronic_commerce_indicator_2_pds_52_2` y ajustar solo la comparación — descartada de inmediato, es un campo distinto (ECI, no Token Requestor ID), no hay forma de que produzca la clasificación correcta sin importar cómo se compare.
+
+**Fix relacionado, mismo día:** auditoría completa de las 32 columnas de `mc_rules` contra `mastercard_interchange_rule_assign` (`adapters.py` línea ~5500, la función real de matching de MC — tampoco se conocía) encontró un solo gap adicional: `issuer_bin_8` se calculaba en `interchange.py` pero nunca se agregaba a `simple_conditions`. Agregado (`_simple_rule_condition("issuer_bin_8", "issuer_bin_8")`) — impacto real hoy: cero (0 reglas activas lo usan en `mc_rules_new.parquet`), deja el motor completo para cuando Mastercard lo empiece a poblar. El resto de columnas de `mc_rules` (`fee_category`, `fee_tier`, `masterpass_incentive_indicator`, `additional_data`) se confirmó que ya están correctamente excluidas como no-condición, coincidiendo con la propia lista de exclusión de legacy.
+
+**Pendiente:** commitear (usuario); decidir si se sube `mc_rules_new.parquet` (generado del excel V23, bloqueado hasta ahora por este bug) ahora que el fix está desplegado; decidir alcance del reproceso de archivos MC 1240/1442 ya existentes.
+
+---
+
 ## Refresh de visa_rules desde excel V37 + 3 fixes en calculate.py/interchange.py — DESPLEGADO Y VALIDADO 2026-07-28
 
 **Decisión:** `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_rules/data.parquet` fue reemplazado por el resultado de re-interpretar `VISA Reglas Intercambio V37.xlsx` (excel legacy más reciente) con una réplica local de `InterchangeRules.read_rules_visa()` (`tst_files/interchange_rules/build_and_compare_rules.py`). El `data.parquet` anterior (cargado 2026-05-18, nunca refrescado desde entonces) quedó respaldado en `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_rules_backup_pre_v37_20260728/data.parquet`.

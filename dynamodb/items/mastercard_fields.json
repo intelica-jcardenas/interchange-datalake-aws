@@ -660,12 +660,12 @@
                                     }
                   },
                   {
-                      "type_record":  {
-                                          "S":  "DE"
-                                      },
                       "length":  {
                                      "N":  "99"
                                  },
+                      "type_record":  {
+                                          "S":  "DE"
+                                      },
                       "subfield":  {
                                        "S":  "0"
                                    },
@@ -686,12 +686,12 @@
                                     }
                   },
                   {
-                      "length":  {
-                                     "N":  "10"
-                                 },
                       "type_record":  {
                                           "S":  "DE"
                                       },
+                      "length":  {
+                                     "N":  "10"
+                                 },
                       "subfield":  {
                                        "S":  "4"
                                    },
@@ -5767,17 +5767,17 @@
                                     }
                   },
                   {
-                      "type_record":  {
-                                          "S":  "PDS"
-                                      },
                       "length":  {
                                      "N":  "100"
                                  },
+                      "type_record":  {
+                                          "S":  "PDS"
+                                      },
                       "subfield":  {
                                        "S":  "0"
                                    },
                       "type_mti":  {
-                                       "S":  "1644, 1740"
+                                       "S":  "1240, 1442, 1644, 1740"
                                    },
                       "tlv_name":  {
                                        "S":  "token requestor id"

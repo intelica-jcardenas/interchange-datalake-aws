@@ -5,7 +5,7 @@
         "JobRunQueuingEnabled": false,
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-03T11:58:25.104000-05:00",
-        "LastModifiedOn": "2026-07-08T16:00:51-05:00",
+        "LastModifiedOn": "2026-07-30T15:09:45.696000-05:00",
         "ExecutionProperty": {
             "MaxConcurrentRuns": 1
         },
@@ -15,22 +15,17 @@
             "PythonVersion": "3"
         },
         "DefaultArguments": {
-            "--client_code": "EBGR",
             "--dynamodb_table_file_control": "itl-0004-itx-dev-dynamo-file_control-02",
-            "--report_month": "202601",
-            "--in_file_key": "N/A",
+            "--enable-metrics": "true",
+            "--enable-job-insights": "true",
+            "--enable-continuous-cloudwatch-log": "true",
             "--scheme_fee_bucket": "itl-0004-itx-dev-intchg-02-s3-scheme-fee",
+            "--operational_bucket": "itl-0004-itx-dev-intchg-02-s3-operational",
+            "--job-language": "python",
             "--TempDir": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/scheme-fee/",
             "--dynamodb_table_client": "itl-0004-itx-dev-dynamo-client-02",
             "--reference_bucket": "itl-0004-itx-dev-intchg-02-s3-reference",
-            "--enable-metrics": "true",
-            "--enable-job-insights": "true",
-            "--mode": "generate",
-            "--enable-continuous-cloudwatch-log": "true",
-            "--operational_bucket": "itl-0004-itx-dev-intchg-02-s3-operational",
-            "--job-language": "python",
-            "--analytics_bucket": "itl-0004-itx-dev-intchg-02-s3-analytics",
-            "--force": "false"
+            "--analytics_bucket": "itl-0004-itx-dev-intchg-02-s3-analytics"
         },
         "MaxRetries": 0,
         "AllocatedCapacity": 2,

@@ -1,5 +1,6 @@
 ﻿{
     "DefaultArguments":  {
+                             "--enable-metrics":  "true",
                              "--enable-job-insights":  "true",
                              "--conf":  "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
                              "--enable-continuous-cloudwatch-log":  "true",

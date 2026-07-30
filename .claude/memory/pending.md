@@ -10,6 +10,35 @@ y se borra de aquí — no se acumulan items completados con `[x]`.
 
 ---
 
+## Reproceso MC token_flag (SBSA enero 2026) — en curso 2026-07-30
+
+Ver `.claude/memory/decisions.md` ("Estandarización de configuración de
+Glue Jobs" y "Por qué token_flag..."). Orden real del proceso regular:
+Calculate → Interchange → Store (no el store intermedio que hacían los
+scripts viejos).
+
+- [x] Paso 1 (`transform→extract→clean` + verificación real de schema):
+  104/104 archivos verificados con `token_requestor_id_pds_59` real.
+- [x] Paso 2 (`glue-mc-calculate`, solo los 104 verificados,
+  `reprocess_mc_calculate_only_sbsa_202601.py`): 104/104 SUCCEEDED.
+- [ ] **Paso 3 (`glue-mc-interchange`, `reprocess_mc_interchange.py`) —
+  pausado a pedido del usuario antes de completarse**, para primero
+  estandarizar configuración de Glue jobs (ver hallazgo de
+  `MaxConcurrentRuns=1` en `mc-calculate` que motivó todo esto). Falta
+  relanzar.
+- [ ] Paso 4 (`glue-mc-store` / `lmbd-mc-store`, una sola vez al final,
+  `reprocess_mc_store_sbsa_202601.py`) — sin empezar, va después del
+  paso 3.
+- [ ] Confirmar con el usuario: `vi-data-quality`/`mc-data-quality`
+  usan `Role=glue-test-role` en vez de `glue-role` — ¿intencional?
+  `vi-data-quality` tiene `NumberOfWorkers=10`/`MaxConcurrentRuns=50`
+  (vs 2/1 de sus pares `get-transaction`/`mc-data-quality`/`scheme-fee`)
+  — ¿intencional o alinear?
+- [ ] Commitear los cambios de hoy (código MC + los 7 `config.json`/
+  `args.json` de Glue resincronizados) — lo hace el usuario.
+
+---
+
 ## Refresh visa_rules (excel V37) — cerrado por ahora, 2026-07-28
 
 Ver `.claude/memory/decisions.md` ("Refresh de visa_rules desde excel V37...")
@@ -25,23 +54,57 @@ validado sin crash contra datos reales (EBGR + SBSA). Pendiente real:
 - [ ] Decidir cuándo borrar el backup
   `s3://itl-0004-itx-dev-intchg-02-s3-reference/visa_rules_backup_pre_v37_20260728/data.parquet`
   (dejado por seguridad, no es parte del flujo normal).
-- [ ] **MC — bug real encontrado en el camino, sin fix:** `token_flag` en
-  `glue-mc-interchange` (`interchange.py` línea ~595) se deriva de
-  `electronic_commerce_indicator_2_pds_52_2` (campo equivocado). Legacy
-  (`adapters.py` línea 4128) lo deriva de `token_requestor_id` (`left(...,3)='501'`
-  → 1/0). El campo correcto (`token_requestor_id_pds_59` en
-  `mastercard_fields`) solo está definido para MTI 1644/1740, no para
-  1240/1442 (los que sí evalúa `glue-mc-interchange`) — falta el PDS/tag
-  correcto para esos 2 MTIs antes de poder arreglarlo. Sin cuantificar
-  impacto (1,119 reglas usan `token_flag='0'`/`'1'` como condición).
-- [ ] MC: excel `MASTERCARD Reglas Intercambio V23.xlsx` también revisado
-  (`tst_files/interchange_rules/`) — sin columnas de criterio nuevas
-  (mismo schema de 32 columnas), pero con contenido actualizado (673
-  altas, 628 bajas, cambios reales en `rate_variable`/`token_flag`/
-  `fee_tier`/etc.). `mc_rules_new.parquet` generado localmente
-  (`output/`), sin subir a S3 — bloqueado hasta resolver el bug de
-  `token_flag` de arriba (no tiene sentido refrescar reglas que dependen
-  de un campo mal calculado).
+- [x] **MC — bug de `token_flag` en `glue-mc-interchange` — CAUSA RAÍZ
+  ENCONTRADA Y FIX DESPLEGADO 2026-07-30, validado sin crash contra
+  datos reales, SIN validación de match decisivo (ver detalle abajo).**
+  Causa real: no faltaba el campo (como se pensaba inicialmente) — el
+  PDS correcto (`token_requestor_id_pds_59`) ya existía en
+  `mastercard_fields`, pero mal scopeado (`type_mti="1644, 1740"` en vez
+  de incluir `1240, 1442`). Encontrado consultando `control.t_mastercard_adapter`
+  en PRD (catálogo de campos real de legacy, antes desconocido) +
+  confirmado con datos reales (`operational.dh_mastercard_data_element_sbsa_out_20260727`:
+  856 filas MTI 1240 con `token_requestor_id=501`).
+  **Fix aplicado:** (1) DynamoDB `mastercard_fields` → `token_requestor_id_pds_59.type_mti`
+  ensanchado a `"1240, 1442, 1644, 1740"`; (2) `interchange.py` línea
+  ~595 → `token_flag` ahora se deriva de `token_requestor_id_pds_59`
+  (`"1"` si empieza con `501`, `"0"` si no, `"BLANK"` si null) en vez de
+  `electronic_commerce_indicator_2_pds_52_2`. Desplegado a S3.
+  **Validado:** reproceso completo (`transform→extract→clean→calculate→interchange`)
+  para 2 archivos reales (SBSA `E0C717BF...`/2026-01-03, EBGR
+  `1A243466...`/2026-01-05) — 0 errores en las 10 corridas, `PDS_59`→`token_requestor_id_pds_59`
+  confirmado con valores reales `501xxxxxxxx` en cada etapa.
+  **Sin validar:** ningún match decisivo real — en ambos archivos de
+  prueba, las transacciones que llegaban a jurisdicción con reglas
+  `token_flag` activas ya habían matcheado una regla anterior
+  (first-match-wins). La lógica de clasificación está verificada por
+  código contra `adapters.py`, no por un match en vivo. (Nota: un primer
+  intento de cross-check dio "447 matches" que resultaron ser falso
+  positivo — el script de validación no filtraba por `ird` ni por
+  vigencia real del archivo, comparaba contra filas de reglas ya
+  vencidas. Corregido, resultado real: 0 matches decisivos en ambos
+  archivos.)
+- [x] **MC — gap de completitud `issuer_bin_8` — FIX APLICADO 2026-07-30,
+  sin desplegar a S3 todavía.** Auditoría completa de las 32 columnas de
+  `mc_rules` contra el motor real de legacy (`mastercard_interchange_rule_assign`,
+  `adapters.py` línea ~5500) — único gap encontrado además de `token_flag`:
+  `issuer_bin_8` se calcula en `interchange.py` pero nunca se agregaba a
+  `simple_conditions`. Agregado (`_simple_rule_condition("issuer_bin_8", "issuer_bin_8")`).
+  Impacto real hoy: cero (0 reglas activas usan `issuer_bin_8` en
+  `mc_rules_new.parquet`) — deja el motor completo para cuando Mastercard
+  lo empiece a poblar.
+- [x] **MC: `mc_rules_new.parquet` (excel V23) subido a S3 2026-07-30.**
+  `s3://itl-0004-itx-dev-intchg-02-s3-reference/mc_rules/data.parquet`
+  reemplazado (24,531 filas, 32 columnas, `token_flag` con 604×'0'/515×'1'
+  confirmado en el archivo ya en S3). Backup de la versión anterior en
+  `mc_rules_backup_pre_v23_20260730/data.parquet`. Sin columnas de
+  criterio nuevas (mismo schema de 32 columnas que antes), pero con
+  contenido actualizado (673 altas, 628 bajas, cambios reales en
+  `rate_variable`/`token_flag`/`fee_tier`/`card_acceptor_business_code`/etc.).
+- [x] Fix de `issuer_bin_8` desplegado a S3 junto con el de `token_flag`
+  (confirmado con `aws s3 cp ... -` + `grep`, ambos presentes en el
+  script desplegado).
+- [ ] Commitear los cambios de MC (`interchange.py`, `mastercard_fields.json`
+  sincronizado) — lo hace el usuario.
 
 ---
 

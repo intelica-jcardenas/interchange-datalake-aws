@@ -3,9 +3,9 @@
         "Name": "itl-0004-itx-dev-intchg-02-glue-mc-data-quality",
         "JobMode": "SCRIPT",
         "JobRunQueuingEnabled": false,
-        "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-test-role",
+        "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-08T08:51:02.453000-05:00",
-        "LastModifiedOn": "2026-07-08T08:51:02.453000-05:00",
+        "LastModifiedOn": "2026-07-30T15:34:36.609000-05:00",
         "ExecutionProperty": {
             "MaxConcurrentRuns": 1
         },
@@ -15,30 +15,17 @@
             "PythonVersion": "3"
         },
         "DefaultArguments": {
-            "--S3_OPERATIONAL": "s3a://itl-0004-itx-dev-intchg-02-s3-operational",
-            "--enable-continuous-log-filter": "true",
-            "--START_DATE": "2026-01-01",
-            "--CUSTOMER_CODE": "EBGR",
-            "--S3_REFERENCE": "s3a://itl-0004-itx-dev-intchg-02-s3-reference",
-            "--enable-spark-ui": "true",
+            "--S3_OPERATIONAL": "s3://itl-0004-itx-dev-intchg-02-s3-operational",
             "--enable-metrics": "true",
-            "--spark-event-logs-path": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/spark-event-logs/",
             "--enable-job-insights": "true",
-            "--ISSUER_ACQUIRER_INDICATOR": "I",
-            "--conf": "spark.eventLog.rolling.enabled=true --conf spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+            "--conf": "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
             "--enable-continuous-cloudwatch-log": "true",
             "--AWS_REGION": "eu-south-2",
             "--SPARK_SHUFFLE_PARTITIONS": "64",
-            "--END_DATE": "2026-01-04",
             "--job-language": "python",
-            "--S3_OUTPUT": "s3a://itl-0004-itx-dev-intchg-02-s3-operational",
-            "--DYNAMO_TABLE_CLIENT": "itl-0004-itx-dev-dynamo-client-02",
-            "--BRAND_LOCAL_INDICATOR": "default"
-        },
-        "Connections": {
-            "Connections": [
-                "itl-0004-itx-dev-intchg-02-glue-vpc-connection"
-            ]
+            "--S3_OUTPUT": "s3://itl-0004-itx-dev-intchg-02-s3-operational",
+            "--S3_REFERENCE": "s3://itl-0004-itx-dev-intchg-02-s3-reference",
+            "--DYNAMO_TABLE_CLIENT": "itl-0004-itx-dev-dynamo-client-02"
         },
         "MaxRetries": 0,
         "AllocatedCapacity": 2,

@@ -3,10 +3,9 @@
         "Name": "itl-0004-itx-dev-intchg-02-glue-mc-calculate",
         "JobMode": "SCRIPT",
         "JobRunQueuingEnabled": false,
-        "Description": "",
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-05-15T13:30:10.458000-05:00",
-        "LastModifiedOn": "2026-06-10T10:16:38.854000-05:00",
+        "LastModifiedOn": "2026-07-30T14:55:18.573000-05:00",
         "ExecutionProperty": {
             "MaxConcurrentRuns": 50
         },
@@ -20,15 +19,11 @@
             "--enable-job-insights": "true",
             "--conf": "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
             "--enable-continuous-cloudwatch-log": "true",
+            "--job-bookmark-option": "job-bookmark-disable",
             "--job-language": "python",
             "--S3_STAGING": "s3://itl-0004-itx-dev-intchg-02-s3-staging",
-            "--TempDir": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/mastercard/tmp/calculate/",
+            "--TempDir": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/mc-calculate/",
             "--S3_REFERENCE": "s3://itl-0004-itx-dev-intchg-02-s3-reference"
-        },
-        "Connections": {
-            "Connections": [
-                "itl-0004-itx-dev-intchg-02-glue-vpc-connection"
-            ]
         },
         "MaxRetries": 1,
         "AllocatedCapacity": 2,
