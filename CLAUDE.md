@@ -214,9 +214,6 @@ interchange-datalake-aws/
 ├── iam/                            # Roles IAM documentados
 ├── athena/                         # Workgroups y catálogos
 ├── layers/itx-pandas-pyarrow/      # Layer compartido: pandas + pyarrow
-├── infrastructure/
-│   ├── deploy.sh                   # Script de despliegue completo
-│   └── terraform/                  # IaC Terraform
 ├── scripts/                        # Utilitarios locales de desarrollo (no se despliegan)
 │   ├── sync-lambdas.ps1            # Descarga config + codigo de Lambdas desde AWS al repo
 │   ├── sync-glue.ps1               # Descarga Jobs (config+script), Databases y Crawlers de Glue desde AWS al repo
@@ -388,9 +385,11 @@ S3_BUCKET_REFERENCE=itl-0004-itx-dev-intchg-02-s3-reference
 DYNAMODB_TABLE_FILE_CONTROL=itl-0004-itx-dev-dynamo-file_control-02
 DYNAMODB_TABLE_FILE_PATTERN=itl-0004-itx-dev-dynamo-file_pattern-02
 DYNAMODB_TABLE_VISA_FIELDS=itl-0004-itx-dev-dynamo-visa_fields-02
+DYNAMODB_TABLE_MASTERCARD_FIELDS=itl-0004-itx-dev-dynamo-mastercard_fields-02
 DYNAMODB_TABLE_CLIENT=itl-0004-itx-dev-dynamo-client-02
 
-STEP_FUNCTION_ARN=arn:aws:states:eu-south-2:<account-id>:stateMachine:itl-0004-itx-dev-intchg-02-sfn-vi
+STEP_FUNCTION_ARN_VI=arn:aws:states:eu-south-2:<account-id>:stateMachine:itl-0004-itx-dev-intchg-02-sfn-vi
+STEP_FUNCTION_ARN_MC=arn:aws:states:eu-south-2:<account-id>:stateMachine:itl-0004-itx-dev-intchg-02-sfn-mc
 
 CHUNK_SIZE_MB=64
 FLUSH_BATCH_SIZE=500000
@@ -404,24 +403,13 @@ CLEAN_CHUNK_SIZE=100000
 
 ## Deploy
 
-```bash
-git clone <repo>
-cd interchange-datalake-aws
-cp .env.example .env
-# Editar .env con valores del ambiente destino
-chmod +x infrastructure/deploy.sh
-./infrastructure/deploy.sh
-```
-
-El script `deploy.sh` crea en orden: S3 buckets → IAM roles → Lambda layer → DynamoDB tables → Lambdas → S3 event triggers → Step Functions → Glue jobs y crawlers.
-
-Alternativamente, usar Terraform en `infrastructure/terraform/`:
-```bash
-cd infrastructure/terraform
-terraform init
-terraform plan
-terraform apply
-```
+Este repositorio es solo de código — el despliegue y la infraestructura
+(IaC, scripts de deploy) se gestionan fuera de este repo, en otro
+ambiente. Para sincronizar el código local con el estado real de AWS
+usar los scripts de `scripts/` (`sync-*.ps1` para bajar desde AWS,
+`push-lambdas.ps1`/`push-glue.ps1` para subir código — nunca
+configuración, ver `.claude/memory/pending.md` → memoria de usuario
+`push_sync_scripts_design.md`).
 
 ---
 
@@ -507,4 +495,3 @@ Archivos con contexto acumulado del proyecto — decisiones tomadas y problemas 
 - Gotchas y problemas conocidos: @.claude/memory/gotchas.md
 - Ejecución manual / debugging paso a paso: @.claude/memory/manual_execution.md
 - Pendientes activos (checklist): @.claude/memory/pending.md
-- Scheme Fee — etapas generate/read vs legacy y carpetas s3-analytics (temporal, retirar al cerrar el desarrollo): @.claude/memory/scheme_fee_generate_read_pipeline.md

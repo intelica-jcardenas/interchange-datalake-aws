@@ -1,6 +1,47 @@
 # Gotchas y problemas conocidos
 
-## glue-vi-calculate: load_visa_ardef() descartaba versiones ARDEF más recientes/específicas por error — BUG NUESTRO, REDISEÑO APLICADO 2026-07-27, VALIDADO END-TO-END 2026-07-28 (SPARK + REPROCESO SBSA + COMPARATIVO CONTRA LEGACY), PENDIENTE COMMIT
+## glue-mc-interchange: columna `settlement_currency_u` muerta en `calculate_mastercard_fee_pyspark()` — LIMPIADA Y DESPLEGADA 2026-07-31
+
+**Archivo:** `glue/scripts/mastercard/interchange/interchange.py`, STEP 1 de `calculate_mastercard_fee_pyspark()`.
+
+Junto con `rate_currency_u`/`trx_currency_u` (usadas después para el join de tipo de cambio `rate_ccy→trx_ccy`), se calculaba también `settlement_currency_u` = `upper(trim(settlement_report_currency_code))` — resto de un diseño anterior al rewrite del fee (`calculated_fee` terminó fijado siempre en `trx_ccy`, no en la moneda de settlement). Confirmado con `grep` (1 sola aparición en todo el archivo, la propia definición) que nunca se leía en ningún paso posterior.
+
+**Fix:** eliminada la línea. Cero cambio de comportamiento — no hace falta ningún reproceso, la columna nunca llegaba a ningún output ni afectaba el cálculo del fee.
+
+**Estado:** desplegado a S3 (`push` manual vía `aws s3 cp`, confirmado byte a byte).
+
+---
+
+## glue-scheme-fee: 2 bugs en `--mode generate`/`--mode read` — RESUELTOS Y VALIDADOS 2026-07-08 (fusionado desde `scheme_fee_generate_read_pipeline.md`, retirado 2026-07-31)
+
+**Archivo:** `glue/scripts/reports/scheme_fee/scheme_fee.py`.
+
+**Bug 1 — NaN en vez de NULL rompía el join de `--mode read`:** `run_generate()` no convertía `NaN` a `None` en columnas numéricas de `report_pdf` antes de `spark.createDataFrame()` — `range_program_id` quedaba `NaN` (no `NULL`) en `state/report/`, y el join `eqNullSafe` de `--mode read` no lo reconocía como "sin valor", dejando esas filas sin costo propagado (755 grupos / 40,302 filas afectadas en la corrida de prueba).
+
+**Bug 2 — `app_id` de Mastercard no era reproducible:** `transform_mastercard_scheme_fee()` usaba `F.monotonically_increasing_id()` (mismo antipatrón de `glue-mc-interchange`, ver gotcha de `monotonically_increasing_id() inestable entre shuffles` más abajo) — el ID no correspondía a ninguna transacción real, imposibilitando cruzar el costo de vuelta. Cambiado a `F.col("ref_id")`, alineado con `get_transaction.py`.
+
+**Fix aplicado y validado (2026-07-08):** `--mode generate --force true` (SBSA/202601) → `--mode read` con CSV simulado rehecho contra el nuevo `app_id`. Resultado: 0 filas de detalle con `transaction_scheme_fee_cost` NULL en `final/detail/` (antes: 40,302); `range_program_id` en `state/report/` con 755 nulls reales y 0 NaN (antes: 0 nulls reales, 755 NaN); `app_id` de Mastercard cruzado 5/5 contra el operational real por `content_hash`+`ref_id`.
+
+**Estado:** ambos fixes aplicados solo en S3 en su momento — confirmar si ya están commiteados antes de asumirlo (no verificado en esta entrada). Detalle de diseño completo (mapeo de etapas vs legacy, estructura de `s3-analytics/`) → `decisions.md`.
+
+---
+
+## run_ebgr.py/run_sbsa.py (tst_files/reporting/): descarga acumulaba part-files viejos con distinto UUID, duplicando el conteo del comparativo — RESUELTO 2026-07-30
+
+**Archivos:** `tst_files/reporting/run_ebgr.py`, `run_sbsa.py` (función `step3_download`).
+**Detectado:** 2026-07-30, comparativo EBGR post-reproceso VI mostrando `count_new` exactamente el doble de lo esperado (64,676,000 en vez de 32,338,000 para MC, mismo patrón 2x para VI).
+
+**Causa:** cada corrida de `glue-get-transaction` escribe el Parquet con `coalesce(1)` a un nombre de part-file con UUID aleatorio nuevo (`part-00000-{uuid}-c000.snappy.parquet`) — Spark en modo overwrite borra el objeto viejo en S3, pero `step3_download()` solo agrega el archivo nuevo al directorio local (`LOCAL_REPORT_DIR / rel`) sin limpiar part-files de corridas anteriores con un UUID distinto. `compute_new_aggregations()` (en `compare_ebgr.py`/`compare_sbsa.py`) lee el directorio completo vía `glob("*.parquet")` — si quedan 2 part-files de 2 corridas distintas, cuenta cada transacción 2 veces.
+
+**Fix:** `step3_download()` ahora borra cualquier `*.parquet` existente en el subdirectorio del dataset antes de descargar el nuevo. Aplicado en ambos scripts (`run_ebgr.py`, `run_sbsa.py`).
+
+**De paso, mismo hallazgo:** ambos scripts tenían `JOB_NAME = "...-glue-test-1"` (nombre viejo, renombrado a `glue-get-transaction` el 2026-07-08 según CLAUDE.md) — corregido también en ambos.
+
+**Si vuelve a aparecer** (un comparativo con `count_new` sospechosamente ~2x el esperado, sobre todo tras 2+ corridas seguidas del mismo reporte sin limpiar entre medio): revisar `ls tst_files/reporting/{cliente}/report_transactions_*.parquet/` — si hay más de un `part-00000-*.parquet`, ese es el problema.
+
+---
+
+## glue-vi-calculate: load_visa_ardef() descartaba versiones ARDEF más recientes/específicas por error — BUG NUESTRO, REDISEÑO APLICADO 2026-07-27, VALIDADO END-TO-END 2026-07-28 (SPARK + REPROCESO SBSA + COMPARATIVO CONTRA LEGACY), COMMITEADO
 
 **Archivo:** `glue/scripts/visa/calculate/calculate.py` (función `load_visa_ardef`, paso 7, comentario `# ── 7. Eliminar rangos solapados`).
 **Detectado:** 2026-07-24, investigando la categoría "unknown" (mecanismo sin clasificar) del batch de revisión de swaps `product_id` en `A/interregional`/`A/intraregional` (ver Hallazgo 5 en memoria de usuario `vi_vs_legacy_differences_sbsa.md`).

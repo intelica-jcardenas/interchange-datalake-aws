@@ -21,33 +21,32 @@
         "Description": "Cataloga archivos de tipos de cambio (VISA y Mastercard)",
         "Classifiers": [],
         "RecrawlPolicy": {
-            "RecrawlBehavior": "CRAWL_EVERYTHING"
+            "RecrawlBehavior": "CRAWL_NEW_FOLDERS_ONLY"
         },
         "SchemaChangePolicy": {
-            "UpdateBehavior": "UPDATE_IN_DATABASE",
-            "DeleteBehavior": "DEPRECATE_IN_DATABASE"
+            "UpdateBehavior": "LOG",
+            "DeleteBehavior": "LOG"
         },
         "LineageConfiguration": {
             "CrawlerLineageSettings": "DISABLE"
         },
         "State": "READY",
         "Schedule": {
-            "ScheduleExpression": "cron(31 21 * * ? *)",
+            "ScheduleExpression": "cron(01 00 * * ? *)",
             "State": "SCHEDULED"
         },
         "CrawlElapsedTime": 0,
         "CreationTime": "2026-06-08T16:31:14-05:00",
-        "LastUpdated": "2026-06-18T16:44:22-05:00",
+        "LastUpdated": "2026-07-01T19:03:46-05:00",
         "LastCrawl": {
-            "Status": "FAILED",
-            "ErrorMessage": "PartitionColumns cannot be deleted when indexes are enabled on the table. (Service: AWSGlue; Status Code: 400; Error Code: InvalidInputException; Request ID: 5a19bbf1-e700-4f85-9f3d-0aaedb278451; Proxy: null)",
+            "Status": "SUCCEEDED",
             "LogGroup": "/aws-glue/crawlers",
             "LogStream": "itl_0004_itx_dev_02_glue_crawler_exchange_rates",
-            "MessagePrefix": "70639f63-137a-482f-a2e5-1011ee3a6a63",
-            "StartTime": "2026-06-29T16:31:36-05:00"
+            "MessagePrefix": "a92bf06d-6484-4b20-9076-6e560cd9a2f6",
+            "StartTime": "2026-07-29T19:01:33-05:00"
         },
-        "Version": 9,
-        "Configuration": "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"}},\"Grouping\":{\"TableLevelConfiguration\":4},\"CreatePartitionIndex\":true}",
+        "Version": 14,
+        "Configuration": "{\"Version\":1.0,\"CrawlerOutput\":{\"Partitions\":{\"AddOrUpdateBehavior\":\"InheritFromTable\"}},\"Grouping\":{\"TableLevelConfiguration\":2},\"CreatePartitionIndex\":false}",
         "LakeFormationConfiguration": {
             "UseLakeFormationCredentials": false,
             "AccountId": ""

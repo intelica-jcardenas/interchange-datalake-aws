@@ -1273,7 +1273,6 @@ def calculate_mastercard_fee_pyspark(
         .withColumn("txn_date_d", F.to_date("txn_date"))
         .withColumn("rate_currency_u", F.upper(F.trim(F.col("rate_currency").cast("string"))))
         .withColumn("trx_currency_u", F.upper(F.trim(F.col("amount_transaction_currency").cast("string"))))
-        .withColumn("settlement_currency_u", F.upper(F.trim(F.col("settlement_report_currency_code").cast("string"))))
     )
     
     # ============================================================================

@@ -137,16 +137,6 @@ Verificado contra AWS (`aws glue get-databases` / `get-crawlers --profile itx-de
 
 Todos los crawlers están en estado `READY` (idle). Los 4 marcados "nunca ejecutado" corresponden a SBSA — cliente sin archivos procesados aún en `s3-operational`/`s3-staging`, consistente con la nota del Paso 3 (un path vacío no genera tabla ni corrida).
 
-### Objetos NO contemplados en este plan (legado / POC — revisar si siguen siendo necesarios)
+### Limpieza de objetos legado/POC — CERRADO (verificado 2026-07-31)
 
-Existen además, fuera de los 16 planeados aquí:
-
-| Tipo | Nombre | Asociado a | Nota |
-|------|--------|-----------|------|
-| Database | `itl_0004_itx_dev_poc_ebgr_visa_staging` | — | Prefijo `poc` — probablemente del prototipo local |
-| Database | `itl_0004_itx_dev_poc_interchange_analytics` | — | Prefijo `poc` |
-| Database | `itl_0004_itx_dev_poc_itx_reference` | `itl-0004-itx-dev-intchg-02-crawler-reference` | Prefijo `poc`, pero el crawler usa la convención corporativa con guiones e `intchg` |
-| Crawler | `itl-0004-itx-dev-intchg-02-crawler-reference` | `itl_0004_itx_dev_poc_itx_reference` | SUCCEEDED — usa convención con guiones, distinta a los 8 planeados aquí |
-| Crawler | `itl-0004-itx-dev-intchg-02-crawler-staging` | `itl_0004_itx_dev_poc_ebgr_visa_staging` | Nunca ejecutado — ídem |
-
-Estos 5 objetos adicionales usan **dos convenciones de nombres distintas** entre sí y respecto a los 16 oficiales — refuerza la necesidad de la tarea pendiente "Renombrar crawlers y databases Glue con prefijo `itx-` consistente" (ver `CLAUDE.md` → Pendientes conocidos).
+Los 5 objetos adicionales documentados antes aquí (`itl_0004_itx_dev_poc_ebgr_visa_staging`, `itl_0004_itx_dev_poc_interchange_analytics`, `itl_0004_itx_dev_poc_itx_reference` + sus 2 crawlers con convención de guiones `itl-0004-itx-dev-intchg-02-crawler-*`) **ya no existen en AWS** — confirmado con `aws glue get-databases`/`get-crawlers` que el catálogo completo (9 databases + 9 crawlers, incluye `exchange_rates` agregado después de los 16 originales) sigue una única convención consistente `itl_0004_itx_dev_02_glue_{database|crawler}_{tipo}_{cliente}_{marca}`, sin restos de la convención vieja ni prefijo `poc`.

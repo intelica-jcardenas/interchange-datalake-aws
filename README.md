@@ -155,9 +155,6 @@ interchange-datalake-aws/
 ├── scripts/
 │   ├── sync-lambdas.ps1
 │   └── sync-glue.ps1
-├── infrastructure/
-│   ├── deploy.sh
-│   └── terraform/
 ├── .env.example
 └── CLAUDE.md
 ```
@@ -166,20 +163,12 @@ interchange-datalake-aws/
 
 ## Deploy
 
-```bash
-git clone <repo>
-cd interchange-datalake-aws
-cp .env.example .env
-# Editar .env con valores del ambiente destino
-chmod +x infrastructure/deploy.sh
-./infrastructure/deploy.sh
-```
-
-Alternativamente con Terraform:
-```bash
-cd infrastructure/terraform
-terraform init && terraform plan && terraform apply
-```
+Este repositorio es solo de código — el despliegue y la infraestructura
+(Terraform/scripts de deploy) se gestionan fuera de este repo. Para
+sincronizar el código local con el estado real de AWS ver `scripts/`
+(`sync-lambdas.ps1`, `sync-glue.ps1`, `sync-dynamodb.ps1`,
+`sync-step-functions.ps1` para bajar, `push-lambdas.ps1`/`push-glue.ps1`
+para subir).
 
 ---
 
