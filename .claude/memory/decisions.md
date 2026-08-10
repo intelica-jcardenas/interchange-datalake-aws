@@ -6,6 +6,47 @@ Las decisiones con implementación/validación extensas fueron resumidas aquí �
 
 ---
 
+## Sync completo 2026-08-10 (post-auditoría): 2 casos reales de código en AWS nunca sincronizado — 1 aceptado, 1 descartado
+
+Tras corregir los 2 gaps de mapeo (ver decisión de abajo), se corrió un sync completo real (Lambdas + Glue jobs + databases + crawlers + DynamoDB schemas + Step Functions) para chequear drift de contenido, no solo de inventario — la última verificación completa de este tipo fue 2026-07-11 (Lambdas/Glue) y parcial 2026-08-03 (solo `vi-data-quality`).
+
+**Resultado: 2 hallazgos reales, el resto (15 Lambdas, 9 Glue jobs restantes, 9 databases, 9 crawlers, 5 tablas DynamoDB, 2 Step Functions) confirmado con 0 diff real** (los únicos cambios detectados en crawlers/`file_control.json` fueron metadata rutinaria — timestamp de corridas de crawler por cron, `ItemCount` creciendo con más archivos procesados).
+
+1. **`lmbd-mc-iar`** (`calculate.py`/`clean.py`, IAR de Mastercard/IP0040T1) — código real en AWS desde 2026-08-05, nunca sincronizado. Reescribe el manejo de fechas/rangos a String (alineado con la convención de `visa_ardef`), saca `app_customer_code` de `BUSINESS_KEYS`/`DEDUP_KEYS` (con comentarios citando 3 fuentes del legacy confirmando que el rango de cuentas Mastercard es global, no por cliente), `MemorySize` 1024→6144MB. **Confirmado por el usuario: cambio real hecho por un miembro del equipo — aceptado, sincronizado al repo, listo para commit** (staging del propio usuario, no de esta sesión).
+
+2. **`glue-exchange-rates`** (`format_exchange_rates.py`) — el sync trajo una versión de AWS con fecha 2026-08-03 que reemplaza el registro manual de particiones (`boto3`) por el sink nativo de Glue (`enableUpdateCatalog`). **El usuario sospecha que es una versión ANTERIOR/incorrecta del script** (a confirmar con el encargado de ese script) — **descartado el cambio en el repo** (`git restore` sobre `config.json`+`format_exchange_rates.py`, working tree vuelto a coincidir exacto con HEAD, confirmado sin diff). **No se tocó AWS** — el usuario fue explícito en que no se haga push desde local hasta confirmar cuál versión es la correcta. Si se retoma: la versión que trae el sync (ya vista en detalle en esta conversación) usa `glueContext.purge_s3_path()` + sink nativo con `enableUpdateCatalog=True`, en vez del `write.mode("overwrite").partitionBy(...)` + `boto3 batch_create_partition` manual que tiene el repo hoy — comparar ambas con el encargado antes de decidir cuál mantener.
+
+**Sin commitear por esta sesión** (el usuario ya tenía todo staged en paralelo, fuera de esta conversación).
+
+---
+
+## Auditoría de scripts sync/push (Lambdas, Glue, DynamoDB, Step Functions) — 2026-08-10, 2 gaps reales encontrados y corregidos
+
+**Motivo:** a raíz de descubrir que `lmbd-test-1` (infra prestada del prototipo `rules-refresh`) no estaba mapeado en `sync-lambdas.ps1`/`push-lambdas.ps1`, el usuario pidió auditar TODOS los scripts de sync/push contra el estado real de AWS, para encontrar cualquier otro recurso bajo el prefijo del proyecto que no estuviera mapeado en memoria/scripts.
+
+**Mecanismo de cada script (importante para saber dónde puede haber drift):**
+- `sync-lambdas.ps1`/`push-lambdas.ps1` (`$AllLambdas`) y `sync-glue.ps1`/`push-glue.ps1` — sección de **Jobs** (`$AllJobs`) → **listas fijas mantenidas a mano**, únicos puntos con riesgo real de quedar desactualizados.
+- `sync-glue.ps1` — secciones de **Databases**/**Crawlers** → auto-discovery (`aws glue get-databases`/`get-crawlers`, sin lista fija).
+- `sync-dynamodb.ps1` → auto-discovery (`aws dynamodb list-tables`, filtrado por prefijo/sufijo de nomenclatura).
+- `sync-step-functions.ps1` → lista fija de 2 items (sfn-vi, sfn-mc).
+
+**2 gaps reales encontrados** (comparando `aws lambda list-functions`/`aws glue get-jobs` contra las listas fijas):
+
+1. **`itl-0004-itx-dev-intchg-02-lmbd-test-1`** — Lambda huérfano de pruebas (creado 2026-06-10) repurposed 2026-08-03 para prototipar `lmbd-rules-refresh` (ver decisión de arriba). Agregado a ambos scripts como suffix `"test-1"` → `Dir="lambdas\rules-refresh"`, grupo nuevo `-Group test` (`ValidateSet` ampliado en ambos). Comentario explícito en el código: el `FunctionName` real en AWS hoy es `test-1`, NO el que dice `lambdas/rules-refresh/config.json` (`itl-...-lmbd-rules-refresh`, que todavía no existe) — actualizar esta entrada el día que se cree el Lambda definitivo.
+   - **Guarda de seguridad agregada en `push-lambdas.ps1`:** este Lambda necesita `openpyxl`/`et_xmlfile` empaquetados junto al código (sin layer propio, a diferencia de TODOS los demás) — si `src/` local no los tiene, el push se salta con aviso en vez de subir un ZIP incompleto que rompería el Lambda (`ImportError` en runtime). Validado con `-WhatIf`: arma el ZIP completo (274.7 KB, 210 archivos, idéntico al real) cuando `openpyxl` sí está presente (bajado por el propio `sync-lambdas.ps1 -Group test`, que se corrió y validó end-to-end contra AWS real).
+   - **`.gitignore`** — agregada exclusión para `lambdas/rules-refresh/src/openpyxl/` y `et_xmlfile/` (+ sus `.dist-info/`) — son dependencias vendored de terceros que bajan con el sync (~1.4MB), no código del repo; ningún otro Lambda del proyecto tiene este patrón.
+   - `lambdas/rules-refresh/config.json`/`env-vars.json` locales ahora son un dump REAL de AWS (ya no el placeholder "PROPUESTO — no desplegado") tras correr el sync.
+
+2. **`itl-0004-itx-dev-intchg-02-glue-ebgr-report`** — Glue job real (mismo rol `glue-role`, mismos buckets del proyecto, tabla `client` de DynamoDB), **creado en AWS 2026-07-31, script (`ebgr_merchant.py`) modificado 2026-08-07 — fuera de cualquier sesión registrada en memoria**, nunca documentado en `CLAUDE.md` ni sincronizado al repo hasta hoy. Descripción del propio script: "Eurobank Merchant Report - AWS Glue production job" — reporte de comercios específico de EBGR, args `--begin_date`/`--end_date`/`--raw_root`/`--output_root`, escribe a `s3-reference/reports/ebgr_reports/` (nota: escribe dentro de `s3-reference`, no de `s3-analytics` como `get_transaction.py`/`scheme_fee.py` — sin investigar por qué, fuera de scope de esta auditoría). Agregado a `$AllJobs` en ambos scripts (`sync-glue.ps1`/`push-glue.ps1`, suffix `"ebgr-report"` → `Dir="glue\scripts\reports\ebgr_report"`, grupo `reports`), sincronizado con `sync-glue.ps1 -Resource jobs -Job ebgr-report` (trajo `config.json`, `args.json`, `ebgr_merchant.py` reales — `py_compile` OK). Agregado a la tabla de Glue Jobs en `CLAUDE.md` (10 jobs, no 9). **Sin analizar su lógica de negocio en profundidad ni validar contra nada** — solo se sincronizó el código para que exista en el repo, ver `.claude/memory/pending.md`.
+
+**Confirmado que NO son de este proyecto** (mismo audit, otros recursos con prefijo parecido pero rol/bucket distintos — no tocados, a pedido del usuario): `itl-0004-itx-dev-glue-read-transactions-parquet` (rol `AWSGlueServiceRole-DEV-PostgresMigration`, script en el bucket genérico `aws-glue-assets-...`, claramente otro proyecto/migración), y los Lambdas `itl-0004-itx-dev-lmbd-{sendmail,file-load,sbsa-preprocess,app}-02`, `itl-0004-itx-dev-lambda-pg-audit-02`, `itl-0004-itx-dev-testfunction` (prefijo sin `intchg-02`, no matchea la convención de nombres del proyecto).
+
+**Sin gaps en:** Glue Databases/Crawlers (9+9, auto-discovery, coincide con lo ya documentado), DynamoDB (5 tablas, auto-discovery), Step Functions (2, lista fija ya completa).
+
+**Sin commitear.**
+
+---
+
 ## `lmbd-rules-refresh` (automatización de visa_rules/mc_rules) — probado end-to-end sobre `lmbd-test-1`, con trigger S3 real activo — 2026-08-10
 
 **Contexto:** `lambdas/rules-refresh/` (código en el repo, ver su `README.md`) reemplaza el proceso manual de refrescar `visa_rules/data.parquet`/`mc_rules/data.parquet` en `s3-reference` — hasta ahora se hacía corriendo `tst_files/interchange_rules/build_and_compare_rules.py` a mano cada vez que el área de Data Quality entregaba un excel nuevo. El Lambda valida el excel, calcula el diff contra el parquet actual, respalda el anterior a `{visa_rules|mc_rules}/history/`, publica el nuevo y archiva el excel de origen.

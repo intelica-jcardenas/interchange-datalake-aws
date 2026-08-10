@@ -240,7 +240,7 @@ lambdas/<marca>/<etapa>/
 | **Step Functions** | Orquestacion del flujo completo |
 | **S3** (5 buckets) | Data lake por capas |
 | **DynamoDB** (4 tablas) | Configuracion y control de estado |
-| **Glue** (9 jobs, ver tabla mas abajo) | ETL pesado y catalogo de datos — inventario de databases/crawlers en `glue/GLUE_CATALOG_CREATION.md` |
+| **Glue** (10 jobs, ver tabla mas abajo) | ETL pesado y catalogo de datos — inventario de databases/crawlers en `glue/GLUE_CATALOG_CREATION.md` |
 | **Athena** | Consultas SQL sobre los datos finales |
 | **CloudWatch** | Logs (30 dias de retencion) |
 | **IAM** | 11 roles con permisos granulares |
@@ -333,6 +333,7 @@ Patron de nomenclatura: `itl-0004-itx-{env}-intchg-02-glue-{marca}-{job}`
 | `itl-0004-itx-dev-intchg-02-glue-vi-data-quality` | Visa | G.1X × 2 | Data Quality Visa (`vi_data_quality.py`). Renombrado desde `glue-test-3` (verificado en AWS 2026-07-08). Aun no integrado a ningun Step Function. |
 | `itl-0004-itx-dev-intchg-02-glue-mc-data-quality` | MC | G.1X × 2 | Data Quality Mastercard (`mc_data_quality.py`). Ya desplegado en AWS (verificado 2026-07-08 — antes documentado como "en desarrollo local, pendiente de subir"; esa nota estaba desactualizada). Primera corrida con datos reales recién el 2026-08-10 (smoke test EBGR/2026-01-05, ver `decisions.md`) — sigue sin validación de resultados contra legacy, aun no integrado a ningun Step Function. |
 | `itl-0004-itx-dev-intchg-02-glue-scheme-fee` | Visa/MC | G.1X × 2 | Scheme Fee (`scheme_fee.py`, `glue/scripts/reports/scheme_fee/`), replica del modulo legacy de cuotas (EC2 `exec_scheme_fee.py`). Modos `--mode generate`/`--mode read`. Desplegado 2026-07-03, ambos modos validados end-to-end 2026-07-08 (falta validar con costos reales, ver `.claude/memory/pending.md`). |
+| `itl-0004-itx-dev-intchg-02-glue-ebgr-report` | Visa/MC (EBGR) | G.1X × 2 | "Eurobank Merchant Report" (`ebgr_merchant.py`, `glue/scripts/reports/ebgr_report/`) — recrea en el datalake un reporte CSV de comercios que existe en legacy, específico para EBGR. `--begin_date`/`--end_date`/`--raw_root`/`--output_root`, escribe a `s3-reference/reports/ebgr_reports/`. En desarrollo por un miembro del equipo, en proceso de validación (2026-08-10) — sincronizado al repo vía `sync-glue.ps1` sin documentación profunda todavía; se documentará con la skill `itx-document-script` cuando el usuario confirme que está terminado. Ver `.claude/memory/pending.md`. |
 
 Glue Version: 4.0
 

@@ -1,0 +1,13 @@
+﻿{
+    "DefaultArguments":  {
+                             "--S3_OPERATIONAL":  "s3://itl-0004-itx-dev-intchg-02-s3-operational",
+                             "--enable-metrics":  "",
+                             "--enable-job-insights":  "true",
+                             "--conf":  "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+                             "--enable-continuous-cloudwatch-log":  "true",
+                             "--S3_ANALYTICS":  "s3://itl-0004-itx-dev-intchg-02-s3-analytics",
+                             "--job-language":  "python",
+                             "--DYNAMO_TABLE_CLIENT":  "itl-0004-itx-dev-dynamo-client-02",
+                             "--S3_REFERENCE":  "s3://itl-0004-itx-dev-intchg-02-s3-reference"
+                         }
+}

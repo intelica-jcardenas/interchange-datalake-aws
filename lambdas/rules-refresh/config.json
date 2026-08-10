@@ -1,26 +1,61 @@
-{
-    "_status": "PROPUESTO — no desplegado en AWS. Este archivo no es un dump real de `get-function-configuration` (a diferencia de los demas config.json del repo) — es la config con la que se recomienda crear el Lambda. Reemplazar por el dump real (via sync-lambdas.ps1) despues del primer despliegue.",
-    "FunctionName": "itl-0004-itx-dev-intchg-02-lmbd-rules-refresh",
+﻿{
+    "FunctionName": "itl-0004-itx-dev-intchg-02-lmbd-test-1",
+    "FunctionArn": "arn:aws:lambda:eu-south-2:861276092327:function:itl-0004-itx-dev-intchg-02-lmbd-test-1",
     "Runtime": "python3.11",
-    "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-rules-refresh-role",
+    "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-vi-role",
     "Handler": "handler.lambda_handler",
-    "Description": "Refresco de visa_rules/mc_rules desde excels de reglas de interchange subidos a s3-reference/interchange_rules/",
-    "Timeout": 300,
-    "MemorySize": 4096,
-    "EphemeralStorage": {
-        "Size": 512
+    "CodeSize": 281283,
+    "Description": "",
+    "Timeout": 120,
+    "MemorySize": 2048,
+    "LastModified": "2026-08-10T17:09:32.000+0000",
+    "CodeSha256": "lBROd4+5HM7xCZ463yPcyzDd43vZqZsD3xBKYFL356g=",
+    "Version": "$LATEST",
+    "VpcConfig": {
+        "SubnetIds": [
+            "subnet-03cb8477fb39f639e",
+            "subnet-0b02ad525f046501b"
+        ],
+        "SecurityGroupIds": [
+            "sg-0671b8f0fb5aa27ca"
+        ],
+        "VpcId": "vpc-0101d2c447b67e9db",
+        "Ipv6AllowedForDualStack": false
     },
-    "Layers": [
-        "PENDIENTE — necesita openpyxl ademas de pandas/pyarrow. El layer compartido itx-pandas-pyarrow NO incluye openpyxl (usado hoy solo por Lambdas que leen/escriben Parquet, no Excel) — ver README.md de esta carpeta."
-    ],
     "Environment": {
         "Variables": {
-            "S3_BUCKET_REFERENCE": "itl-0004-itx-dev-intchg-02-s3-reference",
-            "RULES_MIN_ROW_RATIO": "0.5"
+            "RULES_MIN_ROW_RATIO": "0.5",
+            "S3_BUCKET_REFERENCE": "itl-0004-itx-dev-intchg-02-s3-reference"
         }
     },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "2cb0614e-babe-4396-9132-1418bcf2ba74",
+    "Layers": [
+        {
+            "Arn": "arn:aws:lambda:eu-south-2:861276092327:layer:itl-0004-itx-dev-intchg-02-pandas-pyarrow:2",
+            "CodeSize": 64425635
+        }
+    ],
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
     "PackageType": "Zip",
     "Architectures": [
         "x86_64"
-    ]
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:eu-south-2::runtime:81a2f2bcc7b606f63601c58153453037785e00ca30d21476cee5f82df01b0d71"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/itl-0004-itx-dev-intchg-02-lmbd-test-1"
+    }
 }

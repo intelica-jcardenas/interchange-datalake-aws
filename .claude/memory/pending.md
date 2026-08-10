@@ -10,6 +10,38 @@ y se borra de aquí — no se acumulan items completados con `[x]`.
 
 ---
 
+## `glue-exchange-rates` (`format_exchange_rates.py`) — versión en AWS vs versión en repo, sin resolver
+
+El sync completo del 2026-08-10 encontró que la versión desplegada en AWS
+(fecha 2026-08-03) usa el sink nativo de Glue (`enableUpdateCatalog`,
+`glueContext.purge_s3_path()`) en vez del registro manual de particiones
+por `boto3` que tiene el repo hoy. El usuario sospecha que la de AWS podría
+ser una versión **anterior/incorrecta** — descartado el cambio en el repo
+por ahora (`git restore`), **sin tocar AWS**. Detalle completo de ambas
+versiones → `decisions.md`.
+
+- [ ] **Confirmar con el encargado de ese script** cuál versión es la
+  correcta antes de decidir si se sincroniza o se hace push del repo hacia
+  AWS.
+
+---
+
+## `glue-ebgr-report` (Eurobank Merchant Report) — encontrado sin documentar 2026-08-10, ver `decisions.md`
+
+**Contexto confirmado por el usuario (2026-08-10):** recrea en el datalake
+un reporte CSV que existe en legacy, específico para EBGR. Lo está
+armando un miembro del equipo, en proceso de validación — **no tocar ni
+investigar la lógica todavía**. Por ahora solo debe existir como entrada
+mapeada en `sync-glue.ps1`/`push-glue.ps1` (ya hecho). Cuando el usuario
+confirme que está terminado/validado, documentar con la skill
+`itx-document-script` (mismo tratamiento que el resto de `glue/scripts/`).
+
+- [ ] **Bucket `s3-analytics`** — usado por `get_transaction.py`/`scheme_fee.py`
+  pero no aparece en la tabla de "S3 — 5 buckets" de `CLAUDE.md` — gap de
+  documentación preexistente, no de hoy, notado de paso durante esta auditoría.
+
+---
+
 ## Automatización `lmbd-rules-refresh` (refresh de visa_rules/mc_rules) — probado 2026-08-10, ver `decisions.md`
 
 - [ ] **Layer con `openpyxl` y rol IAM dedicados** — hoy corre sobre

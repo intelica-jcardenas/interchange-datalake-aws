@@ -10,10 +10,11 @@
 #   .\scripts\sync-lambdas.ps1 -Group mc                # solo Mastercard
 #   .\scripts\sync-lambdas.ps1 -Group vi                # solo Visa
 #   .\scripts\sync-lambdas.ps1 -Group general           # solo generales (router, unzip, archive-file)
+#   .\scripts\sync-lambdas.ps1 -Group test               # infra prestada de prueba (hoy: test-1 = rules-refresh)
 #   .\scripts\sync-lambdas.ps1 -Lambda mc-interpreter   # uno especifico
 
 param(
-    [ValidateSet("all","mc","vi","general")]
+    [ValidateSet("all","mc","vi","general","test")]
     [string]$Group = "all",
     [string]$Lambda = ""
 )
@@ -44,6 +45,14 @@ $AllLambdas = [ordered]@{
     "mc-store"          = @{ Group="mc"; Dir="lambdas\mastercard\store" }
     "mc-iar"            = @{ Group="mc"; Dir="lambdas\mastercard\iar" }
     "mc-exchange-rates" = @{ Group="mc"; Dir="lambdas\mastercard\exchange-rates" }
+    # Infra prestada (temporal) -- ver lambdas\rules-refresh\README.md.
+    # "test-1" es el nombre REAL en AWS hoy (Lambda huerfano de pruebas,
+    # creado 2026-06-10, repurposed 2026-08-03 para prototipar
+    # lmbd-rules-refresh) -- no confundir con el FunctionName que dice
+    # lambdas\rules-refresh\config.json (itl-...-lmbd-rules-refresh), que
+    # todavia no existe en AWS. Actualizar esta entrada (suffix real y
+    # Dir) el dia que se cree el Lambda definitivo con su propio rol/layer.
+    "test-1"            = @{ Group="test"; Dir="lambdas\rules-refresh" }
 }
 
 # Validar -Lambda si se paso

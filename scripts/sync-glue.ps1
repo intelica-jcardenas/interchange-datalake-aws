@@ -41,6 +41,7 @@ $AllJobs = [ordered]@{
     "vi-data-quality"  = @{ Group="reports"; Dir="glue\scripts\reports\vi_data_quality" }
     "mc-data-quality"  = @{ Group="reports"; Dir="glue\scripts\reports\mc_data_quality" }
     "scheme-fee"     = @{ Group="reports"; Dir="glue\scripts\reports\scheme_fee" }
+    "ebgr-report"    = @{ Group="reports"; Dir="glue\scripts\reports\ebgr_report" }
 }
 
 # Invoca AWS CLI capturando stdout como UTF-8 via System.Diagnostics.Process.

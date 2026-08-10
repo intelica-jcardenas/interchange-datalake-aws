@@ -30,12 +30,13 @@
 #   .\scripts\push-lambdas.ps1 -Group mc                # solo Mastercard
 #   .\scripts\push-lambdas.ps1 -Group vi                # solo Visa
 #   .\scripts\push-lambdas.ps1 -Group general           # solo generales (router, unzip, archive-file)
+#   .\scripts\push-lambdas.ps1 -Group test               # infra prestada de prueba (hoy: test-1 = rules-refresh)
 #   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter    # una especifica
 #   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter -WhatIf   # arma el zip y muestra tamano, no sube nada
 #   .\scripts\push-lambdas.ps1 -Force                    # sin prompt de confirmacion (automatizacion)
 
 param(
-    [ValidateSet("all","mc","vi","general")]
+    [ValidateSet("all","mc","vi","general","test")]
     [string]$Group = "all",
     [string]$Lambda = "",
     [switch]$WhatIf,
@@ -68,6 +69,14 @@ $AllLambdas = [ordered]@{
     "mc-store"          = @{ Group="mc"; Dir="lambdas\mastercard\store" }
     "mc-iar"            = @{ Group="mc"; Dir="lambdas\mastercard\iar" }
     "mc-exchange-rates" = @{ Group="mc"; Dir="lambdas\mastercard\exchange-rates" }
+    # Infra prestada (temporal) -- ver lambdas\rules-refresh\README.md.
+    # "test-1" es el nombre REAL en AWS hoy (Lambda huerfano de pruebas,
+    # creado 2026-06-10, repurposed 2026-08-03 para prototipar
+    # lmbd-rules-refresh) -- no confundir con el FunctionName que dice
+    # lambdas\rules-refresh\config.json (itl-...-lmbd-rules-refresh), que
+    # todavia no existe en AWS. Actualizar esta entrada (suffix real y
+    # Dir) el dia que se cree el Lambda definitivo con su propio rol/layer.
+    "test-1"            = @{ Group="test"; Dir="lambdas\rules-refresh" }
 }
 
 # Directorios y patrones que nunca deben llegar al ZIP subido a AWS.
@@ -144,6 +153,20 @@ foreach ($Suffix in $ToSync.Keys) {
             Write-Host ""
             continue
         }
+    }
+
+    # test-1 (rules-refresh) necesita openpyxl/et_xmlfile empaquetados junto al
+    # codigo -- a diferencia de TODAS las demas Lambdas de este repo, no tiene
+    # layer propio que cubra esa dependencia (ver lambdas\rules-refresh\README.md).
+    # local\src\ solo tiene handler.py -- subir solo eso pisaria el ZIP real
+    # (que hoy incluye openpyxl) y rompería el Lambda en runtime (ImportError).
+    # Hasta que exista un layer dedicado, este push se salta -- desplegar a mano
+    # (bajar el ZIP real, reemplazar handler.py, resubir) como se hizo hasta ahora.
+    if ($Suffix -eq "test-1" -and -not (Test-Path (Join-Path $LocalSrc "openpyxl"))) {
+        Write-Host "  SKIP - test-1 necesita openpyxl/et_xmlfile empaquetados (no estan en src/ local) -- desplegar a mano" -ForegroundColor Yellow
+        $null = $Results.Add([pscustomobject]@{ Lambda = $Suffix; Group = $Meta.Group; Status = "SKIP (deps faltantes)" })
+        Write-Host ""
+        continue
     }
 
     # 1. Copiar src/ a un staging dir, excluyendo __pycache__ y basura de SO/editor.

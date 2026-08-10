@@ -1,0 +1,42 @@
+﻿{
+    "Job": {
+        "Name": "itl-0004-itx-dev-intchg-02-glue-ebgr-report",
+        "JobMode": "SCRIPT",
+        "JobRunQueuingEnabled": false,
+        "Description": "",
+        "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
+        "CreatedOn": "2026-07-31T18:37:35.760000-05:00",
+        "LastModifiedOn": "2026-08-03T16:30:30.045000-05:00",
+        "ExecutionProperty": {
+            "MaxConcurrentRuns": 1
+        },
+        "Command": {
+            "Name": "glueetl",
+            "ScriptLocation": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/ebgr_merchant.py",
+            "PythonVersion": "3"
+        },
+        "DefaultArguments": {
+            "--S3_OPERATIONAL": "s3://itl-0004-itx-dev-intchg-02-s3-operational",
+            "--enable-metrics": "",
+            "--enable-job-insights": "true",
+            "--conf": "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
+            "--enable-continuous-cloudwatch-log": "true",
+            "--S3_ANALYTICS": "s3://itl-0004-itx-dev-intchg-02-s3-analytics",
+            "--job-language": "python",
+            "--DYNAMO_TABLE_CLIENT": "itl-0004-itx-dev-dynamo-client-02",
+            "--S3_REFERENCE": "s3://itl-0004-itx-dev-intchg-02-s3-reference"
+        },
+        "Connections": {
+            "Connections": [
+                "itl-0004-itx-dev-intchg-02-glue-vpc-connection"
+            ]
+        },
+        "MaxRetries": 0,
+        "AllocatedCapacity": 2,
+        "Timeout": 30,
+        "MaxCapacity": 2.0,
+        "WorkerType": "G.1X",
+        "NumberOfWorkers": 2,
+        "GlueVersion": "4.0"
+    }
+}

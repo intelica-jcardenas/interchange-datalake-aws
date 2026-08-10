@@ -26,3 +26,11 @@ sql*
 
 # Credenciales de proxies para scraping de tasas (mc-exchange-rates)
 **/resources/proxy_settings.json
+
+# Dependencias empaquetadas junto al codigo (sin layer propio, ver
+# lambdas/rules-refresh/README.md) -- sync-lambdas.ps1 las baja de AWS junto
+# con handler.py, pero son vendored de terceros, no codigo del repo.
+lambdas/rules-refresh/src/openpyxl/
+lambdas/rules-refresh/src/openpyxl-*.dist-info/
+lambdas/rules-refresh/src/et_xmlfile/
+lambdas/rules-refresh/src/et_xmlfile-*.dist-info/
