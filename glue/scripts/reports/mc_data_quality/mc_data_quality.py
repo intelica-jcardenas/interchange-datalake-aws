@@ -344,22 +344,26 @@ def get_client_from_dynamo(customer_code: str) -> dict:
 
 def read_parquet(spark, path: str, name: str) -> DataFrame:
     """
-    Lee un directorio Parquet desde S3 sin schema explícito, dejando que
-    Spark infiera el schema desde los datos (a diferencia de
+    Lee un parquet desde S3 sin schema explícito, dejando que Spark infiera
+    el schema desde los datos (a diferencia de
     read_ipm_1644_operational/read_ipm_1240_operational, que sí declaran
     schema fijo). Usado para tablas de referencia pequeñas y consistentes
-    (business_transaction_type, currency, validation_conditions).
+    (business_transaction_type, currency, validation_conditions) — se les
+    pasa el archivo exacto (`.../data.parquet`), no el prefijo/carpeta, para
+    no depender de que Spark ignore algún archivo no-parquet que conviva ahí
+    (ej. `currency/` también tiene `m_currency.csv/`, usado por
+    glue-exchange-rates vía catálogo).
 
     Args:
         spark: Sesión de Spark activa.
-        path: Path S3 al directorio Parquet a leer.
+        path: Path S3 al archivo o directorio Parquet a leer.
         name: Nombre descriptivo de la fuente, solo para logging.
 
     Returns:
-        DataFrame con el contenido del directorio.
+        DataFrame con el contenido leído.
 
     Ejemplo:
-        read_parquet(spark, f"{S3_REFERENCE}/currency/", "currency")
+        read_parquet(spark, f"{S3_REFERENCE}/currency/data.parquet", "currency")
     """
     print(f"[READ] {name}: {path}", flush=True)
     return spark.read.option("mergeSchema", "false").parquet(path)
@@ -726,9 +730,9 @@ def get_mastercard_validation_results_settlement(
         f"file_type=IN/date={query_date}/"
     )
 
-    btt_path = f"{S3_REFERENCE}/mastercard_business_transaction_type/"
-    currency_path = f"{S3_REFERENCE}/currency/"
-    validation_path = f"{S3_REFERENCE}/validation_conditions/"
+    btt_path = f"{S3_REFERENCE}/mastercard_business_transaction_type/data.parquet"
+    currency_path = f"{S3_REFERENCE}/currency/data.parquet"
+    validation_path = f"{S3_REFERENCE}/validation_conditions/data.parquet"
 
     df_raw = read_ipm_1644_operational(spark, data_path)
 
@@ -977,9 +981,9 @@ def get_mastercard_validation_results_transactional(
         f"file_type={file_type}/date={query_date}/"
     )
 
-    btt_path = f"{S3_REFERENCE}/mastercard_business_transaction_type/"
-    currency_path = f"{S3_REFERENCE}/currency/"
-    validation_path = f"{S3_REFERENCE}/validation_conditions/"
+    btt_path = f"{S3_REFERENCE}/mastercard_business_transaction_type/data.parquet"
+    currency_path = f"{S3_REFERENCE}/currency/data.parquet"
+    validation_path = f"{S3_REFERENCE}/validation_conditions/data.parquet"
 
     #df_raw = read_parquet(spark, data_path, "IPM_1240")
     df_raw = read_ipm_1240_operational(spark, data_path)

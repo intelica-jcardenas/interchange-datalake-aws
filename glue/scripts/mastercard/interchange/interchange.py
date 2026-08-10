@@ -412,20 +412,22 @@ def build_schema_from_layout(items: Iterable[Dict[str, Any]]) -> StructType:
  
 def read_parquet(spark: SparkSession, path: str, name: str) -> DataFrame:
     """
-    Lee un directorio Parquet desde S3 sin schema explícito (Spark infiere
-    desde los datos). Usado para tablas de referencia (currency, mc_rules) y
-    CAL.
+    Lee un parquet desde S3 sin schema explícito (Spark infiere desde los
+    datos) — acepta tanto un archivo exacto (ej. currency/data.parquet,
+    preferido para tablas de referencia chicas, evita que Spark liste la
+    carpeta entera si conviviera con algún archivo no-parquet) como un
+    directorio (usado para CAL, que sí son varios part-files reales).
 
     Args:
         spark: Sesión de Spark activa.
-        path: Path S3 al directorio Parquet.
+        path: Path S3 al archivo o directorio Parquet.
         name: Nombre descriptivo de la fuente, solo para logging.
 
     Returns:
-        DataFrame con el contenido del directorio.
+        DataFrame con el contenido leído.
 
     Ejemplo:
-        read_parquet(spark, f"{s3_reference}/currency/", "REF currency")
+        read_parquet(spark, f"{s3_reference}/currency/data.parquet", "REF currency")
     """
     log(f"[READ] {name}: {path}")
     return spark.read.option("mergeSchema", "false").parquet(path)
@@ -1631,7 +1633,7 @@ def run_interchange_mti(
     txn_prefix =  (f"{s3_staging}/{client_id}/MC/400_IPM_{mti}_CLN/"f"file_type={file_type}/date={file_date}/")
     calc_prefix = (f"{s3_staging}/{client_id}/MC/500_IPM_{mti}_CAL/"f"file_type={file_type}/date={file_date}/")
  
-    currency_path = f"{s3_reference}/currency/"
+    currency_path = f"{s3_reference}/currency/data.parquet"
     rules_path = f"{s3_reference}/mc_rules/data.parquet"
  
     # Salida final en STAGING, no en carpeta local.

@@ -19,10 +19,17 @@ y se borra de aquí — no se acumulan items completados con `[x]`.
   propio** antes de dejar el trigger S3→Lambda activo de forma
   permanente — hoy está activo y auto-publica sin aprobación manual
   (diseño ya acordado), pero sigue corriendo sobre infra prestada.
-- [ ] **Commit pendiente** de `lambdas/rules-refresh/` y el fix de
-  `glue/scripts/mastercard/interchange/interchange.py`
-  (`mc_rules/data.parquet` exacto en vez de prefijo — ver `decisions.md`,
-  cambio validado sin regresión, no bug real confirmado).
+- [ ] **Commit pendiente** de `lambdas/rules-refresh/` y los fixes de
+  archivo-exacto-vs-prefijo en `glue/scripts/mastercard/interchange/interchange.py`
+  (`currency`, `mc_rules`) y `glue/scripts/reports/mc_data_quality/mc_data_quality.py`
+  (`currency`, `mastercard_business_transaction_type`,
+  `validation_conditions`) — ver `decisions.md`, ambos desplegados y
+  validados con smoke test real (2026-08-10), sin regresión.
+- [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
+  (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
+  paths — sigue sin ninguna validación de que sus *resultados* (filas de
+  validación, discrepancias detectadas) sean correctos contra legacy.
+  Pendiente si se decide integrar este job al pipeline real.
 
 **Nota:** se evaluó y descartó explícitamente una tabla DynamoDB de
 auditoría (`rules_control`) para este Lambda — proceso chico y de baja

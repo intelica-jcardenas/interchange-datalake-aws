@@ -26,6 +26,29 @@ Las decisiones con implementación/validación extensas fueron resumidas aquí �
 
 ---
 
+## Auditoría completa de lecturas a `s3-reference` (prefijo/directorio vs archivo exacto) — 2026-08-10, 2 fixes aplicados y validados
+
+**Motivo:** a raíz del fix de `mc_rules` (ver decisión de arriba), el usuario pidió auditar TODAS las lecturas de tablas de referencia en los 8 scripts que tocan `s3-reference` (`visa/calculate.py`, `visa/interchange.py`, `mastercard/calculate.py`, `mastercard/interchange.py`, `get_transaction.py`, `scheme_fee.py`, `vi_data_quality.py`, `mc_data_quality.py`) — recordaba un incidente real anterior con un CSV en `currency/` que rompió un proceso que esperaba solo `.parquet`.
+
+**Hallazgo confirmado:** `currency/` en `s3-reference` SÍ tiene un archivo no-parquet real hoy — `currency/m_currency.csv/m_currency.csv` (subido 2026-08-05). No es basura: es el input real de la tabla de catálogo Glue `m_currency_csv` (`itl_0004_itx_dev_02_glue_database_exchange_rates`), consumida por `glue-exchange-rates`/`format_exchange_rates.py` vía `glueContext.create_dynamic_frame.from_catalog(...)` — **no se puede borrar** sin romper ese job. Coincide con el recuerdo del usuario (mismo tipo de problema, misma carpeta) — posiblemente el mismo archivo resubido, o el mismo patrón repitiéndose.
+
+**3 lecturas en modo PREFIJO/DIRECTORIO encontradas (mismo patrón de riesgo que `mc_rules`), 2 corregidas:**
+1. `currency/` en `glue-mc-interchange` (`interchange.py:1634`, ahora `:1636`) y `mc_data_quality.py` (×2 ocurrencias) → cambiado a `currency/data.parquet` exacto.
+2. `mastercard_business_transaction_type/` en `mc_data_quality.py` (×2) → `mastercard_business_transaction_type/data.parquet` exacto.
+3. `validation_conditions/` en `mc_data_quality.py` (×2, inconsistente con `vi_data_quality.py` que ya leía el archivo exacto) → `validation_conditions/data.parquet` exacto.
+
+**Confirmado que NO rompía hoy** (evidencia real, no solo teoría): `glue-mc-interchange` corrió 3 veces el mismo día con el CSV ya presente desde el 2026-08-05, todas `SUCCEEDED` — mismo comportamiento de Spark que con `mc_rules/history/` (no recorre subcarpetas de un nivel que no siguen el patrón Hive `clave=valor`). El fix es igualmente defensivo/de robustez, no la corrección de un bug activo confirmado.
+
+**Resto de lecturas de referencia en los 8 scripts: ya usaban archivo exacto** (`country`, `region`, `mastercard_iar`, `mastercard_brand_product`, `visa_rules`, `visa_ardef`, `visa_bin_products`, `mastercard_bin_products`, `local_switch`, `scheme_fee_bin_products`, `bin_funding_source`, `visa_business_transaction_type`, `size_ticket`, `visa_business_transaction_cycle`, y `validation_conditions` en `vi_data_quality.py`). `exchange-rates-glue/brand=X/exchange_date=Y/` es la única lectura de directorio que queda — partición Hive real por diseño (múltiples part-files legítimos por partición), contenido confirmado limpio.
+
+**Lambdas (`lmbd-mc-clean`, `lmbd-mc-iar`, `lmbd-vi-ardef`) confirmadas sin este riesgo, por diseño:** todas usan `S3.get_object(Bucket=..., Key="carpeta/data.parquet")` (key exacta) + `pd.read_parquet(io.BytesIO(body))` — `get_object` no puede "leer una carpeta entera", nunca hace listado de directorio. Sin cambios necesarios ahí.
+
+**Desplegado y validado (2026-08-10):** ambos scripts subidos a S3 real (`ScriptLocation`). `glue-mc-interchange` — smoke test contra EBGR `1A243466B3AC24A91E3B5376494943B3`/2026-01-05/MTI 1240: `SUCCEEDED`, `rules_needed=1557` (idéntico al baseline pre-fix), sin regresión. `mc_data_quality.py` — smoke test EBGR/2026-01-05/`I`/`default`: `SUCCEEDED` — **primera ejecución de este job contra datos reales en toda su historia** (antes solo se había probado sin datos reales, ver `gotchas.md`), las 5 lecturas de referencia (`mastercard_business_transaction_type`, `currency`, `validation_conditions` ×2 pasadas) confirmadas leyendo el archivo exacto, output generado en `s3-analytics/EBGR/reports/quality/range_2026-01-05_2026-01-05/`.
+
+**Sin commitear.**
+
+---
+
 ## Scheme Fee (`glue-scheme-fee`) — mapeo de etapas `generate`/`read` vs legacy y estructura de `s3-analytics/` — VALIDADO 2026-07-08, referencia permanente (fusionado desde `scheme_fee_generate_read_pipeline.md`, retirado 2026-07-31 por ya no aplicar como "temporal" — sin urgencia de cierre, EBGR no usa cuotas)
 
 **Contexto:** `glue-scheme-fee` replica el módulo legacy de cuotas (`managment.py`/`getquery.py`, proceso EC2) en 2 modos: `--mode generate` (arma el detalle+reporte y exporta un CSV para el equipo externo que calcula las cuotas) y `--mode read` (lee el CSV de vuelta con los costos y los propaga). El histórico de bugs/investigaciones/decisiones de diseño más extenso vive en la memoria de usuario `scheme_fee_job_design.md` (no versionada en este repo) — esta entrada es solo el mapeo de etapas + estructura de carpetas.
