@@ -6,7 +6,29 @@ memoria de usuario: ver `push_sync_scripts_design.md` e
 `itx_document_script_skill.md`). Lo resuelto se documenta en
 `decisions.md`/`gotchas.md` (o en la memoria de usuario correspondiente)
 y se borra de aquí — no se acumulan items completados con `[x]`.
-Última actualización: 2026-07-31.
+Última actualización: 2026-08-10.
+
+---
+
+## Automatización `lmbd-rules-refresh` (refresh de visa_rules/mc_rules) — probado 2026-08-10, ver `decisions.md`
+
+- [ ] **Layer con `openpyxl` y rol IAM dedicados** — hoy corre sobre
+  infraestructura prestada (`lmbd-test-1`, rol `lmbd-vi-role`), sin
+  Lambda ni rol propios.
+- [ ] **Decidir si se queda sobre `lmbd-test-1` o se migra a un Lambda
+  propio** antes de dejar el trigger S3→Lambda activo de forma
+  permanente — hoy está activo y auto-publica sin aprobación manual
+  (diseño ya acordado), pero sigue corriendo sobre infra prestada.
+- [ ] **Commit pendiente** de `lambdas/rules-refresh/` y el fix de
+  `glue/scripts/mastercard/interchange/interchange.py`
+  (`mc_rules/data.parquet` exacto en vez de prefijo — ver `decisions.md`,
+  cambio validado sin regresión, no bug real confirmado).
+
+**Nota:** se evaluó y descartó explícitamente una tabla DynamoDB de
+auditoría (`rules_control`) para este Lambda — proceso chico y de baja
+frecuencia, no la justifica. El schema propuesto y toda referencia en
+código/README fueron eliminados (no solo deshabilitados) — no queda
+ningún rastro en el repo, ver `decisions.md`.
 
 ---
 
@@ -35,9 +57,16 @@ y se borra de aquí — no se acumulan items completados con `[x]`.
   concentrado 100% en `transaction_type_id=22` (ATM cash withdrawal) —
   bug en `glue-vi-interchange` (asignación de fee), no en
   `get_transaction.py`. Detalle → `gotchas.md`.
-- [ ] **`vi-data-quality`**: `NumberOfWorkers=10`/`MaxConcurrentRuns=1`
-  vs sus pares de reportería (`2`/`1`) — dejado sin tocar a pedido
-  explícito del usuario, no confirmar sin que lo pida.
+- [ ] **`vi-data-quality`**: `NumberOfWorkers=10` vs sus pares de
+  reportería (`2`) — sigue sin confirmar, dejado sin tocar a pedido
+  explícito del usuario. `MaxConcurrentRuns` cambió de `1` a `50` en AWS
+  el 2026-07-31 (fuera de esta sesión, no lo tocamos nosotros) —
+  confirmado con un sync completo de los 9 Glue jobs (los otros 8 sin
+  ningún diff, script+config+args idénticos a AWS). Repo local
+  actualizado para reflejar el `50` real. Sin decidir si es intencional
+  (alineación con sus pares, que ya usan 50) o el mismo patrón de
+  "contaminación de consola" ya visto en otros jobs — ver
+  `decisions.md` → "Estandarización de configuración de Glue Jobs".
 
 ---
 

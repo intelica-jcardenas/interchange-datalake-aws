@@ -1,0 +1,26 @@
+{
+    "_status": "PROPUESTO — no desplegado en AWS. Este archivo no es un dump real de `get-function-configuration` (a diferencia de los demas config.json del repo) — es la config con la que se recomienda crear el Lambda. Reemplazar por el dump real (via sync-lambdas.ps1) despues del primer despliegue.",
+    "FunctionName": "itl-0004-itx-dev-intchg-02-lmbd-rules-refresh",
+    "Runtime": "python3.11",
+    "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-rules-refresh-role",
+    "Handler": "handler.lambda_handler",
+    "Description": "Refresco de visa_rules/mc_rules desde excels de reglas de interchange subidos a s3-reference/interchange_rules/",
+    "Timeout": 300,
+    "MemorySize": 4096,
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "Layers": [
+        "PENDIENTE — necesita openpyxl ademas de pandas/pyarrow. El layer compartido itx-pandas-pyarrow NO incluye openpyxl (usado hoy solo por Lambdas que leen/escriben Parquet, no Excel) — ver README.md de esta carpeta."
+    ],
+    "Environment": {
+        "Variables": {
+            "S3_BUCKET_REFERENCE": "itl-0004-itx-dev-intchg-02-s3-reference",
+            "RULES_MIN_ROW_RATIO": "0.5"
+        }
+    },
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ]
+}

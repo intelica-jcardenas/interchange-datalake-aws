@@ -8,8 +8,19 @@ Contexto: para depurar el pipeline es mucho más rápido ejecutar cada paso a ma
 
 ```powershell
 aws sso login --profile itx-dev
-$env:AWS_PROFILE = "itx-dev"   # opcional, evita pasar --profile en cada comando
+$env:AWS_PROFILE = "itx-dev"   # NO opcional para scripts/*.ps1 que no pasan --profile explícito
 ```
+
+**`$env:AWS_PROFILE` no persiste entre invocaciones de tool separadas**
+(mismo comportamiento que el resto del estado de shell) — hay que
+setearlo en el mismo bloque de comando que invoca el script, cada vez.
+Sin esto, `sync-glue.ps1`/`sync-lambdas.ps1`/`push-glue.ps1`/
+`push-lambdas.ps1` (que usan `Invoke-AwsCli` sin `--profile` explícito)
+fallan en silencio — cada job/Lambda sale como `"SKIP - no encontrado en
+AWS"`, un mensaje engañoso que no indica que el problema es de
+credenciales, no de que el recurso no exista. `aws sts get-caller-identity`
+con `--profile itx-dev` explícito puede seguir funcionando en paralelo y
+confundir el diagnóstico.
 
 ---
 

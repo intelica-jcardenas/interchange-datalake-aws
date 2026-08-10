@@ -1632,7 +1632,7 @@ def run_interchange_mti(
     calc_prefix = (f"{s3_staging}/{client_id}/MC/500_IPM_{mti}_CAL/"f"file_type={file_type}/date={file_date}/")
  
     currency_path = f"{s3_reference}/currency/"
-    rules_path = f"{s3_reference}/mc_rules/"
+    rules_path = f"{s3_reference}/mc_rules/data.parquet"
  
     # Salida final en STAGING, no en carpeta local.
     #output_base = s3_staging.rstrip("/")

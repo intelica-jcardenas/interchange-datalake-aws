@@ -1,0 +1,6 @@
+{
+    "Variables": {
+        "S3_BUCKET_REFERENCE": "itl-0004-itx-dev-intchg-02-s3-reference",
+        "RULES_MIN_ROW_RATIO": "0.5"
+    }
+}

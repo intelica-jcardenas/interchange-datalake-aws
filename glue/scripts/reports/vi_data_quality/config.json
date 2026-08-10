@@ -5,9 +5,9 @@
         "JobRunQueuingEnabled": false,
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-08T08:51:02.242000-05:00",
-        "LastModifiedOn": "2026-07-30T15:34:34.883000-05:00",
+        "LastModifiedOn": "2026-07-31T18:37:35.481000-05:00",
         "ExecutionProperty": {
-            "MaxConcurrentRuns": 1
+            "MaxConcurrentRuns": 50
         },
         "Command": {
             "Name": "glueetl",
@@ -22,8 +22,8 @@
             "--enable-continuous-cloudwatch-log": "true",
             "--operational_bucket": "itl-0004-itx-dev-intchg-02-s3-operational",
             "--job-language": "python",
-            "--dynamodb_table_client": "itl-0004-itx-dev-dynamo-client-02",
             "--TempDir": "s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/temp/vi-data-quality/",
+            "--dynamodb_table_client": "itl-0004-itx-dev-dynamo-client-02",
             "--reference_bucket": "itl-0004-itx-dev-intchg-02-s3-reference",
             "--analytics_bucket": "itl-0004-itx-dev-intchg-02-s3-analytics"
         },
