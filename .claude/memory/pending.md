@@ -92,7 +92,9 @@ confirme que está terminado/validado, documentar con la skill
 
 ---
 
-## Automatización `lmbd-rules-refresh` (refresh de visa_rules/mc_rules) — probado 2026-08-10, ver `decisions.md`
+## Automatización `lmbd-rules-refresh` (refresh de visa_rules/mc_rules) — probado 2026-08-10, primer refresh REAL de producción 2026-08-11, ver `decisions.md`
+
+**2026-08-11:** primer uso real del trigger para publicar un cambio de negocio genuino (no solo smoke test) — fix de expansión de familias `TRANSACTION_CODE` (excel V38) desplegado a `lmbd-test-1` y disparado subiendo el excel a S3. Backup automático + publicación + smoke test contra EBGR/SBSA, cero regresión. Ver decisión "`visa_rules`: excel V38 simplifica `TRANSACTION_CODE`..." en `decisions.md`.
 
 - [ ] **Layer con `openpyxl` y rol IAM dedicados** — hoy corre sobre
   infraestructura prestada (`lmbd-test-1`, rol `lmbd-vi-role`), sin
@@ -101,6 +103,10 @@ confirme que está terminado/validado, documentar con la skill
   propio** antes de dejar el trigger S3→Lambda activo de forma
   permanente — hoy está activo y auto-publica sin aprobación manual
   (diseño ya acordado), pero sigue corriendo sobre infra prestada.
+  Acción del usuario pendiente (2026-08-11): pedirle al equipo que
+  renombren `lmbd-test-1` o creen un Lambda nuevo con la misma
+  configuración/código — el docstring de `handler.py` ya documenta
+  explícitamente este gap (nombre real en AWS vs nombre "definitivo").
 - [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
   (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
   paths — sigue sin ninguna validación de que sus *resultados* (filas de

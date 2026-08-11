@@ -1,13 +1,7 @@
 """
-handler.py — Lambda propuesta: itl-0004-itx-dev-intchg-02-lmbd-rules-refresh
+handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-rules-refresh
 ================================================================================
 Archivo:     lambdas/rules-refresh/src/handler.py
-Estado:      PROPUESTA — no desplegada en AWS todavia. Ver README.md de esta
-             carpeta para lo que falta antes de poder crearla (layer con
-             openpyxl, notificacion S3, rol IAM). Sin tabla de auditoria en
-             DynamoDB por decision explicita — proceso chico y de baja
-             frecuencia, el resultado de cada refresh (diff, exito/fallo)
-             queda en CloudWatch, no hace falta un registro aparte.
 
 Refresca visa_rules/data.parquet y mc_rules/data.parquet en s3-reference a
 partir de los excels de reglas de interchange que el negocio sube
@@ -47,6 +41,11 @@ Flujo por archivo:
        - Ratio de filas nuevo/actual por debajo de RULES_MIN_ROW_RATIO
          (default 0.5) -> falla dura. Guarda barata contra "subieron el
          sheet equivocado" o un archivo truncado.
+       - VISA: TRANSACTION_CODE en notacion abreviada de 1 digito (formato
+         V38+, ej. "5") se expande a la familia completa de TCs (ver
+         VISA_TC_FAMILIES/_expand_transaction_code_family) antes de
+         guardar — codigos ya completos de 2 digitos (formato V37, ej.
+         "25") se dejan sin tocar.
        - Error al leer/parsear el excel (hoja no encontrada, archivo
          corrupto) -> tratado igual que un RulesValidationError, no como
          error de infraestructura (sin este guard, un archivo con la hoja
@@ -72,6 +71,17 @@ MASTERCARD Reglas Intercambio V23.xlsx): _build_visa_rules()/_build_mc_rules()
 producen un DataFrame identico (assert_frame_equal, check_dtype=False) al
 generado por el prototipo build_and_compare_rules.py para ambas marcas — no
 se solo probo que "no rompe", se confirmo equivalencia fila a fila.
+
+Uso real en produccion (no solo pruebas):
+  - 2026-08-10: primera prueba end-to-end sobre lmbd-test-1 con el trigger S3
+    real (subida de un excel real disparando el Lambda sin invocacion
+    manual).
+  - 2026-08-11: primer refresh real de un cambio de negocio genuino (excel
+    VISA V38, expansion de familias de TRANSACTION_CODE — ver
+    VISA_TC_FAMILIES/_expand_transaction_code_family arriba) — SUCCESS,
+    backup automatico a visa_rules/history/, visa_rules/data.parquet
+    publicado, smoke test de glue-vi-interchange contra 2 archivos reales
+    (EBGR/SBSA) sin regresion. Detalle completo en decisions.md.
 
 Variables de entorno:
   S3_BUCKET_REFERENCE            : bucket s3-reference (incoming, parquet, history, archive)
@@ -151,6 +161,66 @@ MC_KEY_COLS = ["jurisdiction", "guide_date", "valid_from", "intelica_id"]
 
 DATE_LIKE_COLS = {"guide_date", "valid_from", "valid_until"}
 NA_STRINGS = {"", "nan", "none", "nat", "<na>"}
+
+# A partir de la version V38 del excel VISA, TRANSACTION_CODE llega como un
+# digito base sin cero a la izquierda (ej. "5", "5,6") en vez de la lista
+# explicita de codigos que traia V37 (ej. "05,25"). Un codigo base es la
+# notacion abreviada de toda una FAMILIA de TCs que comparten el mismo
+# business_transaction_type (ver calc_business_transaction_type_draft en
+# glue/scripts/visa/calculate/calculate.py: purchase_codes/cash_codes/
+# atm_codes) — 05 (compra 1ra presentacion) implica tambien su reversal
+# 15/35 y su contracargo 25.
+VISA_TC_FAMILIES = {
+    "05": ("05", "15", "25", "35"),
+    "06": ("06", "16", "26", "36"),
+    "07": ("07", "17", "27", "37"),
+}
+
+
+def _expand_transaction_code_family(value):
+    """
+    Expande un valor de TRANSACTION_CODE a su familia completa cuando viene
+    en notacion abreviada de 1 digito (formato V38+). Un codigo que YA
+    viene con 2 digitos (formato V37, ej. "25") se deja tal cual, sin
+    expandir — ahi el excel ya listaba el codigo exacto que la regla
+    necesitaba, y expandirlo igual romperia reglas viejas que a proposito
+    no incluian codigos de reversal/re-presentment.
+
+    Args:
+        value: Valor crudo de la celda TRANSACTION_CODE (ej. "5,6", "05,25"
+            o NaN/None si la regla no tiene esta condicion).
+
+    Returns:
+        String con los codigos expandidos y deduplicados, separados por
+        coma, en el mismo formato que ya consume `_apply_default()` en
+        `glue/scripts/visa/interchange/interchange.py`. Devuelve `value`
+        sin cambios si es nulo/vacio.
+
+    Ejemplo:
+        _expand_transaction_code_family("5,6")
+        # -> "05,15,25,35,06,16,26,36"
+        _expand_transaction_code_family("05,25")
+        # -> "05,25" (formato V37, sin cambios)
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return value
+    text = str(value).strip()
+    if text == "" or text.upper() in ("NAN", "NONE"):
+        return value
+
+    codes = [c.strip() for c in text.split(",") if c.strip() != ""]
+    expanded = []
+    seen = set()
+    for code in codes:
+        if code.isdigit() and len(code) == 1:
+            family = VISA_TC_FAMILIES.get(code.zfill(2), (code.zfill(2),))
+        else:
+            family = (code,)
+        for fc in family:
+            if fc not in seen:
+                seen.add(fc)
+                expanded.append(fc)
+    return ",".join(expanded)
 
 BRAND_CONFIG = {
     "VISA": {
@@ -390,6 +460,8 @@ def _build_visa_rules(raw_df: pd.DataFrame) -> pd.DataFrame:
         data[col] = pd.to_numeric(data[col], errors="coerce")
 
     data.columns = data.columns.str.lower()
+    if "transaction_code" in data.columns:
+        data["transaction_code"] = data["transaction_code"].apply(_expand_transaction_code_family)
     return data
 
 

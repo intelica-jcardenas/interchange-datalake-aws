@@ -6,6 +6,44 @@ Las decisiones con implementación/validación extensas fueron resumidas aquí �
 
 ---
 
+## `visa_rules`: excel V38 simplifica `TRANSACTION_CODE` a familia base — expansión agregada en `lmbd-rules-refresh`/`build_and_compare_rules.py`, DESPLEGADO Y VALIDADO CONTRA DATOS REALES 2026-08-11
+
+**Contexto:** a raíz de la extensión de TCs de `lmbd-vi-transform` (ver decisión de abajo), el excel de reglas de interchange Visa también cambió — el usuario subió `VISA Reglas Intercambio V38 dev.xlsx` a `tst_files/interchange_rules/` y pidió confirmar si la columna `TRANSACTION_CODE` se había simplificado a representar solo la familia base (`05`/`06`/`07`) en vez de listar cada TC explícito, esperando que el pipeline expanda `05` a toda la familia `{05,15,25,35}`.
+
+**Confirmado con datos reales (comparación fila a fila por `INTELICA_ID`, 30,403 filas):**
+- V37 listaba explícitamente el código de primera presentación **junto con su contracargo** en la misma regla (ej. `"05,25"`, `"05,06,25,26"`, `"06,26,07,27"`) — nunca incluyó los reversal codes (`15,16,17,35,36,37`).
+- V38 colapsa esas mismas reglas a solo el dígito base, **sin cero a la izquierda**: `"5"`, `"5,6"`, `"6"`, `"7"`, `"5,6,7"` — mapeo 1:1 sistemático, confirmado en el 99.9% de las 30,403 filas.
+- 2 problemas reales encontrados, no solo el de alcance que el usuario ya sospechaba:
+  1. **Pérdida del cero a la izquierda** (`"5"` en vez de `"05"`) — el motor de reglas (`_apply_default()` en `interchange.py`) hace comparación de string exacta contra `draft_code`, que siempre viene de 2 dígitos. Sin corregir esto, **ningún** rule con condición `transaction_code` volvería a matchear nunca, ni siquiera para lo que V38 sí menciona.
+  2. **17 filas con mapeo inconsistente** (no las ~12 estimadas al principio) donde la familia base de V38 no coincide con lo que V37 tenía (ej. Honduras AFT `intelica_id=11-17`: V37 `05,07,25,27` → V38 `5,6`, perdiendo la familia 7 y ganando la 6 que no estaba). Verificado que en esas 17 filas **solo cambia `TRANSACTION_CODE`**, el resto de la regla (fee, jurisdicción, vigencia) es idéntico — **confirmado por el usuario con el equipo de reglas: es una corrección de negocio intencional, no un error de tipeo.**
+
+**Familia usada para la expansión — ya existía en el código, no es nueva:** `calc_business_transaction_type_draft()` en `glue/scripts/visa/calculate/calculate.py` (línea 971-973) ya agrupa `purchase_codes=[05,15,25,35]`, `cash_codes=[06,16,26,36]`, `atm_codes=[07,17,27,37]` para otro campo derivado — se reutilizó la misma agrupación, no una interpretación nueva.
+
+**Dónde se aplicó el fix — deliberadamente NO en `interchange.py`/`calculate.py`:** el motor de reglas (`_apply_default()`) ya soporta listas separadas por comas vía `isin()` — no hace falta tocarlo. El fix vive en la **etapa de construcción del parquet de reglas**, los 2 lugares que hoy leen el excel:
+- `tst_files/interchange_rules/build_and_compare_rules.py` → `read_rules_visa()` (proceso manual)
+- `lambdas/rules-refresh/src/handler.py` → `_build_visa_rules()` (Lambda automático con trigger S3 activo)
+
+Nueva función `_expand_transaction_code_family()` (duplicada en ambos archivos, mismo patrón de duplicación ya usado entre estos 2 — `handler.py` documenta explícitamente que es una réplica del proceso manual) + constante `VISA_TC_FAMILIES`. Lógica: un código de **1 dígito** (formato V38) se expande a la familia completa; un código que ya viene de **2 dígitos** (formato V37) se deja intacto — así la función es segura para ambos formatos sin necesidad de detectar de qué versión viene el excel (no hace falta un flag externo).
+
+**Validación de la función antes de tocar producción:**
+- Contra los 30,403 valores reales de V37: **0 filas cambiarían** — confirma que el fix es inocuo sobre el formato viejo (idempotente).
+- Contra los 5 patrones reales de V38: expande correctamente (`"5"`→`"05,15,25,35"`, `"5,6"`→unión de ambas familias, etc.).
+
+**Desplegado y publicado 2026-08-11:**
+1. Fix subido al Lambda real `lmbd-test-1` (`push-lambdas.ps1 -Lambda test-1 -Force`), verificado byte a byte con sync-back (67 líneas agregadas, 0 líneas tocadas).
+2. Excel subido a `s3-reference/interchange_rules/VISA/` — el trigger S3 lo procesó solo (`SUCCESS`, 41s): backup automático a `visa_rules/history/data_20260811T190612.parquet`, publicó `visa_rules/data.parquet` nuevo (30,403 filas), archivó el excel a `_archive/`. Diff logueado por el propio Lambda: `added=0, removed=0, columns_with_diff: {transaction_code: 30397}` — coincide exacto con la comparación local previa (`build_and_compare_rules.py` apuntado ad-hoc a V38, sin modificar su default que sigue en V37).
+3. `tst_files/reference_data/visa_rules.parquet` (cache local) actualizado con el parquet recién publicado.
+
+**Smoke test contra 2 archivos reales ya conocidos (mismo patrón que el refresh de V37):**
+- EBGR `93BF199C85D2DF243AFDABEE5572E8C0` (2026-01-03, IN, 269,725 filas): `glue-vi-interchange` `SUCCEEDED`, **output ITX idéntico byte a byte** antes/después.
+- SBSA `7102B505635CCF3C8E8BE335DACA3193` (2026-01-27, OUT, 1,740,991 filas): `SUCCEEDED`, 956 filas con `interchange_fee_variable`/`interchange_fee_amount` "distintos" a primera vista — investigado a fondo: `interchange_intelica_id`/`fee_descriptor`/`fee_currency`/`fee_fixed`/`fee_min`/`fee_cap` 100% idénticos en esas filas, la diferencia máxima real es `9.89e-17` (fee_variable) y `7.50e-12` (fee_amount) — **ruido de precisión de punto flotante entre 2 ejecuciones de Spark no determinísticas** (orden de shuffle/partición), no un efecto del cambio de reglas. **Cero regresión confirmada en ambos archivos.**
+
+**Por qué el smoke test no muestra el efecto real del fix (esperado, no es una limitación del test):** EBGR y SBSA son clientes de producción cuyos `draft_code` siempre estuvieron dentro del set viejo (`05,06,07,25,26,27`) — los TCs `15,16,17,35,36,37` recién los soporta `lmbd-vi-transform` desde ayer (ver decisión de abajo), y solo para archivos de NXGR, que todavía no llegan a `extract`/`calculate`/`interchange` (fuera de alcance de esa sesión). El efecto real de la expansión de familias (una transacción con `draft_code=15` matcheando ahora la misma regla que `05`) no se puede demostrar end-to-end hasta que algún cliente real genere esos TCs y el pipeline downstream los consuma.
+
+**Sin commitear** (código en `lambdas/rules-refresh/src/handler.py` — decisión del usuario, no de esta sesión).
+
+---
+
 ## `lmbd-vi-transform`: nuevos Transaction Codes Visa (RETURNED, RECLASSIFICATION) + extensión BASEII + fix de `RecordAccumulator` para TCSN alfabético — DESPLEGADO Y VALIDADO CONTRA DATOS REALES 2026-08-11
 
 **Contexto:** actualización de los manuales Visa que agrega TCs que el pipeline no reconocía. Pedido explícito del usuario: alcance acotado **solo** a `lambdas/visa/transform/src/handler.py` — extract/clean/calculate/interchange/DynamoDB `visa_fields` quedan fuera, para una sesión futura.
