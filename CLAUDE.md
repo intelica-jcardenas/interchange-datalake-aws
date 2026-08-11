@@ -418,9 +418,11 @@ configuración, ver `.claude/memory/pending.md` → memoria de usuario
 
 | Tipo | Marca | Descripcion | Encoding |
 |------|-------|-------------|----------|
-| BASEII | Visa | Transacciones (TC 05/06/07/25/26/27) | Texto plano, latin-1, ancho fijo |
+| BASEII | Visa | Transacciones (TC 05/06/07/25/26/27; +15/16/17/35/36/37 y TCSN "D" agregados 2026-08-11 en `lmbd-vi-transform`, desplegado y validado contra datos reales del cliente NXGR — ver `.claude/memory/decisions.md`) | Texto plano, latin-1, ancho fijo |
 | SMS | Visa | Transacciones (TC 33) | Texto plano, latin-1, ancho fijo |
 | VSS | Visa | Settlement / liquidacion (TC 46, file_type=IN) | Texto plano, latin-1, ancho fijo |
+| RETURNED | Visa | Returned Credit/Debit/Nonfinancial (TC 01/02/03, TCSN 0-9+D/E, combinados en un solo output). **Nuevo 2026-08-11, solo en `lmbd-vi-transform`, desplegado y validado con datos reales** — extract/clean/calculate/interchange no lo consumen todavía. | Texto plano, latin-1, ancho fijo |
+| RECLASSIFICATION | Visa | Reclassification (TC 04, TCSN 0-7/9+D/E, sin "8"). **Nuevo 2026-08-11, solo en `lmbd-vi-transform`, desplegado y validado con datos reales** — extract/clean/calculate/interchange no lo consumen todavía. | Texto plano, latin-1, ancho fijo |
 | ARDEF | Visa | Rangos de BINes y reglas de fees | Texto plano, latin-1 |
 | IAR | Mastercard | Rangos de BINes y reglas de fees | EBCDIC |
 | IN/OUT | Mastercard | Transacciones de interchange | EBCDIC |

@@ -1,6 +1,6 @@
 ﻿{
     "TableName":  "itl-0004-itx-dev-dynamo-file_pattern-02",
-    "Count":  18,
+    "Count":  20,
     "Items":  [
                   {
                       "created_at":  {
@@ -351,6 +351,38 @@
                   },
                   {
                       "created_at":  {
+                                         "S":  "2026-08-11 15:29:25"
+                                     },
+                      "direction":  {
+                                        "S":  "INCOMING"
+                                    },
+                      "file_type":  {
+                                        "S":  "VI Incoming"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "19"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "VISA"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "NXGR VISA Incoming"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:NEXI-INTELICA-VISA-IN)"
+                                      },
+                      "customer_code":  {
+                                            "S":  "NXGR"
+                                        }
+                  },
+                  {
+                      "created_at":  {
                                          "S":  "2026-01-06 17:41:21"
                                      },
                       "direction":  {
@@ -379,6 +411,38 @@
                                       },
                       "customer_code":  {
                                             "S":  "SBSA"
+                                        }
+                  },
+                  {
+                      "created_at":  {
+                                         "S":  "2026-08-11 15:29:25"
+                                     },
+                      "direction":  {
+                                        "S":  "OUTGOING"
+                                    },
+                      "file_type":  {
+                                        "S":  "VI Outgoing"
+                                    },
+                      "pattern_id":  {
+                                         "S":  "20"
+                                     },
+                      "priority":  {
+                                       "N":  "10"
+                                   },
+                      "brand":  {
+                                    "S":  "VISA"
+                                },
+                      "is_active":  {
+                                        "N":  "1"
+                                    },
+                      "description":  {
+                                          "S":  "NXGR VISA Outgoing"
+                                      },
+                      "file_format":  {
+                                          "S":  "(?:NEXI-INTELICA-VISA-OUT)"
+                                      },
+                      "customer_code":  {
+                                            "S":  "NXGR"
                                         }
                   },
                   {

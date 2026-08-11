@@ -6,7 +6,57 @@ memoria de usuario: ver `push_sync_scripts_design.md` e
 `itx_document_script_skill.md`). Lo resuelto se documenta en
 `decisions.md`/`gotchas.md` (o en la memoria de usuario correspondiente)
 y se borra de aquí — no se acumulan items completados con `[x]`.
-Última actualización: 2026-08-10.
+Última actualización: 2026-08-11.
+
+---
+
+## `lmbd-vi-transform`: TCs nuevos Visa (RETURNED/RECLASSIFICATION/BASEII extendido) — CERRADO 2026-08-11
+
+Trabajo completo, validado a fondo con datos reales (cliente NXGR) y cerrado
+a pedido del usuario. Detalle completo → `decisions.md`. Queda abierto solo
+lo que sigue:
+
+- [ ] **Downstream fuera de alcance a propósito:** `lmbd-vi-extract`/
+  `lmbd-vi-clean`/`glue-vi-calculate`/`glue-vi-interchange` y la tabla
+  DynamoDB `visa_fields` no saben nada todavía de `RETURNED`/
+  `RECLASSIFICATION` ni de la columna `"D"` nueva en BASEII — esos Parquets
+  se generan en `s3-staging` pero nada los consume aún más adelante en el
+  pipeline. Definir cuándo se aborda (sesión futura).
+- [ ] **Crawler/database de Glue para `NXGR`** — confirmado que no existe
+  ninguno (ni para VISA ni MASTERCARD) — ya hay Parquets reales en
+  `s3-staging/NXGR/VISA/...` pero nadie puede consultarlos vía Athena/
+  catálogo. Ofrecido al usuario, decidido dejarlo para después.
+- [ ] **3 combinaciones TC/TCSN sin probar con datos reales** (solo tests
+  sintéticos): TC `15/16/17/35/36/37` y TCSN `"D"` en BASEII (los 7
+  records BASEII reales vistos eran todos del rango viejo 05-27), y TC
+  `03` (Returned Nonfinancial) — solo se vio `01`/`02` en datos reales.
+  Riesgo bajo (mismo `_tcsn_ordinal`/mecanismo de sets ya probado con
+  datos reales para `D`/`E` en RETURNED/RECLASSIFICATION) — repetir el
+  chequeo de tabulación TC/TCSN si aparece un archivo real que los use,
+  sin necesidad de buscarlos activamente.
+- [ ] **EBGR/SBSA — riesgo aceptado, sin acción:** si algún día reciben
+  archivos con los TC nuevos, la columna `"D"` puede generar un
+  `HIVE_BAD_DATA`/`HIVE_PARTITION_SCHEMA_MISMATCH` transitorio en Athena
+  hasta re-correr el crawler (`staging_ebgr_visa`/`staging_sbsa_visa`, sin
+  schedule, no se autocorrigen). Mismo fix ya validado varias veces en
+  `gotchas.md` — decidido no hacer nada proactivo, solo re-crawlear si
+  pasa.
+
+---
+
+## Estructura Hive-partitioned para reportes en `s3-analytics` — propuesta lista, sin implementar
+
+Propuesta completa en artifact: https://claude.ai/code/artifact/662380d0-15b7-42c4-8c0b-42e6c97b1403
+(`get_transaction.py` → `report_month=YYYYMM/data.parquet` + `_adhoc/{tag}/` para corridas
+de investigación; `scheme_fee.py` → agregar `report_month=` a `state/`/`final/`, CSV
+IN/OUT sin tocar). Motivada porque hoy no existe ningún crawler/database de Glue
+apuntando a `s3-analytics` — no se puede consultar desde Athena vía catálogo todavía.
+
+- [ ] **Revisar la propuesta y decidir si se implementa** — sin apuro, el usuario
+  pidió dejarla anotada para revisar más adelante.
+- [ ] Si se aprueba: decidir qué hacer con el histórico ya generado de
+  `get_transaction` (reescribir vs. aplicar la estructura solo hacia adelante),
+  y si `_adhoc/` vive en `s3-analytics` o en otro bucket.
 
 ---
 
@@ -51,12 +101,6 @@ confirme que está terminado/validado, documentar con la skill
   propio** antes de dejar el trigger S3→Lambda activo de forma
   permanente — hoy está activo y auto-publica sin aprobación manual
   (diseño ya acordado), pero sigue corriendo sobre infra prestada.
-- [ ] **Commit pendiente** de `lambdas/rules-refresh/` y los fixes de
-  archivo-exacto-vs-prefijo en `glue/scripts/mastercard/interchange/interchange.py`
-  (`currency`, `mc_rules`) y `glue/scripts/reports/mc_data_quality/mc_data_quality.py`
-  (`currency`, `mastercard_business_transaction_type`,
-  `validation_conditions`) — ver `decisions.md`, ambos desplegados y
-  validados con smoke test real (2026-08-10), sin regresión.
 - [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
   (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
   paths — sigue sin ninguna validación de que sus *resultados* (filas de

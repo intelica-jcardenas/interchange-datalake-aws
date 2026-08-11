@@ -1,5 +1,31 @@
 # Gotchas y problemas conocidos
 
+## lmbd-router: archivo sin match de patrón en `file_pattern` (DynamoDB) se descarta en silencio, sin rastro persistente — CONFIRMADO 2026-08-11, PENDIENTE (sin fix, solo documentado)
+
+**Archivo:** `lambdas/router/src/handler.py`, funciones `clasificar_archivo()` (línea ~1182) y su uso en `lambda_handler()` (línea ~1579-1583).
+
+`clasificar_archivo()` recorre los patrones activos de DynamoDB `file_pattern` en orden de prioridad, probando `re.search(regex, filename)` de cada uno — devuelve `None` si ninguno matchea. Cuando eso pasa:
+
+```python
+clasificacion = clasificar_archivo(filename, patrones)
+if not clasificacion:
+    logger.warning(f"  Sin match de patrón: {filename}")
+    results.append({'file': filename, 'status': 'SKIPPED', 'reason': 'No pattern match'})
+    continue
+```
+
+**Consecuencias confirmadas leyendo el código (no reproducido con un archivo real):**
+- No se genera `file_id`, no se calcula `content_hash`, **no se registra nada en DynamoDB `file_control`** — el archivo no deja ningún rastro operacional, como si nunca hubiera llegado.
+- No dispara ninguna etapa siguiente (Step Function, `lmbd-vi-ardef`/`lmbd-mc-iar`, unzip).
+- El archivo original **se queda en `s3-landing` sin moverse** — nunca llega a `lmbd-archive-file` porque ese paso corre al final del pipeline normal, y este archivo nunca entra al pipeline.
+- Única traza: un `logger.warning` en CloudWatch + un `status: SKIPPED` dentro del `results` que retorna el Lambda — pero como el router se dispara async por evento S3, nadie ve ese resultado salvo que vaya a buscarlo manualmente en CloudWatch. No cuenta como error (`continue`, sigue con el resto del batch, `statusCode: 200` igual), así que **tampoco dispara ninguna alarma de CloudWatch basada en fallos de Lambda**.
+
+**Por qué importa ahora:** surgió investigando qué pasaría si un archivo de reglas Visa (u otro tipo nuevo) llegara con un nombre que no matchea ningún patrón `file_pattern` configurado (typo en el regex, tipo de archivo nuevo del cliente, etc.) — se perdería de forma invisible.
+
+**Sin fix aplicado — solo documentado a pedido del usuario.** Si se retoma: candidatos razonables son (a) mover el archivo a un prefijo tipo `_unclassified/` en landing (mismo patrón `_archive/`/`_rejected/` ya usado en `lmbd-rules-refresh`) en vez de dejarlo donde cayó, y/o (b) una alarma de CloudWatch sobre el patrón de log `"Sin match de patrón"` para que alguien se entere sin tener que revisar logs a mano.
+
+---
+
 ## glue-mc-interchange: columna `settlement_currency_u` muerta en `calculate_mastercard_fee_pyspark()` — LIMPIADA Y DESPLEGADA 2026-07-31
 
 **Archivo:** `glue/scripts/mastercard/interchange/interchange.py`, STEP 1 de `calculate_mastercard_fee_pyspark()`.

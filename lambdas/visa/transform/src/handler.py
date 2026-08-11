@@ -6,12 +6,16 @@ Archivo:     lambdas/visa/transform/src/handler.py
 Primera etapa del pipeline Visa. Lee el archivo CTF de texto plano de
 ancho fijo (latin-1) desde el bucket de landing en UNA SOLA PASADA y
 agrupa los bytes en records estructurados según los manuales Visa,
-generando tres tipos de Parquet en paralelo:
-  - BASEII (TC 05/06/07/25/26/27) — records transaccionales
+generando cinco tipos de Parquet en paralelo:
+  - BASEII (TC 05/06/07/25/26/27/15/16/17/35/36/37) — records
+    transaccionales; TCSN 0-7 + D (extensión agregada 2026-08)
   - SMS    (TC 33) — records transaccionales de settlement messages
   - VSS    (TC 46, solo file_type=IN) — records de liquidación, lo que
     Visa reporta que cobró; se contrastan más adelante en
     `glue-vi-interchange` contra la tarificación propia (Data Quality)
+  - RETURNED (TC 01 Returned Credit / 02 Returned Debit / 03 Returned
+    Nonfinancial, combinados en un solo output) — TCSN 0-9 + D/E
+  - RECLASSIFICATION (TC 04) — TCSN 0-7, 9, D/E (sin "8")
 
 Cada línea del archivo se clasifica por su Transaction Code (`tc`,
 posición 0-2) y TCSN (`tcsn`, posición 3-4), se acumula en el record
@@ -69,9 +73,12 @@ FLUSH_BATCH_SIZE = int(os.environ.get('FLUSH_BATCH_SIZE', '200000'))
 # =============================================================================
 
 # BASEII — Transaction Codes financieros y administrativos
-BASEII_TC_SET   = {"05", "06", "07", "25", "26", "27"}
-BASEII_TCSN_SET = {"0", "1", "2", "3", "4", "5", "6", "7"}
-BASEII_COLUMNS  = ["0", "1", "2", "3", "4", "5", "6", "7"]  # columnas del Parquet
+# TCSN "D" y TC 15/16/17/35/36/37 agregados 2026-08 (actualización del
+# manual Visa) — ver _tcsn_ordinal() para por qué el TCSN alfabético
+# necesitó un fix aparte en RecordAccumulator.
+BASEII_TC_SET   = {"05", "06", "07", "25", "26", "27", "15", "16", "17", "35", "36", "37"}
+BASEII_TCSN_SET = {"0", "1", "2", "3", "4", "5", "6", "7", "D"}
+BASEII_COLUMNS  = ["0", "1", "2", "3", "4", "5", "6", "7", "D"]  # columnas del Parquet
 
 # SMS — Settlement Messages (TC 33)
 SMS_TC_SET          = {"33"}
@@ -98,10 +105,35 @@ VSS_TYPE_POS     = (60, 63)            # posición del tipo en la línea TCSN=0
 VSS_SUFFIX_POS   = (63, 65)            # posición del sufijo validador
 VSS_SUFFIX_VALUE = "  "               # sufijo esperado (2 espacios)
 
+# RETURNED — TC 01 (Returned Credit), 02 (Returned Debit), 03 (Returned
+# Nonfinancial). Los 3 comparten el mismo rango de TCSN, así que se
+# combinan en un solo acumulador/output (mismo patrón que BASEII, que ya
+# combina varios TCs distintos) — el texto crudo de cada línea sigue
+# conteniendo el TC real en la posición 0-2, así que no se pierde
+# información para diferenciarlos después si hiciera falta.
+# TCSN 0-8, 9, D, E (manual Visa) — el "9" se agregó 2026-08-11 tras
+# validar contra archivos reales de NXGR: TC=01/02 TCSN=9 aparecía en el
+# archivo crudo pero no en ningún TCSN_SET, se estaba descartando.
+RETURNED_TC_SET   = {"01", "02", "03"}
+RETURNED_TCSN_SET = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "E"}
+RETURNED_COLUMNS  = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "E"]
+
+# RECLASSIFICATION — TC 04. TCSN 0-7, 9, D, E (manual Visa -- OJO: sin
+# "8", a diferencia de RETURNED). El "9" se agregó 2026-08-11 tras
+# validar contra archivos reales de NXGR: TC=04 TCSN=9 representaba el
+# 100% de los records de este grupo (cada record cierra con una línea
+# TCSN=9 que se estaba descartando por completo, aunque el record se
+# seguia cerrando bien gracias a la linea TCSN=0 del siguiente).
+RECLASS_TC_SET   = {"04"}
+RECLASS_TCSN_SET = {"0", "1", "2", "3", "4", "5", "6", "7", "9", "D", "E"}
+RECLASS_COLUMNS  = ["0", "1", "2", "3", "4", "5", "6", "7", "9", "D", "E"]
+
 # Subdirectorios de salida en S3 (consistentes con el pipeline)
-BASEII_SUBDIR = "100-BASEII_RAW_DRAFTS"
-SMS_SUBDIR    = "100-SMS_RAW_MESSAGES"
-VSS_SUBDIRS   = {vt: f"100-VSS_{vt}_RAW" for vt in VSS_TYPES}
+BASEII_SUBDIR   = "100-BASEII_RAW_DRAFTS"
+SMS_SUBDIR      = "100-SMS_RAW_MESSAGES"
+VSS_SUBDIRS     = {vt: f"100-VSS_{vt}_RAW" for vt in VSS_TYPES}
+RETURNED_SUBDIR = "100-RETURNED_RAW"
+RECLASS_SUBDIR  = "100-RECLASS_RAW"
 
 
 # =============================================================================
@@ -223,6 +255,35 @@ def _read_line_blocks(
 # Equivalente a _pivot_values_on_key del código original EC2.
 # =============================================================================
 
+def _tcsn_ordinal(key: str) -> int:
+    """
+    Convierte una clave TCSN a un entero ordenable. Dígitos 0-9 valen su
+    propio valor; letras (D, E, ...) valen 10 + su posición alfabética,
+    para que siempre ordenen DESPUÉS de cualquier dígito.
+
+    Necesario porque TCSN "D"/"E" (BASEII extendido, RETURNED,
+    RECLASSIFICATION) son extensiones que aparecen DESPUÉS de los TCSN
+    numéricos dentro del mismo record, no el inicio de uno nuevo — tratar
+    "D" como si valiera 0 (como haría un simple `int(key)` sobre una
+    clave no numérica) cerraría el record de forma incorrecta apenas
+    apareciera una línea TCSN "D" a continuación de TCSN "7".
+
+    Args:
+        key: Clave TCSN ("0"-"9" o letra "D"/"E"/...) o record_type SMS
+            (siempre numérico, sin efecto de este ajuste).
+
+    Returns:
+        Entero ordenable: el valor del dígito, o 10+offset alfabético.
+
+    Ejemplo:
+        _tcsn_ordinal("7")  # 7
+        _tcsn_ordinal("D")  # 13 (> cualquier dígito)
+    """
+    if key.isdigit():
+        return int(key)
+    return 10 + (ord(key.upper()) - ord('A'))
+
+
 class RecordAccumulator:
     """
     Acumula las líneas de un mismo record lógico.
@@ -258,8 +319,8 @@ class RecordAccumulator:
         formar parte del nuevo record en progreso.
 
         Args:
-            key: Clave de la línea (TCSN "0"-"7" para BASEII/VSS, o
-                record_type de 5 dígitos para SMS).
+            key: Clave de la línea (TCSN "0"-"8"/"D"/"E" según el grupo,
+                o record_type de 5 dígitos para SMS).
             line: Contenido completo de la línea.
 
         Returns:
@@ -272,8 +333,9 @@ class RecordAccumulator:
             acc.feed("1", linea1)  # None
             acc.feed("0", linea2)  # {"0": linea0, "1": linea1} (cerró)
         """
-        # Convertir clave a entero para comparar (TCSN "0"-"7" o índice)
-        key_int = int(key) if key.isdigit() else 0
+        # Convertir clave a entero ordenable (ver _tcsn_ordinal — los TCSN
+        # alfabéticos "D"/"E" deben ordenar después de cualquier dígito).
+        key_int = _tcsn_ordinal(key)
 
         completed = None
         if self._prev_key is not None and key_int <= self._prev_key and self._current:
@@ -483,7 +545,8 @@ def _process_single_pass(
 ) -> list:
     """
     Lee el archivo CTF UNA SOLA VEZ y genera todos los Parquets (BASEII,
-    SMS, VSS) en paralelo, sin necesidad de releer el archivo por tipo.
+    SMS, VSS, RETURNED, RECLASSIFICATION) en paralelo, sin necesidad de
+    releer el archivo por tipo.
 
     Por cada bloque de líneas leído (`_read_line_blocks`), clasifica cada
     línea por su Transaction Code (`tc`) y TCSN (`tcsn`), y la alimenta al
@@ -496,6 +559,10 @@ def _process_single_pass(
       3. VSS (solo file_type=IN): TC=46/TCSN en {0,1} → acumulador único →
          se determina el tipo (110/120/130/140) leyendo una posición fija
          del record ya cerrado → uno de 4 ParquetBatchWriters según el tipo
+      4. RETURNED: TC en {01,02,03}/TCSN en RETURNED_TCSN_SET → acumulador
+         único (los 3 TC combinados) → ParquetBatchWriter
+      5. RECLASSIFICATION: TC=04/TCSN en RECLASS_TCSN_SET → acumulador
+         único → ParquetBatchWriter
 
     Al terminar la lectura, hace flush del último record en progreso de
     cada acumulador (`flush_last()`), ya que el fin del archivo no dispara
@@ -526,25 +593,31 @@ def _process_single_pass(
         # [{'output_type': 'BASEII', 's3_key': '...', 'records': 350000, ...}, ...]
     """
     # ── S3 keys de destino ──────────────────────────────────────────────────
-    baseii_key = _build_s3_key(client_id, brand, file_type, file_date, BASEII_SUBDIR, content_hash)
-    sms_key    = _build_s3_key(client_id, brand, file_type, file_date, SMS_SUBDIR, content_hash)
-    vss_keys   = {
+    baseii_key   = _build_s3_key(client_id, brand, file_type, file_date, BASEII_SUBDIR, content_hash)
+    sms_key      = _build_s3_key(client_id, brand, file_type, file_date, SMS_SUBDIR, content_hash)
+    returned_key = _build_s3_key(client_id, brand, file_type, file_date, RETURNED_SUBDIR, content_hash)
+    reclass_key  = _build_s3_key(client_id, brand, file_type, file_date, RECLASS_SUBDIR, content_hash)
+    vss_keys     = {
         vt: _build_s3_key(client_id, brand, file_type, file_date, VSS_SUBDIRS[vt], content_hash)
         for vt in VSS_TYPES
     }
 
     # ── Writers ──────────────────────────────────────────────────────────────
-    baseii_writer = ParquetBatchWriter(STAGING_BUCKET, baseii_key, BASEII_COLUMNS, content_hash)
-    sms_writer    = ParquetBatchWriter(STAGING_BUCKET, sms_key,    SMS_COLUMNS,   content_hash)
-    vss_writers   = {
+    baseii_writer   = ParquetBatchWriter(STAGING_BUCKET, baseii_key,   BASEII_COLUMNS,   content_hash)
+    sms_writer      = ParquetBatchWriter(STAGING_BUCKET, sms_key,      SMS_COLUMNS,      content_hash)
+    returned_writer = ParquetBatchWriter(STAGING_BUCKET, returned_key, RETURNED_COLUMNS, content_hash)
+    reclass_writer  = ParquetBatchWriter(STAGING_BUCKET, reclass_key,  RECLASS_COLUMNS,  content_hash)
+    vss_writers     = {
         vt: ParquetBatchWriter(STAGING_BUCKET, vss_keys[vt], VSS_COLUMNS, content_hash)
         for vt in VSS_TYPES
     }
 
     # ── Acumuladores de records lógicos ─────────────────────────────────────
-    baseii_acc = RecordAccumulator()
-    sms_acc    = RecordAccumulator()
-    vss_acc    = RecordAccumulator()
+    baseii_acc   = RecordAccumulator()
+    sms_acc      = RecordAccumulator()
+    vss_acc      = RecordAccumulator()
+    returned_acc = RecordAccumulator()
+    reclass_acc  = RecordAccumulator()
 
     total_lines = 0
 
@@ -584,6 +657,18 @@ def _process_single_pass(
                         if vss_type in VSS_TYPES_SET and suffix == VSS_SUFFIX_VALUE:
                             vss_writers[vss_type].add(completed)
 
+            # RETURNED: TC 01 (Credit) / 02 (Debit) / 03 (Nonfinancial), combinados
+            elif tc in RETURNED_TC_SET and tcsn in RETURNED_TCSN_SET:
+                completed = returned_acc.feed(tcsn, line)
+                if completed:
+                    returned_writer.add(completed)
+
+            # RECLASSIFICATION: TC 04
+            elif tc in RECLASS_TC_SET and tcsn in RECLASS_TCSN_SET:
+                completed = reclass_acc.feed(tcsn, line)
+                if completed:
+                    reclass_writer.add(completed)
+
     logger.info(f"Single pass complete. Total lines read: {total_lines:,}")
 
     # ── Flush de los últimos records (pueden quedar al llegar al EOF) ────────
@@ -604,6 +689,14 @@ def _process_single_pass(
                 suffix   = tcsn0[VSS_SUFFIX_POS[0]:VSS_SUFFIX_POS[1]]
                 if vss_type in VSS_TYPES_SET and suffix == VSS_SUFFIX_VALUE:
                     vss_writers[vss_type].add(last)
+
+    last = returned_acc.flush_last()
+    if last:
+        returned_writer.add(last)
+
+    last = reclass_acc.flush_last()
+    if last:
+        reclass_writer.add(last)
 
     # ── Cerrar writers y construir la lista de outputs ───────────────────────
     outputs = []
@@ -648,6 +741,30 @@ def _process_single_pass(
     else:
         logger.info("VSS: skipped (file_type=OUT)")
 
+    returned_total = returned_writer.close()
+    if returned_total > 0:
+        logger.info(f"RETURNED: {returned_total:,} records")
+        outputs.append({
+            "output_type": "RETURNED",
+            "s3_key":      returned_key,
+            "records":     returned_total,
+            "subdir":      RETURNED_SUBDIR,
+        })
+    else:
+        logger.warning("RETURNED: no records found")
+
+    reclass_total = reclass_writer.close()
+    if reclass_total > 0:
+        logger.info(f"RECLASSIFICATION: {reclass_total:,} records")
+        outputs.append({
+            "output_type": "RECLASSIFICATION",
+            "s3_key":      reclass_key,
+            "records":     reclass_total,
+            "subdir":      RECLASS_SUBDIR,
+        })
+    else:
+        logger.warning("RECLASSIFICATION: no records found")
+
     return outputs
 
 
@@ -660,7 +777,7 @@ def lambda_handler(event, context):
     Punto de entrada de la Lambda `lmbd-vi-transform`. Invocada por la
     Step Function Visa como primer paso tras la clasificación del router.
     Descarga el archivo CTF de landing y delega en `_process_single_pass()`
-    la generación de los Parquets BASEII/SMS/VSS.
+    la generación de los Parquets BASEII/SMS/VSS/RETURNED/RECLASSIFICATION.
 
     Args:
         event: Payload de Step Functions con `client_id`, `file_id`,
@@ -698,6 +815,9 @@ def lambda_handler(event, context):
                 {"output_type": "VSS_110",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_110_RAW"},
                 {"output_type": "VSS_120",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_120_RAW"},
                 {"output_type": "VSS_130",  "s3_key": "...", "records": ...,    "subdir": "100-VSS_130_RAW"},
+                # además, si el archivo trae devoluciones/reclasificaciones (opcional):
+                # {"output_type": "RETURNED",         "s3_key": "...", "records": ..., "subdir": "100-RETURNED_RAW"},
+                # {"output_type": "RECLASSIFICATION", "s3_key": "...", "records": ..., "subdir": "100-RECLASS_RAW"},
             ],
             "client_id": ..., "file_id": ..., "brand": ...,
             "file_type": ..., "file_date": ..., "content_hash": ...
