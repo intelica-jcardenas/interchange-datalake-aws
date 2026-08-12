@@ -66,12 +66,13 @@ Salida
   CSV (intercambio con equipo externo):
     s3://{scheme_fee_bucket}/OUT/{client}/{client}_{report_month}_{ts}.csv   (generate)
     s3://{scheme_fee_bucket}/IN/{client}/{in_file_key}                       (leído en read)
-  Estado interno (Parquet):
-    s3://{analytics_bucket}/{client}/scheme_fee/state/{report_month}/detail/
-    s3://{analytics_bucket}/{client}/scheme_fee/state/{report_month}/report/
-    s3://{analytics_bucket}/{client}/scheme_fee/state/{report_month}/summary.json
-    s3://{analytics_bucket}/{client}/scheme_fee/final/{report_month}/detail/   (tras read)
-    s3://{analytics_bucket}/{client}/scheme_fee/final/{report_month}/report/   (tras read)
+  Estado interno (Parquet, particionado Hive por report_month — ver
+  decisions.md "Estructura Hive para reportes en s3-analytics"):
+    s3://{analytics_bucket}/{client}/scheme_fee/state/report_month={report_month}/detail/
+    s3://{analytics_bucket}/{client}/scheme_fee/state/report_month={report_month}/report/
+    s3://{analytics_bucket}/{client}/scheme_fee/state/report_month={report_month}/summary.json
+    s3://{analytics_bucket}/{client}/scheme_fee/final/report_month={report_month}/detail/   (tras read)
+    s3://{analytics_bucket}/{client}/scheme_fee/final/report_month={report_month}/report/   (tras read)
 
 REFERENCIA NUEVA REQUERIDA (no existe aún en s3-reference — subir antes de
 correr el job; ver detalle de columnas en load_bin_funding_source(),
@@ -204,8 +205,8 @@ ENABLE_SMS = True
 
 s3 = boto3.client("s3")
 
-STATE_PREFIX = f"{CLIENT_CODE}/scheme_fee/state/{REPORT_MONTH}"
-FINAL_PREFIX = f"{CLIENT_CODE}/scheme_fee/final/{REPORT_MONTH}"
+STATE_PREFIX = f"{CLIENT_CODE}/scheme_fee/state/report_month={REPORT_MONTH}"
+FINAL_PREFIX = f"{CLIENT_CODE}/scheme_fee/final/report_month={REPORT_MONTH}"
 
 # =============================================================================
 # CONSTANTES DE NEGOCIO (portadas literalmente del legacy — no son "datos de

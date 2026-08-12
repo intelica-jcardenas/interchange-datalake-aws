@@ -19,9 +19,16 @@ Fuentes de datos
 
 Salida
 ------
-  S3 analytics    : {client_id}/reports/report_transactions_{client_id}_{report_suffix}.parquet
+  S3 analytics (particionado Hive por report_month — ver decisions.md
+  "Estructura Hive para reportes en s3-analytics"):
+    corrida oficial : {client_id}/reports/get_transaction/report_month={report_month}/data.parquet
+    corrida adhoc   : {client_id}/reports/get_transaction/_adhoc/{adhoc_tag}/data.parquet
   Una sola escritura por ejecución, cubriendo el rango [start_date, end_date].
-  report_suffix es un parámetro del job (ej: "202601", "202601_v2").
+  report_month (YYYYMM) es siempre obligatorio. adhoc_tag decide el
+  destino Y nombra la carpeta cuando aplica: vacío ("") escribe/sobreescribe
+  la corrida oficial del mes; no vacío (ej. "byfix", "sms_test") deriva a
+  _adhoc/{adhoc_tag}/ (fuera del alcance de cualquier crawler que excluya
+  ese prefijo).
 
 Schema de salida (32 columnas)
 -------------------------------
@@ -39,8 +46,14 @@ Parámetros del job
   --client_code           Código de cliente único, ej: "EBGR"
   --start_date            Inicio del rango en formato YYYY-MM-DD (inclusive)
   --end_date              Fin del rango en formato YYYY-MM-DD (inclusive)
-  --report_suffix         Identificador para el nombre de salida, ej: "202601"
-                           o "202601_v2" — reemplaza al YYYYMM[_suffix] anterior
+  --report_month          Partición Hive del reporte oficial, formato YYYYMM,
+                           ej: "202601" — siempre obligatorio, incluso en
+                           corridas adhoc (se usa para el rango de datos,
+                           no solo para el nombre de la partición)
+  --adhoc_tag             "" (vacío) para la corrida oficial del mes —
+                           cualquier otro valor (ej: "byfix", "sms_test")
+                           deriva la escritura a _adhoc/{adhoc_tag}/ en vez
+                           de sobreescribir report_month={report_month}/
   --scheme_fee            "true" / "false" — activa el duplicado on-us y el
                            join de costo de cuotas contra scheme_fee.py
   --operational_bucket    Nombre del bucket operational (lectura de Parquets)
@@ -130,7 +143,8 @@ args = getResolvedOptions(
         "client_code",
         "start_date",
         "end_date",
-        "report_suffix",
+        "report_month",
+        "adhoc_tag",
         "scheme_fee",
         "operational_bucket",
         "reference_bucket",
@@ -142,7 +156,8 @@ args = getResolvedOptions(
 CLIENT_CODE = args["client_code"].strip().upper()
 START_DATE = args["start_date"]
 END_DATE = args["end_date"]
-REPORT_SUFFIX = args["report_suffix"].strip()
+REPORT_MONTH = args["report_month"].strip()
+ADHOC_TAG = args["adhoc_tag"].strip()
 SCHEME_FEE = args["scheme_fee"].lower() == "true"
 OPERATIONAL_BUCKET = args["operational_bucket"]
 BUCKET_REF = args["reference_bucket"]
@@ -1267,23 +1282,37 @@ def process_client_range(
 def write_result(df: DataFrame, client_id: str) -> str:
     """
     Escribe el reporte final como un único archivo Parquet en el bucket
-    S3 analytics, bajo {client_id}/reports/.
+    S3 analytics, bajo {client_id}/reports/get_transaction/ — particionado
+    Hive por report_month (ver decisions.md, "Estructura Hive para
+    reportes en s3-analytics").
+
+    Dos destinos posibles según ADHOC_TAG:
+      - ADHOC_TAG vacío (corrida oficial): escribe a
+        report_month={REPORT_MONTH}/data.parquet — sobreescribe el
+        reporte oficial del mes, es lo único que un crawler apuntado a
+        esta carpeta debe catalogar.
+      - ADHOC_TAG no vacío (corrida de investigación/comparativo): escribe
+        a _adhoc/{ADHOC_TAG}/data.parquet — el propio valor de ADHOC_TAG
+        nombra la carpeta (ej. "byfix", "sms_test"), mismo prefijo "_" que
+        ya usa lmbd-rules-refresh para sus carpetas administrativas, un
+        crawler configurado para excluirlo nunca ve estas corridas.
 
     Args:
         df: DataFrame final (32 columnas de FINAL_COLS) a persistir.
-        client_id: Código de cliente, usado en el nombre del archivo.
-            Ejemplo: "SBSA".
+        client_id: Código de cliente, usado en la ruta. Ejemplo: "SBSA".
 
     Returns:
         Path completo de S3 donde quedó escrito el archivo.
 
     Ejemplo:
         s3_path = write_result(result_df, "SBSA")
-        # "s3://itl-...-s3-analytics/SBSA/reports/report_transactions_SBSA_202601.parquet"
+        # oficial (--adhoc_tag ""):       "s3://itl-...-s3-analytics/SBSA/reports/get_transaction/report_month=202601/data.parquet"
+        # adhoc (--adhoc_tag byfix):      "s3://itl-...-s3-analytics/SBSA/reports/get_transaction/_adhoc/byfix/data.parquet"
     """
-    filename = f"report_transactions_{client_id}_{REPORT_SUFFIX}.parquet"
-
-    s3_key = f"{client_id}/reports/{filename}"
+    if ADHOC_TAG:
+        s3_key = f"{client_id}/reports/get_transaction/_adhoc/{ADHOC_TAG}/data.parquet"
+    else:
+        s3_key = f"{client_id}/reports/get_transaction/report_month={REPORT_MONTH}/data.parquet"
     s3_path = f"s3://{ANALYTICS_BUCKET}/{s3_key}"
 
     log_info(f"[write_result] Writing {df.count()} rows → {s3_path}")
@@ -1315,7 +1344,8 @@ def main():
     log_info("glue-vi-mc-reporting Start")
     log_info(f"  client        : {CLIENT_CODE}")
     log_info(f"  range         : {START_DATE} -> {END_DATE}")
-    log_info(f"  report_suffix : {REPORT_SUFFIX}")
+    log_info(f"  report_month  : {REPORT_MONTH}")
+    log_info(f"  adhoc_tag     : {ADHOC_TAG or '(vacio -> corrida oficial)'}")
     log_info(f"  scheme_fee    : {SCHEME_FEE}")
     log_info("=" * 70)
 

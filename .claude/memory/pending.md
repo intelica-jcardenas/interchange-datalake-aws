@@ -44,19 +44,65 @@ lo que sigue:
 
 ---
 
-## Estructura Hive-partitioned para reportes en `s3-analytics` — propuesta lista, sin implementar
+## Estructura Hive-partitioned para reportes en `s3-analytics` — CÓDIGO EDITADO Y DATOS YA REORGANIZADOS 2026-08-11, script SIN DESPLEGAR (a propósito)
 
-Propuesta completa en artifact: https://claude.ai/code/artifact/662380d0-15b7-42c4-8c0b-42e6c97b1403
-(`get_transaction.py` → `report_month=YYYYMM/data.parquet` + `_adhoc/{tag}/` para corridas
-de investigación; `scheme_fee.py` → agregar `report_month=` a `state/`/`final/`, CSV
-IN/OUT sin tocar). Motivada porque hoy no existe ningún crawler/database de Glue
-apuntando a `s3-analytics` — no se puede consultar desde Athena vía catálogo todavía.
+Propuesta completa en artifact: https://claude.ai/code/artifact/662380d0-15b7-42c4-8c0b-42e6c97b1403.
+Retomada y ejecutada 2026-08-11 — **el usuario pidió explícitamente no desplegar
+nada a AWS todavía** ("no despliegues nada, mañana reviso a primera hora"), así
+que el código quedó listo en el repo pero el `ScriptLocation` real en
+`s3-reference` sigue con la versión anterior (sin el fix) hasta que confirme.
 
-- [ ] **Revisar la propuesta y decidir si se implementa** — sin apuro, el usuario
-  pidió dejarla anotada para revisar más adelante.
-- [ ] Si se aprueba: decidir qué hacer con el histórico ya generado de
-  `get_transaction` (reescribir vs. aplicar la estructura solo hacia adelante),
-  y si `_adhoc/` vive en `s3-analytics` o en otro bucket.
+**Código editado (local, sin desplegar):**
+- `glue/scripts/reports/get_transaction/get_transaction.py`: **`report_suffix`
+  eliminado** (ya no es argumento del job — versión 2026-08-12, ver
+  `decisions.md` para el diseño intermedio descartado). Ahora 2 args:
+  `report_month` (obligatorio, YYYYMM) y `adhoc_tag` (obligatorio-pero-vacío-
+  por-default, mismo patrón que `force`/`in_file_key` de `scheme_fee.py` —
+  nunca en `DefaultArguments`, siempre pasado explícito en cada
+  `start-job-run`). `write_result()`: `adhoc_tag` vacío → escribe/sobreescribe
+  `{client}/reports/get_transaction/report_month={report_month}/data.parquet`;
+  no vacío → `{client}/reports/get_transaction/_adhoc/{adhoc_tag}/data.parquet`
+  (el propio valor de `adhoc_tag` nombra la carpeta, ej. `--adhoc_tag byfix`).
+- `glue/scripts/reports/scheme_fee/scheme_fee.py`: `STATE_PREFIX`/`FINAL_PREFIX`
+  (línea ~207-208) ahora arman `state/report_month={REPORT_MONTH}` /
+  `final/report_month={REPORT_MONTH}` en vez de `state/{REPORT_MONTH}`. Único
+  cambio real — todo lo demás (CSV `IN/`/`OUT/` en `s3-scheme-fee`, lógica de
+  cálculo) sin tocar, confirmado.
+- `py_compile` OK en ambos. **`args.json` de ninguno de los 2 requiere cambios**
+  (ningún parámetro de negocio vive en `DefaultArguments`, se pasan siempre
+  por `Arguments` en cada ejecución — mismo criterio ya establecido).
+
+**Datos existentes en `s3-analytics` ya reorganizados y verificados (copia
+server-side + verificación de tamaño byte a byte antes de borrar el original,
+originales borrados recién después de confirmar):**
+- EBGR: único reporte existente (`ebgr_202601`) → promovido a oficial,
+  `EBGR/reports/get_transaction/report_month=202601/data.parquet`.
+- SBSA: 5 reportes existentes → **`sbsa_202601_hallazgo5bfix` (2026-07-28)
+  promovido a oficial** (el más reciente Y semánticamente el último estado
+  validado de VI tras el fix de Hallazgo 5b — ver `decisions.md`; confirmado
+  que el fix de MC token_flag del 2026-07-30, posterior, no afecta este pick
+  porque no tuvo ningún match real en tráfico SBSA). Los otros 4
+  (`sbsa_202601`, `sbsa_202601_byfix`, `sbsa_202601_sms_test`,
+  `202601_scheme_fee_union_test`) → `SBSA/reports/get_transaction/_adhoc/{nombre}/data.parquet`.
+- `scheme_fee`: `EBGR/scheme_fee/state/202601/` → `state/report_month=202601/`;
+  `SBSA/scheme_fee/{state,final}/202601/` → `{state,final}/report_month=202601/`
+  (incluye limpieza de los marcadores `_$folder$` de esas 2 carpetas).
+- CSV `IN/`/`OUT/` en `s3-scheme-fee` — no tocado, fuera del alcance.
+- `EBGR/reports/ebgr_merchant/`, `EBGR/reports/quality/` (otros jobs,
+  `ebgr_merchant.py`/`mc_data_quality.py`) — confirmado que NO son
+  `get_transaction`, no se tocaron.
+
+**Pendiente real:**
+- [ ] **Usuario revisa el código mañana** (2026-08-12) antes de cualquier
+  push a S3/AWS — nada desplegado todavía, `ScriptLocation` real sigue con
+  la versión vieja.
+- [ ] Tras aprobar: `push-glue.ps1` para ambos scripts, y validar con una
+  corrida real (`--adhoc_tag ""` para confirmar que escribe/sobreescribe el
+  oficial; `--adhoc_tag <algo>` para confirmar que cae en `_adhoc/`).
+- [ ] Crawlers nuevos para `s3-analytics` (hoy no existe ninguno) — sección
+  5 de la propuesta, sin crear todavía.
+- [ ] Documentar en `CLAUDE.md` los 3 buckets faltantes de la tabla "S3 (5
+  buckets)": `s3-analytics`, `s3-athena`, `s3-scheme-fee`.
 
 ---
 
