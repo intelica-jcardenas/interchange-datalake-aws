@@ -60,6 +60,7 @@ Job Parameters:
 """
 import sys
 import json
+import uuid
 from datetime import datetime, date
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
@@ -69,6 +70,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from pyspark.sql.types import StringType, IntegerType, LongType, DoubleType, DateType
 import boto3
+
+s3_client = boto3.client("s3")
  
  
 # =============================================================================
@@ -469,10 +472,16 @@ def load_parquet_safe(path: str) -> DataFrame:
  
 def save_parquet(df: DataFrame, path: str):
     """
-    Guarda un DataFrame como un único Parquet (coalesce(1)) en la ruta dada.
+    Guarda un DataFrame como un único Parquet en la ruta dada, sin el
+    marcador de directorio `_$folder$` que el committer de Spark/Hadoop
+    genera al escribir directo con `df.write.parquet(path)`. Delega en
+    `write_single_parquet()` — mismo patrón ya validado en
+    `glue/scripts/mastercard/interchange/interchange.py` y
+    `glue/scripts/reports/get_transaction/get_transaction.py`.
 
     Args:
-        df: DataFrame a escribir.
+        df: DataFrame a escribir (se fuerza a 1 solo part-file con
+            `coalesce(1)`).
         path: Path S3 de destino.
 
     Returns:
@@ -481,8 +490,69 @@ def save_parquet(df: DataFrame, path: str):
     Ejemplo:
         save_parquet(result_df, "s3://bucket/EBGR/VISA/400_baseii_cal_drafts/.../x.parquet")
     """
-    df.coalesce(1).write.mode("overwrite").parquet(path)
+    write_single_parquet(df, path)
     log_info(f"  Saved to {path}")
+
+
+def write_single_parquet(df: DataFrame, final_s3_path: str) -> None:
+    """
+    Escribe `df` como un único archivo Parquet en `final_s3_path`, sin el
+    marcador de directorio `_$folder$` que el committer de Spark/Hadoop
+    genera al escribir directo con `df.write.parquet(path)` — Spark
+    siempre produce una "carpeta" (part-*.parquet + ese marcador) aunque
+    el resultado sea un solo archivo. Se escribe a un prefijo temporal
+    descartable (nombre único con uuid4, evita colisiones entre
+    ejecuciones concurrentes) y se copia el único part-file al key final
+    exacto vía `copy_object` — sin pasar por el committer en el destino
+    final, así que ahí nunca se genera el marcador. El prefijo temporal
+    completo se borra siempre al final, haya fallado o no la escritura.
+
+    Mismo patrón ya validado en `write_single_parquet()` de
+    `glue/scripts/mastercard/interchange/interchange.py` y
+    `glue/scripts/reports/get_transaction/get_transaction.py` —
+    simplificado a solo S3 (este job siempre escribe a s3://).
+
+    Args:
+        df: DataFrame a escribir (se fuerza a 1 solo part-file con
+            `coalesce(1)`).
+        final_s3_path: URI s3:// completo del archivo final, incluyendo
+            el nombre ".parquet".
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: si no se encuentra ningún part-file tras escribir
+            el prefijo temporal.
+
+    Ejemplo:
+        write_single_parquet(result_df, "s3://bucket/EBGR/VISA/400_baseii_cal_drafts/.../x.parquet")
+    """
+    bucket, final_key = final_s3_path[len("s3://"):].split("/", 1)
+    tmp_prefix = f"{final_key}_tmp_{uuid.uuid4().hex}/"
+    tmp_uri = f"s3://{bucket}/{tmp_prefix}"
+
+    try:
+        df.coalesce(1).write.mode("overwrite").parquet(tmp_uri)
+
+        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=tmp_prefix)
+        part_keys = [
+            obj["Key"] for obj in resp.get("Contents", [])
+            if obj["Key"].endswith(".parquet") and "/part-" in obj["Key"]
+        ]
+        if not part_keys:
+            raise RuntimeError(f"No se encontró part parquet en {tmp_uri}")
+
+        s3_client.copy_object(
+            Bucket=bucket,
+            CopySource={"Bucket": bucket, "Key": part_keys[0]},
+            Key=final_key,
+        )
+    finally:
+        cleanup = s3_client.list_objects_v2(Bucket=bucket, Prefix=tmp_prefix)
+        leftover = [{"Key": obj["Key"]} for obj in cleanup.get("Contents", [])]
+        if leftover:
+            s3_client.delete_objects(Bucket=bucket, Delete={"Objects": leftover})
 
 
 # =============================================================================

@@ -128,17 +128,18 @@ confirme que está terminado/validado, documentar con la skill
 
 **2026-08-11:** primer uso real del trigger para publicar un cambio de negocio genuino (no solo smoke test) — fix de expansión de familias `TRANSACTION_CODE` (excel V38) desplegado a `lmbd-test-1` y disparado subiendo el excel a S3. Backup automático + publicación + smoke test contra EBGR/SBSA, cero regresión. Ver decisión "`visa_rules`: excel V38 simplifica `TRANSACTION_CODE`..." en `decisions.md`.
 
-- [ ] **Layer con `openpyxl` y rol IAM dedicados** — hoy corre sobre
-  infraestructura prestada (`lmbd-test-1`, rol `lmbd-vi-role`), sin
-  Lambda ni rol propios.
-- [ ] **Decidir si se queda sobre `lmbd-test-1` o se migra a un Lambda
-  propio** antes de dejar el trigger S3→Lambda activo de forma
-  permanente — hoy está activo y auto-publica sin aprobación manual
-  (diseño ya acordado), pero sigue corriendo sobre infra prestada.
-  Acción del usuario pendiente (2026-08-11): pedirle al equipo que
-  renombren `lmbd-test-1` o creen un Lambda nuevo con la misma
-  configuración/código — el docstring de `handler.py` ya documenta
-  explícitamente este gap (nombre real en AWS vs nombre "definitivo").
+- [x] ~~Layer con `openpyxl`~~ — **RESUELTO 2026-08-13**: layer dedicado
+  `itl-0004-itx-dev-intchg-02-rules-refresh-openpyxl` creado, adjuntado,
+  código redesplegado sin dependencias bundleadas, probado en vivo
+  (reproceso real de excel, diff=0). Ver `decisions.md`.
+- [ ] **Rol IAM dedicado + rename a Lambda definitivo** — sigue sobre
+  infraestructura prestada (`lmbd-test-1`, rol `lmbd-vi-role`). **En
+  curso 2026-08-13:** ticket armado para pedirle al equipo que
+  renombren/recreen `lmbd-test-1` como
+  `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (incluye reapuntar el
+  trigger S3 y evaluar rol propio) — el docstring de `handler.py` ya
+  documenta explícitamente este gap (nombre real en AWS vs nombre
+  "definitivo").
 - [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
   (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
   paths — sigue sin ninguna validación de que sus *resultados* (filas de
@@ -153,31 +154,15 @@ ningún rastro en el repo, ver `decisions.md`.
 
 ---
 
-## Reglas Visa/MC — pendientes de bajo impacto
+## Configuración `vi-data-quality` pendiente de confirmar
 
-- [ ] **SBSA VI** — el reproceso masivo de 156 archivos (Hallazgo 5b) ya
-  corre con los 3 fixes de V37 (`token_requestor_id`/`settlement_flag`/
-  `cashback`) en el código, pero nunca se corrió un comparativo dedicado
-  post-V37 para SBSA (solo se validó el fix de ARDEF). Bajo valor, sin
-  decidir si vale la pena repetir el ejercicio hecho hoy para EBGR.
-- [ ] **`intelica_id`/`region_country_code` NULL en MC (82.6% de EBGR
-  IN, ~similar en SBSA)** — causa raíz NO encontrada (investigado a
-  fondo 2026-07-30, ver `decisions.md`): confirmado que el motor de
-  reglas de `interchange.py` (Spark) falla en matchear reglas activas
-  bien formadas, por una razón no identificada en la ejecución de Spark
-  (no es contenido de reglas, no es cálculo de jurisdicción, no es un
-  problema de join/duplicados). **Confirmado que no afecta ningún $
-  reportado hoy** (IN usa `amounts_transaction_fee_7_pds_146_7`, no
-  `calculated_value`) — prioridad media, no bloquea producción.
-  Instrumentar `assign_rules_simple()`/`prefilter_rules_needed()` con
-  logging real y correrlo aislado sería el siguiente paso si se retoma.
-- [ ] **ATM JPY rule 1055 vs 1065 (EBGR, 1 transacción)** —
-  `glue-vi-interchange` asigna la regla equivocada, fee_fixed=0.50 USD
-  faltante. Investigar campo diferenciador en `visa_rules`.
-- [ ] **`interchange_fees_amount` de SMS +60.55% de más** (SBSA),
-  concentrado 100% en `transaction_type_id=22` (ATM cash withdrawal) —
-  bug en `glue-vi-interchange` (asignación de fee), no en
-  `get_transaction.py`. Detalle → `gotchas.md`.
+(Nota: los pendientes de bajo impacto de reglas Visa/MC —SBSA VI sin
+comparativo post-V37, `intelica_id` NULL en MC, ATM JPY rule 1055/1065,
+SMS +60.55%— se sacaron del checklist activo 2026-08-13 a pedido del
+usuario, por no justificar el esfuerzo frente al impacto. Siguen con su
+detalle técnico completo en `gotchas.md`/`decisions.md`, solo dejan de
+trackearse acá.)
+
 - [ ] **`vi-data-quality`**: `NumberOfWorkers=10` vs sus pares de
   reportería (`2`) — sigue sin confirmar, dejado sin tocar a pedido
   explícito del usuario. `MaxConcurrentRuns` cambió de `1` a `50` en AWS
@@ -218,22 +203,25 @@ detalle completo. Ya desplegado y commiteado; validado para SBSA
 
 ## Housekeeping tst_files/ y S3 (bajo impacto, no urgente)
 
-- [ ] **Carpetas `_$folder$` en Visa (staging/reference)** — marcador 0
-  bytes que el committer nativo de Hadoop/Spark crea por cada partición
-  nueva al escribir con `df.coalesce(1).write.parquet(path)`
-  (`visa/calculate.py`/`visa/interchange.py`). Contados 2026-07-31:
-  360 en `s3-staging` (casi todos `EBGR/VISA/400_baseii_cal_drafts/`,
-  `500_baseii_itx_drafts/`), 2 en `s3-reference`
-  (`exchange-rates-glue/brand={Mastercard,Visa}`), 0 en
-  `s3-operational`. Cosmético — no rompe nada (Athena/Glue los
-  ignoran), pero se regeneran cada corrida mientras el código siga
-  usando ese writer; borrar los existentes no sirve sin cambiar el
-  mecanismo de escritura. El patrón `write_single_parquet()` de
-  `mastercard/interchange.py` (writer nativo a un prefijo temporal +
-  `copy_object` del part-file al nombre final, sin pasar por el
-  committer que genera el marcador) lo resolvería de raíz si se aplica
-  a los 2 scripts de Visa — evaluado y descartado por ahora (esfuerzo
-  real de código+deploy+prueba vs. beneficio puramente cosmético).
+- [x] ~~Carpetas `_$folder$` en `visa/calculate.py`/`visa/interchange.py`~~
+  — **RESUELTO 2026-08-13**, ver `decisions.md`. Los 360 marcadores
+  existentes en `s3-staging` (`400_baseii_cal_drafts`,
+  `500_baseii_itx_drafts`, `400/500_vss_*`, `400/500_sms_*`, EBGR+SBSA)
+  fueron borrados — no deberían volver a generarse, el código que los
+  creaba ya no usa el writer nativo de Spark.
+- [ ] **`glue-exchange-rates` (`format_exchange_rates.py`) y
+  `glue-vi-data-quality` (`vi_data_quality.py`) siguen expuestos** —
+  ambos escriben con el writer nativo de Spark
+  (`.write.mode(...).parquet(path)`, el segundo con `partitionBy` en
+  exchange-rates) sin pasar por `write_single_parquet()`/
+  `write_parquet_multi()`. Confirmado 2026-08-13: 2 marcadores ya
+  existentes en `s3-reference/exchange-rates-glue/brand={Mastercard,Visa}`
+  (sin tocar, se irían regenerando). Deliberadamente fuera de alcance
+  de esta sesión — `vi-data-quality` ni siquiera está integrado a un
+  Step Function todavía (bajo impacto real); `exchange-rates` sigue con
+  su propio pendiente sin resolver (versión AWS vs repo, ver sección
+  propia más arriba) — no tiene sentido tocar su writer hasta resolver
+  eso primero.
 
 ---
 

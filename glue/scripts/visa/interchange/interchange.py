@@ -48,6 +48,7 @@ Job Parameters:
 
 import sys
 import json
+import uuid
 from datetime import datetime, date
 import pandas as pd
 from awsglue.utils import getResolvedOptions
@@ -60,6 +61,8 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType, LongType
 )
 import boto3
+
+s3_client = boto3.client("s3")
 
 # =============================================================================
 # CONFIGURACIÓN SPARK
@@ -106,10 +109,15 @@ def load_parquet(path: str) -> DataFrame:
 def save_parquet(df: DataFrame, path: str):
     """
     Guarda el DataFrame como Parquet en S3, con estrategia de particionado de
-    escritura según el volumen: `coalesce(1)` para archivos chicos (un solo
-    Parquet, más simple de leer) y `repartition(4)` para archivos grandes,
-    evitando el error "RPC message too large" que puede ocurrir al coalescer
-    demasiadas filas a una sola partición.
+    escritura según el volumen: `write_single_parquet()` para archivos chicos
+    (un solo Parquet, más simple de leer) y `write_parquet_multi()` para
+    archivos grandes (4 part-files en paralelo, evitando el error "RPC
+    message too large" que puede ocurrir al coalescer demasiadas filas a una
+    sola partición). Ninguna de las 2 variantes deja el marcador de
+    directorio `_$folder$` que el committer de Spark/Hadoop genera al
+    escribir directo con `df.write.parquet(path)` — mismo patrón ya validado
+    en `glue/scripts/mastercard/interchange/interchange.py` (single) y
+    `glue/scripts/reports/scheme_fee/scheme_fee.py` (multi).
 
     Args:
         df: DataFrame a escribir.
@@ -124,11 +132,192 @@ def save_parquet(df: DataFrame, path: str):
     """
     count = df.count()
     if count > 200_000:
-        log_info(f"  Large file ({count:,} rows) — using repartition(4)")
-        df.repartition(4).write.mode("overwrite").parquet(path)
+        log_info(f"  Large file ({count:,} rows) — using write_parquet_multi (4 partitions)")
+        write_parquet_multi(df, path)
     else:
-        df.coalesce(1).write.mode("overwrite").parquet(path)
+        write_single_parquet(df, path)
     log_info(f"  Saved: {path}")
+
+
+def _list_all_keys(bucket: str, prefix: str) -> list:
+    """
+    Lista TODAS las keys bajo un prefijo S3, paginando con
+    list_objects_v2 (que devuelve máximo 1000 por llamada) — usado por
+    `write_parquet_multi()` tanto para encontrar los part-files recién
+    escritos como para limpiar el prefijo final/temporal antes de
+    escribir, donde asumir "una sola página" sería un bug silencioso en
+    datasets que crezcan más allá de 1000 objetos.
+
+    Args:
+        bucket: Nombre del bucket S3.
+        prefix: Prefijo a listar.
+
+    Returns:
+        Lista de keys (str) bajo ese prefijo, vacía si no hay ninguna.
+
+    Ejemplo:
+        _list_all_keys("bucket", "EBGR/VISA/500_baseii_itx_drafts/file_type=IN/date=2026-01-03/")
+    """
+    keys = []
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kwargs)
+        keys.extend(obj["Key"] for obj in resp.get("Contents", []))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return keys
+
+
+def _delete_all_keys(bucket: str, keys: list) -> None:
+    """
+    Borra una lista de keys S3 en lotes de 1000 — límite duro de la API
+    `delete_objects` (rechaza el request completo si se le pasan más).
+    Usado por `write_parquet_multi()` para limpiar el prefijo final antes
+    de escribir y el prefijo temporal al terminar.
+
+    Args:
+        bucket: Nombre del bucket S3.
+        keys: Lista de keys a borrar (puede estar vacía).
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _delete_all_keys("bucket", ["a.parquet", "b.parquet"])
+    """
+    for i in range(0, len(keys), 1000):
+        chunk = keys[i:i + 1000]
+        s3_client.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in chunk]},
+        )
+
+
+def write_single_parquet(df: DataFrame, final_s3_path: str) -> None:
+    """
+    Escribe `df` como un único archivo Parquet en `final_s3_path`, sin el
+    marcador de directorio `_$folder$` que el committer de Spark/Hadoop
+    genera al escribir directo con `df.write.parquet(path)`. Se escribe a
+    un prefijo temporal descartable (nombre único con uuid4) y se copia
+    el único part-file al key final exacto vía `copy_object` — sin pasar
+    por el committer en el destino final, así que ahí nunca se genera el
+    marcador. El prefijo temporal completo se borra siempre al final,
+    haya fallado o no la escritura.
+
+    Mismo patrón ya validado en `glue/scripts/mastercard/interchange/interchange.py`
+    y `glue/scripts/reports/get_transaction/get_transaction.py`.
+
+    Args:
+        df: DataFrame a escribir (se fuerza a 1 solo part-file con
+            `coalesce(1)`).
+        final_s3_path: URI s3:// completo del archivo final, incluyendo
+            el nombre ".parquet".
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: si no se encuentra ningún part-file tras escribir
+            el prefijo temporal.
+
+    Ejemplo:
+        write_single_parquet(result_df, "s3://bucket/EBGR/VISA/500_baseii_itx_drafts/.../x.parquet")
+    """
+    bucket, final_key = final_s3_path[len("s3://"):].split("/", 1)
+    tmp_prefix = f"{final_key}_tmp_{uuid.uuid4().hex}/"
+    tmp_uri = f"s3://{bucket}/{tmp_prefix}"
+
+    try:
+        df.coalesce(1).write.mode("overwrite").parquet(tmp_uri)
+
+        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=tmp_prefix)
+        part_keys = [
+            obj["Key"] for obj in resp.get("Contents", [])
+            if obj["Key"].endswith(".parquet") and "/part-" in obj["Key"]
+        ]
+        if not part_keys:
+            raise RuntimeError(f"No se encontró part parquet en {tmp_uri}")
+
+        s3_client.copy_object(
+            Bucket=bucket,
+            CopySource={"Bucket": bucket, "Key": part_keys[0]},
+            Key=final_key,
+        )
+    finally:
+        cleanup = s3_client.list_objects_v2(Bucket=bucket, Prefix=tmp_prefix)
+        leftover = [{"Key": obj["Key"]} for obj in cleanup.get("Contents", [])]
+        if leftover:
+            s3_client.delete_objects(Bucket=bucket, Delete={"Objects": leftover})
+
+
+def write_parquet_multi(df: DataFrame, final_s3_path: str) -> None:
+    """
+    Escribe `df` como varios archivos Parquet (4 part-files, vía
+    `repartition(4)`) bajo el prefijo de `final_s3_path`, preservando el
+    paralelismo de escritura para archivos grandes, sin el marcador de
+    directorio `_$folder$` que el committer de Spark/Hadoop genera al
+    escribir directo con `df.write.parquet(path)`.
+
+    A diferencia de `write_single_parquet()`, esta variante NO fuerza un
+    solo archivo — forzar `coalesce(1)` en archivos de >200,000 filas es
+    justamente lo que `save_parquet()` evita (riesgo de "RPC message too
+    large"). Mecánica: escribe a un prefijo temporal descartable (nombre
+    único con uuid4), copia TODOS los part-files resultantes al prefijo
+    final vía `copy_object`, y borra el prefijo temporal completo. Antes
+    de copiar, limpia el prefijo final existente — mismo efecto que
+    `mode("overwrite")` hubiera tenido escribiendo directo. Mismo patrón
+    ya validado en `write_parquet_multi()` de
+    `glue/scripts/reports/scheme_fee/scheme_fee.py`.
+
+    Args:
+        df: DataFrame a escribir (se fuerza a 4 part-files con
+            `repartition(4)`).
+        final_s3_path: URI s3:// completo del archivo final "lógico" —
+            el prefijo real usado es este path sin el sufijo ".parquet"
+            (los 4 part-files quedan bajo ese prefijo, como ya hacía
+            `df.repartition(4).write.parquet(path)` antes de este fix).
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: si no se encuentra ningún part-file tras escribir
+            el prefijo temporal.
+
+    Ejemplo:
+        write_parquet_multi(result_df, "s3://bucket/EBGR/VISA/500_baseii_itx_drafts/.../x.parquet")
+    """
+    bucket, final_key = final_s3_path[len("s3://"):].split("/", 1)
+    final_prefix = final_key.rstrip("/")
+    tmp_prefix = f"{final_prefix}_tmp_{uuid.uuid4().hex}/"
+    tmp_uri = f"s3://{bucket}/{tmp_prefix}"
+
+    try:
+        df.repartition(4).write.mode("overwrite").parquet(tmp_uri)
+
+        part_keys = [
+            key for key in _list_all_keys(bucket, tmp_prefix)
+            if key.endswith(".parquet") and "/part-" in key
+        ]
+        if not part_keys:
+            raise RuntimeError(f"No se encontró part parquet en {tmp_uri}")
+
+        existing_keys = _list_all_keys(bucket, f"{final_prefix}/")
+        _delete_all_keys(bucket, existing_keys)
+
+        for part_key in part_keys:
+            filename = part_key.rsplit("/", 1)[-1]
+            s3_client.copy_object(
+                Bucket=bucket,
+                CopySource={"Bucket": bucket, "Key": part_key},
+                Key=f"{final_prefix}/{filename}",
+            )
+    finally:
+        _delete_all_keys(bucket, _list_all_keys(bucket, tmp_prefix))
 
 # =============================================================================
 # CARGA DE TABLAS DE REFERENCIA
