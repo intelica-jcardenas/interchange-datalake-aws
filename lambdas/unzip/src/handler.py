@@ -4,24 +4,33 @@ handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-unzip
 Archivo:     lambdas/unzip/src/handler.py
 
 Descomprime archivos ZIP detectados por el router antes de que lleguen al
-flujo normal del pipeline. Sube al landing solo los archivos internos que
-hacen match con los patrones de `file_pattern` en DynamoDB (los mismos que
-usa el router), archiva el ZIP original en s3-archive (no en s3-operational)
-y elimina el ZIP del landing. Cada archivo extraído y subido dispara al
-router nuevamente via S3 Event — es la forma en que el pipeline logra
-paralelismo gratis al procesar los N archivos internos de un ZIP sin
-orquestación adicional.
+flujo normal del pipeline. Sube al landing **todos** los archivos internos,
+matcheen o no un patrón de `file_pattern` en DynamoDB — la clasificación
+sigue consultándose acá (mismos patrones que usa el router) pero solo para
+el caso especial de nombrado de VISA ARDEF (ver `_extract_and_upload()`);
+para todo lo demás es solo informativa (log `unmatched`). Archiva el ZIP
+original en s3-archive (no en s3-operational) y elimina el ZIP del landing.
+Cada archivo extraído y subido dispara al router nuevamente via S3 Event —
+es la forma en que el pipeline logra paralelismo gratis al procesar los N
+archivos internos de un ZIP sin orquestación adicional, y también la forma
+en que un archivo sin match de patrón termina pasando por el manejo de
+"desconocido" del router (`procesar_archivo_desconocido()`, ver
+gotchas.md) en vez de perderse silenciosamente acá adentro (2026-08-12 —
+antes de este fix, un archivo sin match se descartaba en esta misma etapa,
+sin llegar nunca a s3-landing y por lo tanto sin que el router lo viera).
 
 Flujo:
   1. Recibe el S3 key del ZIP y la file_date extraída por el router
   2. Descarga el ZIP en streaming a /tmp (chunks de 8MB)
   3. Inspecciona los archivos internos sin extraer (solo lee el índice)
-  4. Filtra por patrones de DynamoDB — mismos que usa el router
-  5. Extrae y sube al landing solo los archivos que hacen match
+  4. Consulta patrones de DynamoDB — mismos que usa el router — solo para
+     resolver el nombrado especial de VISA ARDEF, no para filtrar
+  5. Extrae y sube TODOS los archivos al landing, matcheen o no
   6. Archiva el ZIP original → archive/originals/zip/{year}/{month}/
   7. Elimina el ZIP del landing
   8. Los archivos subidos al landing disparan el router via S3 Event
-     automáticamente → paralelismo gratis sin configuración adicional
+     automáticamente → paralelismo gratis sin configuración adicional;
+     el router decide la clasificación real (o UNKNOWN) de cada uno
 
 Formatos de ZIP recibidos:
   MAST260416.zip          → Mastercard, YYMMDD en nombre
@@ -458,13 +467,17 @@ def lambda_handler(event, context):
     """
     Entry point del Lambda unzip. Invocado asincrónicamente por el router
     cuando detecta un ZIP en el landing. Descarga el ZIP, inspecciona su
-    índice sin extraer nada a disco, clasifica cada archivo interno contra
-    los patrones de DynamoDB, sube al landing solo los que hacen match
-    (los que no matchean se descartan, quedando registrados en `skipped`),
-    archiva el ZIP original en s3-archive y limpia el landing. Cada archivo
-    subido dispara al router nuevamente vía S3 Event, logrando paralelismo
-    sin orquestación adicional. El bloque `finally` limpia /tmp tanto en
-    éxito como en fallo.
+    índice sin extraer nada a disco, consulta los patrones de DynamoDB
+    (solo para el nombrado especial de VISA ARDEF, ver
+    `_extract_and_upload()`) y sube **todos** los archivos internos al
+    landing, matcheen o no un patrón — los que no matchean quedan
+    contados en `unmatched`, pero se suben igual, para que el router los
+    vea y los registre como `UNKNOWN` en vez de perderse acá (ver
+    `procesar_archivo_desconocido()` en `lambdas/router/src/handler.py`).
+    Archiva el ZIP original en s3-archive y limpia el landing. Cada
+    archivo subido dispara al router nuevamente vía S3 Event, logrando
+    paralelismo sin orquestación adicional. El bloque `finally` limpia
+    /tmp tanto en éxito como en fallo.
 
     Args:
         event: Payload recibido desde el router:
@@ -482,8 +495,8 @@ def lambda_handler(event, context):
             "status":        "EXTRACTED",
             "zip_file":      "VISA260416.zip",
             "total_in_zip":  10,
-            "matched":       4,
-            "skipped":       6,
+            "uploaded":      10,
+            "unmatched":     6,
             "uploaded_keys": ["EBGR/I479273260330", ...],
             "archive_key":   "EBGR/originals/zip/2026/04/VISA260416.zip"
         }
@@ -523,10 +536,21 @@ def lambda_handler(event, context):
     logger.info(f"  File date: {file_date}")
 
     try:
-        # Paso 1 — Cargar patrones desde DynamoDB
+        # Paso 1 — Cargar patrones desde DynamoDB. Un cliente sin NINGÚN
+        # patrón activo (a diferencia de "tiene patrones pero este archivo
+        # no matchea ninguno") ya NO aborta el ZIP completo (2026-08-12) —
+        # antes, un `raise` acá cortaba todo antes de descargar/extraer/
+        # archivar, dejando el ZIP entero atascado en landing para
+        # siempre. `_matches_pattern(filename, [])` ya devuelve None de
+        # forma natural con una lista vacía, así que cada archivo interno
+        # simplemente cae en la rama "sin match" (ver Paso 4) y sube igual
+        # — el router los va a registrar como UNKNOWN.
         patterns = _load_patterns(client_id)
         if not patterns:
-            raise ValueError(f"No active patterns for client '{client_id}'")
+            logger.warning(
+                f"Sin patrones activos para '{client_id}' — todos los "
+                f"archivos del ZIP se van a subir sin clasificar (UNKNOWN)"
+            )
 
         # Paso 2 — Descargar ZIP a /tmp en streaming
         _download_zip_to_tmp(bucket_landing, s3_key, tmp_path)
@@ -534,9 +558,19 @@ def lambda_handler(event, context):
         # Paso 3 — Inspeccionar contenido sin extraer
         all_files = _inspect_zip(tmp_path)
 
-        # Paso 4 — Filtrar por patrones y extraer los que corresponden
+        # Paso 4 — Extraer y subir TODOS los archivos internos, matcheen o no
+        # un patrón. Antes, un archivo sin match se descartaba acá mismo
+        # (nunca llegaba a s3-landing) — el router nunca lo veía, así que su
+        # manejo de "sin clasificar" (procesar_archivo_desconocido(), ver
+        # gotchas.md) no aplicaba a nada que llegara comprimido. La
+        # clasificación sigue haciéndose acá SOLO para el caso especial de
+        # `_extract_and_upload()` (pattern_id == "7", VISA ARDEF, antepone
+        # file_date al nombre) — para todo lo demás, matchee o no, sube con
+        # el nombre tal cual y deja que el router sea la única fuente de
+        # verdad de la clasificación (evita 2 lugares con la misma lógica
+        # de patrones que pueden desalinearse, como pasó acá).
         uploaded_keys = []
-        skipped       = []
+        unmatched     = []
 
         for zip_entry in all_files:
             filename      = zip_entry.split('/')[-1]
@@ -545,20 +579,24 @@ def lambda_handler(event, context):
             if clasificacion:
                 logger.info(f"  MATCH: {filename} "
                             f"({clasificacion['brand']}/{clasificacion['direction']})")
-                dest_key = _extract_and_upload(
-                    tmp_zip_path=tmp_path,
-                    zip_entry_name=zip_entry,
-                    client_id=client_id,
-                    dest_bucket=bucket_landing,
-                    pattern_id=clasificacion['pattern_id'],
-                    file_date = file_date
-                )
-                uploaded_keys.append(dest_key)
+                pattern_id = clasificacion['pattern_id']
             else:
-                logger.info(f"  SKIP:  {filename} (no pattern match)")
-                skipped.append(filename)
+                logger.info(f"  SIN MATCH: {filename} — se sube igual, "
+                            f"el router lo va a registrar como UNKNOWN")
+                pattern_id = None
+                unmatched.append(filename)
 
-        logger.info(f"Summary: {len(uploaded_keys)} uploaded, {len(skipped)} skipped")
+            dest_key = _extract_and_upload(
+                tmp_zip_path=tmp_path,
+                zip_entry_name=zip_entry,
+                client_id=client_id,
+                dest_bucket=bucket_landing,
+                pattern_id=pattern_id,
+                file_date=file_date
+            )
+            uploaded_keys.append(dest_key)
+
+        logger.info(f"Summary: {len(uploaded_keys)} uploaded ({len(unmatched)} sin match de patrón)")
 
         # Paso 5 — Archivar ZIP original en archive (server-side copy)
         archive_key = _archive_zip(
@@ -580,8 +618,8 @@ def lambda_handler(event, context):
             'zip_file':      zip_filename,
             'file_date':     file_date,
             'total_in_zip':  len(all_files),
-            'matched':       len(uploaded_keys),
-            'skipped':       len(skipped),
+            'uploaded':      len(uploaded_keys),
+            'unmatched':     len(unmatched),
             'uploaded_keys': uploaded_keys,
             'archive_key':   archive_key,
         }

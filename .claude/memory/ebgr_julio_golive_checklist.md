@@ -39,7 +39,27 @@ con error**, va a procesar con datos viejos/incompletos sin avisar.
 
 ---
 
-## 2. Flujo automático real (router → Step Functions → archive) — sin actividad real desde 2026-06-16
+## 2. Flujo automático real (router → Step Functions → archive) — RESUELTO 2026-08-13, validado con archivo real de EBGR y demostrado ante el equipo
+
+**Actualización 2026-08-13:** se subió un ZIP real de EBGR
+(`VISA260702.zip`, 8 archivos: 5 VISA/INCOMING + 3 sin match) a
+`s3-landing` sin ninguna invocación manual. Las 5 ejecuciones reales de
+`sfn-vi` que disparó el router terminaron `SUCCEEDED`
+(Transform→Extract→Clean→Calculate→Interchange→Store→Archive),
+`s3-operational` con Parquets reales, `s3-landing` limpio, los 3 sin
+match correctamente registrados `UNKNOWN`/archivados (ver
+`decisions.md`/`gotchas.md` del proyecto — el mismo día se corrigió que
+`lmbd-unzip` tenía su propia lógica de matching independiente de la del
+router). La demo formal ante el equipo al día siguiente usó este mismo
+mecanismo y salió bien — limitada a mostrar el procesamiento formal de
+archivos una vez llegan a landing; `s3-analytics`/`scheme-fee`/
+`data-quality` quedan para una sesión futura. **Este ítem queda
+cerrado** — detalle histórico del gap original abajo, sin acción
+adicional.
+
+---
+
+### Detalle histórico (síntoma original, verificado 2026-08-02, ya resuelto)
 
 Confirmado en `s3-archive` (`EBGR/originals/...`, ordenado por
 `LastModified` real): el archivo más reciente que pasó por el flujo
@@ -112,7 +132,7 @@ existen en `tst_files/reprocessing/`).
 
 | # | Ítem | Bloqueante para julio | Acción |
 |---|---|---|---|
-| 1 | Tipo de cambio / ARDEF / IAR desactualizados | **Sí** | Refrescar antes de procesar julio; decidir dueño+cadencia |
-| 2 | Flujo automático sin probar desde hace 6+ semanas | **Sí** | Smoke test end-to-end con archivo real |
+| 1 | Tipo de cambio / ARDEF / IAR desactualizados | Parcial — ARDEF/IAR refrescados 2026-08-12, FX sigue ~9 días de atraso | Refrescar FX antes de procesar fechas recientes; decidir dueño+cadencia |
+| 2 | ~~Flujo automático sin probar desde hace 6+ semanas~~ | **RESUELTO 2026-08-13** | Smoke test end-to-end con archivo real de EBGR hecho y validado — ver sección 2 arriba |
 | 3 | SFTP — mecanismo desconocido | **Sí, si es el canal real de EBGR** | Confirmar con el equipo antes de asumir que "cargar archivos" es solo soltarlos en landing |
 | 4 | Febrero 2026 sin reprocesar | No bloqueante, pero pendiente de decisión | Decidir alcance antes de dar EBGR por "al día" |

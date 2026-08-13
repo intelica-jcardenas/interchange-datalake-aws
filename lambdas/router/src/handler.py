@@ -47,6 +47,7 @@ import logging
 import boto3
 import io
 import struct
+import zipfile
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote_plus
@@ -61,6 +62,7 @@ sfn           = boto3.client('stepfunctions')
 lambda_client = boto3.client('lambda')
 
 LANDING_BUCKET      = os.environ.get('S3_BUCKET_LANDING')
+ARCHIVE_BUCKET      = os.environ.get('S3_BUCKET_ARCHIVE')
 TABLE_FILE_CONTROL  = os.environ.get('DYNAMODB_TABLE_FILE_CONTROL', 'itx-file-control')
 TABLE_FILE_PATTERN  = os.environ.get('DYNAMODB_TABLE_FILE_PATTERN', 'itx-file-pattern')
 UNZIP_FUNCTION_NAME = os.environ.get('UNZIP_FUNCTION_NAME', 'itx-unzip')
@@ -70,6 +72,10 @@ VISA_ARDEF_FUNCTION_NAME   = os.environ.get('VISA_ARDEF_FUNCTION_NAME')
 MASTERCARD_IAR_FUNCTION_NAME   = os.environ.get('MASTERCARD_IAR_FUNCTION_NAME')
 
 HASH_CHUNK_SIZE = 1 * 1024 * 1024
+# Mismos valores que lmbd-archive-file — ver _archivar_bajo_prefijo(), que
+# porta su patrón de compresión en streaming para archivos UNKNOWN/DUPLICATE.
+COMPRESS_CHUNK_BYTES = int(os.environ.get('COMPRESS_CHUNK_SIZE_MB', '32')) * 1024 * 1024
+MULTIPART_THRESHOLD = 100 * 1024 * 1024
 FILE_TYPE_MAP = {
     'IN': 'IN',
     'INCOMING': 'IN',
@@ -1266,17 +1272,377 @@ def verificar_duplicado(file_id: str, content_hash: str) -> Tuple[str, Optional[
 
 
 # =============================================================================
+# ARCHIVOS SIN MATCH DE PATRÓN (file_pattern)
+# =============================================================================
+
+def procesar_archivo_desconocido(
+    bucket: str, key: str, event_size: int, client_id: str, filename: str
+) -> Dict:
+    """
+    Maneja un archivo que no matcheó ningún patrón activo de
+    `file_pattern` — antes de esta función, ese archivo se descartaba en
+    silencio (ver gotcha "lmbd-router: archivo sin match de patrón..." en
+    gotchas.md): sin registro en `file_control`, sin moverse de landing,
+    solo un `logger.warning` que nadie ve salvo que vaya a buscarlo a
+    mano en CloudWatch.
+
+    Reusa exactamente el mismo cálculo de identidad que un archivo
+    clasificado (`generar_file_id`/`calcular_content_hash`/
+    `verificar_duplicado`/`generar_file_id_unico`) — la identidad de un
+    archivo no depende de si matcheó un patrón, así que no hay motivo
+    para tener una lógica de deduplicación distinta acá. Diferencias
+    reales respecto al flujo normal:
+      - `clasificacion` sintética ({'brand': 'UNKNOWN', 'direction':
+        'UNKNOWN'}) — FILE_TYPE_MAP/BRAND_ID_MAP resuelven cualquier
+        valor no reconocido a 'UNKNOWN' por su propio default.
+      - `control_status='UNKNOWN'` directo (nunca pasa por PENDING ni
+        por `actualizar_estado()` — no hay ningún pipeline que lo vaya a
+        mover de estado).
+      - Se archiva a `s3-archive` en vez de dejarse en landing (ver
+        `archivar_desconocido()`); la key resultante se persiste como
+        `archive_key` (columna top-level, `update_item` no destructivo)
+        para no depender solo del retorno del Lambda.
+      - Nunca se llama a `start_process()`.
+
+    Args:
+        bucket: Bucket S3 de landing.
+        key: Key completo del archivo en landing.
+        event_size: Tamaño reportado por el evento S3 (fallback si
+            `obtener_file_size` no puede confirmar el tamaño real).
+        client_id: Código de cliente (primer segmento del path).
+        filename: Nombre del archivo (último segmento del path).
+
+    Returns:
+        Dict para agregar a `results` — mismo formato que el resto de
+        ramas de `lambda_handler()` (`status` en {"SKIPPED", "ERROR"}).
+
+    Ejemplo:
+        procesar_archivo_desconocido("landing", "EBGR/raro.dat", 1024, "EBGR", "raro.dat")
+        # -> {'file': 'raro.dat', 'status': 'SKIPPED', 'reason': 'No pattern match',
+        #     'file_id': '...', 'control_status': 'UNKNOWN', 'archived_key': 'EBGR/originals/UNKNOWN/...'}
+    """
+    file_id = generar_file_id(client_id, filename)
+
+    content_hash = calcular_content_hash(bucket, key)
+    if not content_hash:
+        logger.warning("  content_hash vacío → usando file_id como fallback")
+        content_hash = file_id
+
+    file_size = obtener_file_size(bucket, key, event_size)
+    file_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    estado_dup, _ = verificar_duplicado(file_id, content_hash)
+    if estado_dup == "duplicado":
+        return procesar_archivo_duplicado(file_id, bucket, key, client_id, filename, "Duplicate (unknown)")
+    elif estado_dup == "version_nueva":
+        logger.info("  VERSION NUEVA (desconocido) — generando nuevo file_id")
+        file_id = generar_file_id_unico(client_id, filename, content_hash)
+
+    clasificacion_desconocida = {'brand': 'UNKNOWN', 'direction': 'UNKNOWN'}
+
+    if not registrar_archivo(
+        file_id=file_id, client_id=client_id, filename=filename,
+        bucket=bucket, s3_key=key, file_size=file_size,
+        content_hash=content_hash, clasificacion=clasificacion_desconocida,
+        file_date=file_date, control_status='UNKNOWN',
+        error_message='Sin match de patrón en file_pattern',
+    ):
+        logger.error("  Falló registro en DynamoDB (desconocido)")
+        return {'file': filename, 'status': 'ERROR', 'error': 'DynamoDB failed (unknown)'}
+
+    archived_key = archivar_desconocido(bucket, key, client_id, filename)
+
+    if archived_key:
+        # Mismo formato que el flujo normal (ver ASL VI/MC, paso
+        # UpdateFileControlArchived): archive_key es un string con el
+        # JSON de {archive_key, file_id, status} — no la key sola.
+        archive_result_json = json.dumps({
+            'status':      'ARCHIVED',
+            'file_id':     file_id,
+            'archive_key': archived_key,
+        })
+        try:
+            dynamodb.Table(TABLE_FILE_CONTROL).update_item(
+                Key={'file_id': file_id},
+                UpdateExpression="SET archive_key = :ak",
+                ExpressionAttributeValues={':ak': archive_result_json},
+            )
+        except Exception as e:
+            logger.warning(f"  No se pudo persistir archive_key para {file_id}: {e}")
+
+    return {
+        'file':          filename,
+        'status':        'SKIPPED',
+        'reason':        'No pattern match',
+        'file_id':       file_id,
+        'control_status': 'UNKNOWN',
+        'archived_key':  archived_key,
+    }
+
+
+def _compress_and_save_to_tmp(source_bucket: str, source_key: str, filename: str, tmp_path: str) -> int:
+    """
+    Lee el archivo de S3 en chunks y lo escribe comprimido en /tmp — port
+    literal de `_compress_and_save_to_tmp()` de `lmbd-archive-file`
+    (mismo patrón, mismo default de chunk vía `COMPRESS_CHUNK_SIZE_MB`).
+    Nunca tiene más de `COMPRESS_CHUNK_BYTES` en RAM al mismo tiempo.
+
+    Args:
+        source_bucket: Bucket origen (landing).
+        source_key: Key del archivo original dentro del bucket origen.
+        filename: Nombre con el que se registra la entrada dentro del ZIP.
+        tmp_path: Ruta local en /tmp donde se escribe el ZIP resultante.
+
+    Returns:
+        Tamaño del ZIP resultante en bytes.
+
+    Ejemplo:
+        _compress_and_save_to_tmp("itx-landing-dev", "EBGR/raro.dat",
+            "raro.dat", "/tmp/EBGR_raro.dat.zip")  # -> 20480
+    """
+    response = s3.get_object(Bucket=source_bucket, Key=source_key)
+    body = response['Body']
+    file_size = response.get('ContentLength', 0)
+
+    logger.info(f"  Comprimiendo s3://{source_bucket}/{source_key} ({file_size / 1024 / 1024:.1f}MB)")
+
+    with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with zf.open(filename, 'w') as zip_entry:
+            while True:
+                chunk = body.read(COMPRESS_CHUNK_BYTES)
+                if not chunk:
+                    break
+                zip_entry.write(chunk)
+
+    zip_size = os.path.getsize(tmp_path)
+    logger.info(f"  ZIP: {zip_size / 1024 / 1024:.1f}MB")
+    return zip_size
+
+
+def _upload_zip_to_s3(tmp_path: str, dest_bucket: str, dest_key: str, zip_size: int) -> None:
+    """
+    Sube el ZIP desde /tmp a S3 — port literal de `_upload_zip_to_s3()` de
+    `lmbd-archive-file`: `put_object` simple para archivos < 100MB,
+    multipart upload (abortado limpio si falla a mitad de camino) para
+    archivos más grandes.
+
+    Args:
+        tmp_path: Ruta local del ZIP a subir.
+        dest_bucket: Bucket destino (archive).
+        dest_key: Key destino dentro del bucket de archive.
+        zip_size: Tamaño del ZIP en bytes, decide la estrategia de subida.
+
+    Returns:
+        None. Relanza la excepción original si el multipart upload falla
+        (después de abortarlo, para no dejar partes huérfanas en S3).
+
+    Ejemplo:
+        _upload_zip_to_s3("/tmp/EBGR_raro.dat.zip", "itl-...-s3-archive",
+            "EBGR/originals/UNKNOWN/2026/08/raro.dat.zip", 20480)
+    """
+    if zip_size < MULTIPART_THRESHOLD:
+        with open(tmp_path, 'rb') as f:
+            s3.put_object(Bucket=dest_bucket, Key=dest_key, Body=f, ContentType='application/zip')
+        return
+
+    mpu = s3.create_multipart_upload(Bucket=dest_bucket, Key=dest_key, ContentType='application/zip')
+    upload_id = mpu['UploadId']
+    parts = []
+    part_num = 1
+    try:
+        with open(tmp_path, 'rb') as f:
+            while True:
+                chunk = f.read(MULTIPART_THRESHOLD)
+                if not chunk:
+                    break
+                response = s3.upload_part(
+                    Bucket=dest_bucket, Key=dest_key, UploadId=upload_id,
+                    PartNumber=part_num, Body=chunk,
+                )
+                parts.append({'PartNumber': part_num, 'ETag': response['ETag']})
+                part_num += 1
+        s3.complete_multipart_upload(
+            Bucket=dest_bucket, Key=dest_key, UploadId=upload_id,
+            MultipartUpload={'Parts': parts},
+        )
+    except Exception:
+        logger.error("Multipart upload falló — abortando")
+        s3.abort_multipart_upload(Bucket=dest_bucket, Key=dest_key, UploadId=upload_id)
+        raise
+
+
+def _archivar_bajo_prefijo(bucket: str, key: str, client_id: str, filename: str, prefijo: str) -> Optional[str]:
+    """
+    Mueve a s3-archive un archivo que el router no va a mandar al
+    pipeline normal — reusada tanto para archivos sin match de patrón
+    (`prefijo="UNKNOWN"`, ver gotcha "lmbd-router: archivo sin match de
+    patrón..." en gotchas.md) como para duplicados de cualquier archivo,
+    clasificado o no (`prefijo="DUPLICATE"`, ver `procesar_archivo_duplicado()`).
+    Sin esto, ambos casos dejaban el archivo indefinidamente en landing.
+
+    Estructura de destino, en paralelo a la de `lmbd-archive-file`
+    (`{client_id}/originals/{brand}/{file_type}/{year}/{month}/{filename}.zip`)
+    pero bajo `{prefijo}` en vez de `{brand}/{file_type}` — lo distingue
+    de inmediato de un archivo archivado por el flujo normal:
+
+      {client_id}/originals/{prefijo}/{year}/{month}/{filename}.zip
+
+    Comprime a .zip antes de subir — mismo patrón de streaming que
+    `lmbd-archive-file` (`_compress_and_save_to_tmp`/`_upload_zip_to_s3`,
+    portados literal más arriba), para no cargar el archivo completo en
+    memoria. Verifica que el ZIP exista en destino (`head_object`) antes
+    de borrar el original de landing — si la verificación falla, el
+    archivo original queda intacto en landing en vez de perderse. `/tmp`
+    se limpia siempre, éxito o fallo (`finally`). `year`/`month` usan la
+    fecha de HOY (no hay fecha de negocio confiable en ninguno de los 2
+    casos — un archivo sin clasificar no tiene fecha extraíble, y un
+    duplicado usa la fecha de ESTA subida, no la original).
+
+    Args:
+        bucket: Bucket S3 de landing (origen).
+        key: Key completo del archivo en landing.
+        client_id: Código de cliente (primer segmento del path).
+        filename: Nombre del archivo (último segmento del path).
+        prefijo: Segmento que reemplaza a `{brand}/{file_type}` en la
+            ruta de destino — "UNKNOWN" o "DUPLICATE".
+
+    Returns:
+        El S3 key de destino (.zip) en `ARCHIVE_BUCKET` si el archivado
+        tuvo éxito, `None` si `ARCHIVE_BUCKET` no está configurado o si
+        algo falló (se loguea el error, nunca se relanza — dejar el
+        archivo en landing sigue siendo mejor que tumbar el resto del
+        batch).
+
+    Ejemplo:
+        _archivar_bajo_prefijo("landing-bucket", "EBGR/raro.dat", "EBGR", "raro.dat", "UNKNOWN")
+        # -> "EBGR/originals/UNKNOWN/2026/08/raro.dat.zip"
+    """
+    if not ARCHIVE_BUCKET:
+        logger.warning(f"  S3_BUCKET_ARCHIVE no configurado — archivo ({prefijo}) queda en landing")
+        return None
+
+    now = datetime.utcnow()
+    zip_filename = filename if filename.lower().endswith('.zip') else f"{filename}.zip"
+    dest_key = f"{client_id}/originals/{prefijo}/{now.strftime('%Y')}/{now.strftime('%m')}/{zip_filename}"
+    tmp_path = f"/tmp/{client_id}_{zip_filename}"
+
+    try:
+        zip_size = _compress_and_save_to_tmp(bucket, key, filename, tmp_path)
+        _upload_zip_to_s3(tmp_path, ARCHIVE_BUCKET, dest_key, zip_size)
+
+        try:
+            s3.head_object(Bucket=ARCHIVE_BUCKET, Key=dest_key)
+        except Exception:
+            logger.error(f"Verificación de subida falló — {filename} queda en landing sin borrar")
+            return None
+
+        s3.delete_object(Bucket=bucket, Key=key)
+        logger.info(f"  Archivado ({prefijo}) → s3://{ARCHIVE_BUCKET}/{dest_key}")
+        return dest_key
+    except Exception as e:
+        logger.error(f"Error archivando ({prefijo}): {e}")
+        return None
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception as e:
+                logger.warning(f"No se pudo limpiar {tmp_path}: {e}")
+
+
+def archivar_desconocido(bucket: str, key: str, client_id: str, filename: str) -> Optional[str]:
+    return _archivar_bajo_prefijo(bucket, key, client_id, filename, "UNKNOWN")
+
+
+def procesar_archivo_duplicado(
+    file_id: str, bucket: str, key: str, client_id: str, filename: str, motivo: str
+) -> Dict:
+    """
+    Maneja un archivo detectado como duplicado exacto (mismo file_id Y
+    mismo content_hash que un registro ya existente en file_control) —
+    aplica tanto al duplicado de un archivo YA CLASIFICADO (detectado en
+    `lambda_handler()`) como al de uno sin clasificar (detectado en
+    `procesar_archivo_desconocido()`), de ahí que reciba `motivo` como
+    texto libre para distinguir el origen en logs/resultados.
+
+    Deliberadamente NO usa `registrar_archivo()` (que hace `put_item` —
+    reemplazaría el registro completo). El `file_id` de un duplicado es
+    el MISMO que el del archivo procesado la primera vez, y ese registro
+    ya tiene el `control_status` real de esa corrida (SUCCESS, FAILED, lo
+    que haya sido) — sobreescribirlo perdería esa historia. En su lugar,
+    `update_item` con `list_append` AGREGA un evento a
+    `duplicate_uploads` sin tocar ningún otro campo (mismo principio que
+    "nunca REMOVE atributos" de otras tablas del proyecto — acá el
+    equivalente es "nunca overwrite un registro con historia real").
+
+    Efecto en S3: el duplicado se archiva a `.../originals/DUPLICATE/...`
+    (ver `_archivar_bajo_prefijo()`) — landing queda limpio igual que en
+    el resto de los casos que maneja el router.
+
+    Args:
+        file_id: file_id ya existente en file_control (mismo que el
+            archivo original — NO se genera uno nuevo).
+        bucket: Bucket S3 de landing.
+        key: Key completo del archivo duplicado en landing.
+        client_id: Código de cliente.
+        filename: Nombre del archivo.
+        motivo: Texto para logs/resultados — "Duplicate" o
+            "Duplicate (unknown)" según el caso.
+
+    Returns:
+        Dict para agregar a `results` (`status: "SKIPPED"`).
+
+    Ejemplo:
+        procesar_archivo_duplicado(file_id, bucket, key, "EBGR", "archivo.txt", "Duplicate")
+    """
+    archived_key = _archivar_bajo_prefijo(bucket, key, client_id, filename, "DUPLICATE")
+
+    try:
+        table = dynamodb.Table(TABLE_FILE_CONTROL)
+        table.update_item(
+            Key={'file_id': file_id},
+            UpdateExpression=(
+                "SET duplicate_uploads = list_append("
+                "if_not_exists(duplicate_uploads, :empty), :new_upload)"
+            ),
+            ExpressionAttributeValues={
+                ':empty': [],
+                ':new_upload': [{
+                    'detected_at':   datetime.utcnow().isoformat(),
+                    'landing_path':  f"s3://{bucket}/{key}",
+                    'archived_key':  archived_key or '',
+                }],
+            },
+        )
+    except Exception as e:
+        logger.warning(f"  No se pudo registrar duplicate_uploads para {file_id}: {e}")
+
+    logger.info(f"  DUPLICADO ({motivo}): {file_id}")
+    return {
+        'file':         filename,
+        'status':       'SKIPPED',
+        'reason':       motivo,
+        'file_id':      file_id,
+        'archived_key': archived_key,
+    }
+
+
+# =============================================================================
 # REGISTRO EN DYNAMODB
 # =============================================================================
 
 def registrar_archivo(
     file_id: str, client_id: str, filename: str,
     bucket: str, s3_key: str, file_size: int,
-    content_hash: str, clasificacion: Dict, file_date: str
+    content_hash: str, clasificacion: Dict, file_date: str,
+    control_status: str = 'PENDING', error_message: Optional[str] = None,
 ) -> bool:
     """
     Crea el registro inicial del archivo en DynamoDB (tabla file_control).
-    Estado inicial: PENDING.
+    Estado inicial: PENDING (o el que se pase en `control_status` — ver
+    caso de archivos sin match de patrón en `lambda_handler()`, que se
+    registran directo en 'UNKNOWN' porque nunca van a pasar por
+    `actualizar_estado()`).
 
     Args:
         file_id: Identificador del archivo (llave de partición).
@@ -1287,8 +1653,18 @@ def registrar_archivo(
         file_size: Tamaño del archivo en bytes.
         content_hash: MD5 del contenido del archivo.
         clasificacion: Dict de clasificación (de clasificar_archivo), usado
-            para derivar brand_id y file_type.
+            para derivar brand_id y file_type. Para archivos sin match,
+            pasar {'brand': 'UNKNOWN', 'direction': 'UNKNOWN'} — los mapas
+            FILE_TYPE_MAP/BRAND_ID_MAP resuelven cualquier valor no
+            reconocido a 'UNKNOWN' vía su propio default.
         file_date: Fecha de negocio del archivo, en formato "YYYY-MM-DD".
+        control_status: Estado inicial del registro. 'PENDING' (default)
+            para el flujo normal — el pipeline lo actualiza después vía
+            `actualizar_estado()`. Un valor terminal (ej. 'UNKNOWN') para
+            archivos que nunca van a entrar al pipeline.
+        error_message: Motivo a registrar cuando `control_status` ya es
+            terminal (ej. "Sin match de patrón en file_pattern") — evita
+            tener que loguear el motivo solo en CloudWatch.
 
     Returns:
         True si el registro se creó exitosamente, False si falló (se loguea
@@ -1302,7 +1678,7 @@ def registrar_archivo(
         table = dynamodb.Table(TABLE_FILE_CONTROL)
         direction = clasificacion['direction'].upper()
         brand = clasificacion['brand'].upper()
-        
+
         file_type = FILE_TYPE_MAP.get(direction, 'UNKNOWN')
         brand_id = BRAND_ID_MAP.get(brand, 'UNKNOWN')
 
@@ -1317,14 +1693,14 @@ def registrar_archivo(
             'file_type':            file_type,
             'file_processing_date': file_date,
             'detected_at':          datetime.utcnow().isoformat(),
-            'control_status':       'PENDING',
+            'control_status':       control_status,
             'process_start_ts':     None,
             'process_finish_ts':    None,
-            'error_message':        None,
+            'error_message':        error_message,
         }
 
         table.put_item(Item=registro)
-        logger.info(f"  Archivo registrado → file_id: {file_id}")
+        logger.info(f"  Archivo registrado → file_id: {file_id} (control_status={control_status})")
         return True
 
     except Exception as e:
@@ -1567,19 +1943,25 @@ def lambda_handler(event, context):
                 continue
             # ─────────────────────────────────────────────────────────────
 
-            # Cargar patrones
+            # Cargar patrones. Un cliente sin NINGÚN patrón activo (a
+            # diferencia de "tiene patrones pero este archivo no matchea
+            # ninguno") ya NO corta como ERROR (2026-08-12) — antes,
+            # `cargar_patrones()` vacío mandaba el archivo directo a un
+            # status "ERROR" sin registrar nada ni archivar, el mismo
+            # problema de fondo que procesar_archivo_desconocido() ya
+            # resuelve para el otro caso. `clasificar_archivo(filename, [])`
+            # ya devuelve None de forma natural con una lista vacía, así
+            # que ambos casos ahora caen en la misma rama "sin match".
             patrones = cargar_patrones(client_id)
-            if not patrones:
-                msg = f"No hay patrones activos para '{client_id}'"
-                logger.error(msg)
-                results.append({'file': filename, 'status': 'ERROR', 'error': msg})
-                continue
 
             # Clasificar
             clasificacion = clasificar_archivo(filename, patrones)
             if not clasificacion:
                 logger.warning(f"  Sin match de patrón: {filename}")
-                results.append({'file': filename, 'status': 'SKIPPED', 'reason': 'No pattern match'})
+                results.append(procesar_archivo_desconocido(
+                    bucket=bucket, key=key, event_size=event_size,
+                    client_id=client_id, filename=filename,
+                ))
                 continue
 
             logger.info(f"  Clasificado: {clasificacion['brand']} / {clasificacion['direction']}")
@@ -1619,8 +2001,7 @@ def lambda_handler(event, context):
             estado_dup, _ = verificar_duplicado(file_id, content_hash)
 
             if estado_dup == "duplicado":
-                logger.info(f"  DUPLICADO — ya procesado: {file_id}")
-                results.append({'file': filename, 'status': 'SKIPPED', 'reason': 'Duplicate'})
+                results.append(procesar_archivo_duplicado(file_id, bucket, key, client_id, filename, "Duplicate"))
                 continue
 
             elif estado_dup == "version_nueva":

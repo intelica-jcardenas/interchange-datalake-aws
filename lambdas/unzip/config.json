@@ -4,12 +4,12 @@
     "Runtime": "python3.11",
     "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-vi-role",
     "Handler": "handler.lambda_handler",
-    "CodeSize": 6598,
+    "CodeSize": 7516,
     "Description": "",
     "Timeout": 240,
     "MemorySize": 1024,
-    "LastModified": "2026-07-11T16:01:54.000+0000",
-    "CodeSha256": "UIIcOC604L0zU40bUumeKAGAJaM+dCiSdlchRhTY8sA=",
+    "LastModified": "2026-08-12T20:25:06.000+0000",
+    "CodeSha256": "BHwplO0b+pr4JKk/W8rSOB3krlbqzr2Lia0sPAoK/Qo=",
     "Version": "$LATEST",
     "VpcConfig": {
         "SubnetIds": [
@@ -33,7 +33,7 @@
     "TracingConfig": {
         "Mode": "PassThrough"
     },
-    "RevisionId": "2c25ddb5-5388-4a27-aa33-2bfa3913394b",
+    "RevisionId": "b141966f-77d1-412e-8a2a-8c91f2b2b1f1",
     "Layers": [
         {
             "Arn": "arn:aws:lambda:eu-south-2:861276092327:layer:itl-0004-itx-dev-intchg-02-pandas-pyarrow:1",
@@ -54,7 +54,7 @@
         "OptimizationStatus": "Off"
     },
     "RuntimeVersionConfig": {
-        "RuntimeVersionArn": "arn:aws:lambda:eu-south-2::runtime:15606da216b3bff5de1872be70ce1a6be87f1f26dafc9bcf45233c0dc338335b"
+        "RuntimeVersionArn": "arn:aws:lambda:eu-south-2::runtime:81a2f2bcc7b606f63601c58153453037785e00ca30d21476cee5f82df01b0d71"
     },
     "LoggingConfig": {
         "LogFormat": "Text",

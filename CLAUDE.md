@@ -30,12 +30,16 @@ S3 Landing  {client_id}/{filename}
     ↓  [S3 Event s3:ObjectCreated:*]
 lmbd-router
     ↓  (1) extrae client_id del path
-    ↓  (2) si ZIP → lmbd-unzip [async, no espera] → cada archivo extraído
-    ↓       dispara el router nuevamente via S3 event → paralelismo gratis
+    ↓  (2) si ZIP → lmbd-unzip [async, no espera] → sube TODOS los archivos
+    ↓       extraídos a landing (con o sin match), cada uno dispara el
+    ↓       router nuevamente via S3 event → paralelismo gratis
     ↓  (3) clasifica via DynamoDB file_pattern (regex por prioridad)
+    ↓       sin match → UNKNOWN (registra en file_control + archiva
+    ↓       comprimido a s3-archive/.../originals/UNKNOWN/, landing limpio)
     ↓  (4) extrae fecha del header: Visa → primeros 50 bytes; MC → chunks buscando trailer 1644/695
     ↓  (5) calcula MD5 en streaming → detecta duplicados en file_control
-    ↓       mismo MD5        → SKIPPED (ya procesado)
+    ↓       mismo MD5        → SKIPPED (ya procesado, evento agregado a
+    ↓                          duplicate_uploads, archivado a .../DUPLICATE/)
     ↓       mismo nombre/distinto MD5 → nuevo file_id (nueva versión)
     ↓  (6) registra en DynamoDB file_control con estado PENDING → PROCESSING
     ↓
