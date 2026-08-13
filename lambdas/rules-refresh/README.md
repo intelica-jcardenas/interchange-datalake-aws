@@ -1,4 +1,4 @@
-# `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (PROPUESTA — no desplegada)
+# `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (desplegado sobre `lmbd-test-1`, nombre definitivo pendiente)
 
 Automatiza el refresco de `visa_rules/data.parquet` y `mc_rules/data.parquet`
 en `s3-reference` a partir de los excels de reglas de interchange que el
@@ -116,21 +116,27 @@ nuevo en ese momento, no antes.
 | `S3_BUCKET_REFERENCE` | Bucket `s3-reference` (incoming, parquet, history, archive) |
 | `RULES_MIN_ROW_RATIO` | Ratio mínimo filas_nuevas/filas_actuales antes de rechazar (default `0.5`) |
 
-## Pendiente antes de poder desplegar
+## Estado real (actualizado 2026-08-13)
 
-- [ ] **Layer con `openpyxl`** — el layer compartido `itx-pandas-pyarrow`
-  (pandas + pyarrow) no incluye `openpyxl`, necesario para
-  `pd.read_excel(..., engine="openpyxl")`. Extender ese layer o crear uno
-  dedicado para este Lambda.
-- [ ] **Rol IAM** `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh-role` —
-  permisos: `s3:GetObject`/`PutObject`/`CopyObject`/`DeleteObject` sobre
-  `s3-reference` (scoped a `interchange_rules/*`, `visa_rules/*`,
-  `mc_rules/*`), `logs:*` estándar.
-- [ ] **Notificación S3** en `s3-reference`, prefijo `interchange_rules/`,
-  sufijo `.xlsx` (opcional), apuntando a esta Lambda.
-- [ ] **Probar contra AWS real** (S3) una vez creada la infraestructura —
-  la validación de hoy es solo local (funciones de construcción/validación,
-  sin tocar AWS).
-- [ ] Decidir si se crea un `visa_rules_backup_pre_v37_20260728/`-style
-  lifecycle policy en `history/` (borrado automático tras N días) o se deja
-  crecer indefinidamente — no implementado en esta propuesta.
+Desplegado y en producción desde 2026-08-10, corriendo sobre infraestructura
+prestada (`itl-0004-itx-dev-intchg-02-lmbd-test-1`, rol
+`itl-0004-itx-dev-intchg-02-lmbd-vi-role`) — ver detalle completo en
+`.claude/memory/decisions.md` (proyecto). Notificación S3 activa en
+`s3-reference` (prefijo `interchange_rules/`, sufijos `.xlsx`/`.xls`),
+auto-publica sin aprobación manual.
+
+**Dependencias:** `openpyxl`/`et_xmlfile` ya NO van empaquetadas junto al
+código — resuelto 2026-08-13 con un layer dedicado
+(`layers/rules-refresh-openpyxl/`, ver su propio README), mismo patrón que
+todos los demás Lambdas del proyecto. `src/` local solo tiene `handler.py`.
+
+## Pendiente
+
+- [ ] **Lambda/rol propios** — sigue sobre `lmbd-test-1`/`lmbd-vi-role`
+  prestados. Renombrar o recrear con nombre definitivo
+  (`itl-0004-itx-dev-intchg-02-lmbd-rules-refresh`) y rol IAM dedicado
+  (permisos: `s3:GetObject`/`PutObject`/`CopyObject`/`DeleteObject` sobre
+  `s3-reference`, scoped a `interchange_rules/*`, `visa_rules/*`,
+  `mc_rules/*`).
+- [ ] Decidir si se crea una lifecycle policy en `history/` (borrado
+  automático tras N días) o se deja crecer indefinidamente.

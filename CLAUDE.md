@@ -217,7 +217,9 @@ interchange-datalake-aws/
 ├── s3/                             # Configuraciones de buckets
 ├── iam/                            # Roles IAM documentados
 ├── athena/                         # Workgroups y catálogos
-├── layers/itx-pandas-pyarrow/      # Layer compartido: pandas + pyarrow
+├── layers/pandas-pyarrow/          # Layer compartido: pandas + pyarrow
+├── layers/pyarrow-curl_cffi/       # Layer de mc-exchange-rates (scraping via proxies)
+├── layers/rules-refresh-openpyxl/  # Layer de rules-refresh: openpyxl + et_xmlfile
 ├── scripts/                        # Utilitarios locales de desarrollo (no se despliegan)
 │   ├── sync-lambdas.ps1            # Descarga config + codigo de Lambdas desde AWS al repo
 │   ├── sync-glue.ps1               # Descarga Jobs (config+script), Databases y Crawlers de Glue desde AWS al repo
@@ -251,7 +253,7 @@ lambdas/<marca>/<etapa>/
 
 ---
 
-## S3 — 5 buckets (Data Lake por capas)
+## S3 — 8 buckets (Data Lake por capas)
 
 Patron de nomenclatura: `itl-0004-itx-{env}-intchg-02-s3-{tipo}`
 
@@ -262,6 +264,9 @@ Patron de nomenclatura: `itl-0004-itx-{env}-intchg-02-s3-{tipo}`
 | `itl-0004-itx-dev-intchg-02-s3-operational` | operational | Parquets finales listos para consumo |
 | `itl-0004-itx-dev-intchg-02-s3-archive` | archive | Archivos originales post-procesamiento |
 | `itl-0004-itx-dev-intchg-02-s3-reference` | reference | Datos de referencia (tablas ARDEF, IAR, tipos de cambio) |
+| `itl-0004-itx-dev-intchg-02-s3-analytics` | analytics | Reportes internos consultables desde Athena — `get_transaction.py` y `scheme_fee.py` (`state/`/`final/`), particionado `report_month=YYYYMM/` (ver `decisions.md` → "Estructura Hive para reportes en `s3-analytics`") |
+| `itl-0004-itx-dev-intchg-02-s3-scheme-fee` | scheme-fee | Punto de intercambio de CSV de cuotas con el equipo externo — `IN/` (enviado) / `OUT/` (recibido con costos). Deliberadamente separado de `s3-analytics` — ver `decisions.md` → "`state/`/`final/` de scheme_fee se quedan en `s3-analytics`" |
+| `itl-0004-itx-dev-intchg-02-s3-athena` | athena | Resultados de consultas Athena (`Unsaved/` — ubicación de salida por defecto del workgroup) |
 
 ---
 

@@ -155,20 +155,6 @@ foreach ($Suffix in $ToSync.Keys) {
         }
     }
 
-    # test-1 (rules-refresh) necesita openpyxl/et_xmlfile empaquetados junto al
-    # codigo -- a diferencia de TODAS las demas Lambdas de este repo, no tiene
-    # layer propio que cubra esa dependencia (ver lambdas\rules-refresh\README.md).
-    # local\src\ solo tiene handler.py -- subir solo eso pisaria el ZIP real
-    # (que hoy incluye openpyxl) y rompería el Lambda en runtime (ImportError).
-    # Hasta que exista un layer dedicado, este push se salta -- desplegar a mano
-    # (bajar el ZIP real, reemplazar handler.py, resubir) como se hizo hasta ahora.
-    if ($Suffix -eq "test-1" -and -not (Test-Path (Join-Path $LocalSrc "openpyxl"))) {
-        Write-Host "  SKIP - test-1 necesita openpyxl/et_xmlfile empaquetados (no estan en src/ local) -- desplegar a mano" -ForegroundColor Yellow
-        $null = $Results.Add([pscustomobject]@{ Lambda = $Suffix; Group = $Meta.Group; Status = "SKIP (deps faltantes)" })
-        Write-Host ""
-        continue
-    }
-
     # 1. Copiar src/ a un staging dir, excluyendo __pycache__ y basura de SO/editor.
     if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
     New-Item -ItemType Directory -Path $StageDir | Out-Null

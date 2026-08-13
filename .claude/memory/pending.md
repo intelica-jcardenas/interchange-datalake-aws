@@ -13,15 +13,12 @@ y se borra de aquí — no se acumulan items completados con `[x]`.
 ## `lmbd-vi-transform`: TCs nuevos Visa (RETURNED/RECLASSIFICATION/BASEII extendido) — CERRADO 2026-08-11
 
 Trabajo completo, validado a fondo con datos reales (cliente NXGR) y cerrado
-a pedido del usuario. Detalle completo → `decisions.md`. Queda abierto solo
-lo que sigue:
+a pedido del usuario. Detalle completo → `decisions.md`. El consumo
+downstream (`extract`/`clean`/`calculate`/`interchange`/`visa_fields`) de
+`RETURNED`/`RECLASSIFICATION`/columna `"D"` **no es un pendiente** — se
+acordó explícitamente que esta etapa solo carga hasta `staging` vía
+`transform`, sin extenderse más allá. Queda abierto solo lo que sigue:
 
-- [ ] **Downstream fuera de alcance a propósito:** `lmbd-vi-extract`/
-  `lmbd-vi-clean`/`glue-vi-calculate`/`glue-vi-interchange` y la tabla
-  DynamoDB `visa_fields` no saben nada todavía de `RETURNED`/
-  `RECLASSIFICATION` ni de la columna `"D"` nueva en BASEII — esos Parquets
-  se generan en `s3-staging` pero nada los consume aún más adelante en el
-  pipeline. Definir cuándo se aborda (sesión futura).
 - [ ] **Crawler/database de Glue para `NXGR`** — confirmado que no existe
   ninguno (ni para VISA ni MASTERCARD) — ya hay Parquets reales en
   `s3-staging/NXGR/VISA/...` pero nadie puede consultarlos vía Athena/
@@ -91,8 +88,6 @@ originales borrados recién después de confirmar):**
   5 de la propuesta, sin crear todavía. Es el paso que le da sentido
   práctico a toda la reestructuración (sin esto nada de esto es
   consultable desde Athena).
-- [ ] Documentar en `CLAUDE.md` los 3 buckets faltantes de la tabla "S3 (5
-  buckets)": `s3-analytics`, `s3-athena`, `s3-scheme-fee`.
 - [ ] `--mode read` de `scheme_fee.py` (con el `write_parquet_multi()`
   nuevo aplicado a `final/detail`/`final/report`) no se probó con datos
   reales — solo `--mode generate`. Sigue sin CSV real del equipo externo
@@ -126,10 +121,6 @@ investigar la lógica todavía**. Por ahora solo debe existir como entrada
 mapeada en `sync-glue.ps1`/`push-glue.ps1` (ya hecho). Cuando el usuario
 confirme que está terminado/validado, documentar con la skill
 `itx-document-script` (mismo tratamiento que el resto de `glue/scripts/`).
-
-- [ ] **Bucket `s3-analytics`** — usado por `get_transaction.py`/`scheme_fee.py`
-  pero no aparece en la tabla de "S3 — 5 buckets" de `CLAUDE.md` — gap de
-  documentación preexistente, no de hoy, notado de paso durante esta auditoría.
 
 ---
 

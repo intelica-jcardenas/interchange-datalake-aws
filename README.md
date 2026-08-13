@@ -150,7 +150,9 @@ interchange-datalake-aws/
 ├── dynamodb/schemas/
 ├── iam/roles/
 ├── s3/configs/
-├── layers/itx-pandas-pyarrow/
+├── layers/pandas-pyarrow/
+├── layers/pyarrow-curl_cffi/
+├── layers/rules-refresh-openpyxl/
 ├── athena/
 ├── scripts/
 │   ├── sync-lambdas.ps1
