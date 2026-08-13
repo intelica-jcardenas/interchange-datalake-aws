@@ -72,6 +72,7 @@ Pendientes (TODO)
 """
 
 import sys
+import uuid
 import boto3
 
 from awsglue.utils import getResolvedOptions
@@ -163,6 +164,8 @@ OPERATIONAL_BUCKET = args["operational_bucket"]
 BUCKET_REF = args["reference_bucket"]
 ANALYTICS_BUCKET = args["analytics_bucket"]
 DDB_CLIENT_TABLE = args["dynamodb_table_client"]
+
+s3_client = boto3.client("s3")
 
 
 # =============================================================================
@@ -1279,6 +1282,68 @@ def process_client_range(
     return result.select(FINAL_COLS)
 
 
+def write_single_parquet(df: DataFrame, final_s3_path: str) -> None:
+    """
+    Escribe `df` como un único archivo Parquet en `final_s3_path`, sin el
+    marcador de directorio `_$folder$` que el committer de Spark/Hadoop
+    genera al escribir directo con `df.write.parquet(path)` — Spark
+    siempre produce una "carpeta" (part-*.parquet + ese marcador) aunque
+    el resultado sea un solo archivo. Acá se escribe a un prefijo
+    temporal descartable (nombre único con uuid4, evita colisiones entre
+    ejecuciones concurrentes) y se copia el único part-file al key final
+    exacto vía `copy_object` — sin pasar por el committer en el destino
+    final, así que ahí nunca se genera el marcador. El prefijo temporal
+    completo (part-file + marcador si lo hubo) se borra siempre al final,
+    haya fallado o no la escritura.
+
+    Mismo patrón ya validado en `write_single_parquet()` de
+    `glue/scripts/mastercard/interchange/interchange.py` — acá
+    simplificado a solo S3 (este job siempre escribe a s3://, nunca a
+    filesystem local).
+
+    Args:
+        df: DataFrame a escribir (se fuerza a 1 solo part-file con
+            `repartition(1)`).
+        final_s3_path: URI s3:// completo del archivo final, incluyendo
+            el nombre ".parquet".
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: si no se encuentra ningún part-file tras escribir
+            el prefijo temporal.
+
+    Ejemplo:
+        write_single_parquet(result_df, "s3://bucket/SBSA/reports/get_transaction/report_month=202601/data.parquet")
+    """
+    bucket, final_key = final_s3_path[len("s3://"):].split("/", 1)
+    tmp_prefix = f"{final_key}_tmp_{uuid.uuid4().hex}/"
+    tmp_uri = f"s3://{bucket}/{tmp_prefix}"
+
+    try:
+        df.repartition(1).write.mode("overwrite").parquet(tmp_uri)
+
+        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=tmp_prefix)
+        part_keys = [
+            obj["Key"] for obj in resp.get("Contents", [])
+            if obj["Key"].endswith(".parquet") and "/part-" in obj["Key"]
+        ]
+        if not part_keys:
+            raise RuntimeError(f"No se encontró part parquet en {tmp_uri}")
+
+        s3_client.copy_object(
+            Bucket=bucket,
+            CopySource={"Bucket": bucket, "Key": part_keys[0]},
+            Key=final_key,
+        )
+    finally:
+        cleanup = s3_client.list_objects_v2(Bucket=bucket, Prefix=tmp_prefix)
+        leftover = [{"Key": obj["Key"]} for obj in cleanup.get("Contents", [])]
+        if leftover:
+            s3_client.delete_objects(Bucket=bucket, Delete={"Objects": leftover})
+
+
 def write_result(df: DataFrame, client_id: str) -> str:
     """
     Escribe el reporte final como un único archivo Parquet en el bucket
@@ -1317,7 +1382,7 @@ def write_result(df: DataFrame, client_id: str) -> str:
 
     log_info(f"[write_result] Writing {df.count()} rows → {s3_path}")
 
-    df.repartition(1).write.mode("overwrite").parquet(s3_path)
+    write_single_parquet(df, s3_path)
 
     log_info(f"[write_result] Done → {s3_path}")
     return s3_path

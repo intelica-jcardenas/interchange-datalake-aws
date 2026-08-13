@@ -44,33 +44,27 @@ lo que sigue:
 
 ---
 
-## Estructura Hive-partitioned para reportes en `s3-analytics` — CÓDIGO EDITADO Y DATOS YA REORGANIZADOS 2026-08-11, script SIN DESPLEGAR (a propósito)
+## Estructura Hive-partitioned para reportes en `s3-analytics` — DESPLEGADO Y VALIDADO CONTRA AWS REAL 2026-08-12
 
 Propuesta completa en artifact: https://claude.ai/code/artifact/662380d0-15b7-42c4-8c0b-42e6c97b1403.
-Retomada y ejecutada 2026-08-11 — **el usuario pidió explícitamente no desplegar
-nada a AWS todavía** ("no despliegues nada, mañana reviso a primera hora"), así
-que el código quedó listo en el repo pero el `ScriptLocation` real en
-`s3-reference` sigue con la versión anterior (sin el fix) hasta que confirme.
+Implementada 2026-08-11, revisada y corregida (rediseño de `adhoc_tag`) el
+2026-08-12, desplegada y validada con datos reales el mismo día — ver
+`decisions.md` para el detalle completo (diseño final, validación DuckDB de
+ambos scripts, hallazgo del `app_id` no-determinístico en `scheme_fee`).
 
-**Código editado (local, sin desplegar):**
-- `glue/scripts/reports/get_transaction/get_transaction.py`: **`report_suffix`
-  eliminado** (ya no es argumento del job — versión 2026-08-12, ver
-  `decisions.md` para el diseño intermedio descartado). Ahora 2 args:
-  `report_month` (obligatorio, YYYYMM) y `adhoc_tag` (obligatorio-pero-vacío-
-  por-default, mismo patrón que `force`/`in_file_key` de `scheme_fee.py` —
-  nunca en `DefaultArguments`, siempre pasado explícito en cada
-  `start-job-run`). `write_result()`: `adhoc_tag` vacío → escribe/sobreescribe
-  `{client}/reports/get_transaction/report_month={report_month}/data.parquet`;
-  no vacío → `{client}/reports/get_transaction/_adhoc/{adhoc_tag}/data.parquet`
-  (el propio valor de `adhoc_tag` nombra la carpeta, ej. `--adhoc_tag byfix`).
-- `glue/scripts/reports/scheme_fee/scheme_fee.py`: `STATE_PREFIX`/`FINAL_PREFIX`
-  (línea ~207-208) ahora arman `state/report_month={REPORT_MONTH}` /
-  `final/report_month={REPORT_MONTH}` en vez de `state/{REPORT_MONTH}`. Único
-  cambio real — todo lo demás (CSV `IN/`/`OUT/` en `s3-scheme-fee`, lógica de
-  cálculo) sin tocar, confirmado.
-- `py_compile` OK en ambos. **`args.json` de ninguno de los 2 requiere cambios**
-  (ningún parámetro de negocio vive en `DefaultArguments`, se pasan siempre
-  por `Arguments` en cada ejecución — mismo criterio ya establecido).
+**Código final (desplegado):**
+- `get_transaction.py`: `report_suffix` eliminado. 2 args: `report_month`
+  (obligatorio, YYYYMM) y `adhoc_tag` (vacío = oficial, sobreescribe
+  `report_month={report_month}/data.parquet`; no vacío = adhoc, su propio
+  valor nombra `_adhoc/{adhoc_tag}/data.parquet`). `write_single_parquet()`
+  nueva — evita el marcador `_$folder$` (mismo patrón que
+  `mastercard/interchange.py`).
+- `scheme_fee.py`: `STATE_PREFIX`/`FINAL_PREFIX` con `report_month=`.
+  `write_parquet_multi()` nueva — variante multi-archivo de lo anterior (no
+  fuerza `coalesce(1)`, preserva paralelismo en datasets de varios GB).
+  `in_file_key` dejó de ser obligatorio en Glue para `--mode generate`
+  (antes rompía con `GlueArgumentError` si se le pasaba `""`).
+- CSV `IN/`/`OUT/` en `s3-scheme-fee` — confirmado sin tocar en ningún punto.
 
 **Datos existentes en `s3-analytics` ya reorganizados y verificados (copia
 server-side + verificación de tamaño byte a byte antes de borrar el original,
@@ -93,16 +87,17 @@ originales borrados recién después de confirmar):**
   `get_transaction`, no se tocaron.
 
 **Pendiente real:**
-- [ ] **Usuario revisa el código mañana** (2026-08-12) antes de cualquier
-  push a S3/AWS — nada desplegado todavía, `ScriptLocation` real sigue con
-  la versión vieja.
-- [ ] Tras aprobar: `push-glue.ps1` para ambos scripts, y validar con una
-  corrida real (`--adhoc_tag ""` para confirmar que escribe/sobreescribe el
-  oficial; `--adhoc_tag <algo>` para confirmar que cae en `_adhoc/`).
 - [ ] Crawlers nuevos para `s3-analytics` (hoy no existe ninguno) — sección
-  5 de la propuesta, sin crear todavía.
+  5 de la propuesta, sin crear todavía. Es el paso que le da sentido
+  práctico a toda la reestructuración (sin esto nada de esto es
+  consultable desde Athena).
 - [ ] Documentar en `CLAUDE.md` los 3 buckets faltantes de la tabla "S3 (5
   buckets)": `s3-analytics`, `s3-athena`, `s3-scheme-fee`.
+- [ ] `--mode read` de `scheme_fee.py` (con el `write_parquet_multi()`
+  nuevo aplicado a `final/detail`/`final/report`) no se probó con datos
+  reales — solo `--mode generate`. Sigue sin CSV real del equipo externo
+  (ver pendiente de scheme_fee más abajo), así que la validación seguiría
+  siendo con costos dummy si se hace.
 
 ---
 

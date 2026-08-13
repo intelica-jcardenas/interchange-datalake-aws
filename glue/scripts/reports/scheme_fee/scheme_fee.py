@@ -116,13 +116,16 @@ Parámetros del job
                            summary previo para el mismo client+report_month y
                            force=false, el job aborta (evita sobreescribir un
                            reporte ya generado sin confirmación explícita).
-  --in_file_key           Sólo en read. Nombre del archivo bajo
-                           IN/{client_code}/ en scheme_fee_bucket.
+  --in_file_key           Obligatorio en read (el job aborta si falta),
+                           ignorado en generate — no hace falta pasarlo
+                           ahí. Nombre del archivo bajo IN/{client_code}/
+                           en scheme_fee_bucket.
 """
 
 import sys
 import re
 import json
+import uuid
 from datetime import datetime
 from calendar import monthrange
 
@@ -171,6 +174,39 @@ def log_error(message: str):
 # PARAMETROS DEL JOB
 # =============================================================================
 
+def _optional_arg(argv: list, name: str, default: str = "") -> str:
+    """
+    Resuelve un argumento Glue `--{name}` directo desde `sys.argv`, sin
+    pasar por `getResolvedOptions()` — que exige que todo argumento en su
+    lista esté presente en `sys.argv`, incluso con valor vacío. El
+    problema real: `start-job-run` con un valor `""` en el JSON de
+    `Arguments` hace que Glue omita el argumento por completo al armar
+    la línea de comandos real (no lo pasa como `--name ""`, lo descarta
+    entero) — así que si `getResolvedOptions()` lo declara obligatorio,
+    revienta con `GlueArgumentError: expected one argument` apenas se
+    intenta una corrida sin ese valor (visto en vivo con `--in_file_key`
+    en `--mode generate`, donde el argumento no aplica).
+
+    Args:
+        argv: Lista de argumentos cruda (`sys.argv`).
+        name: Nombre del argumento sin el prefijo `--`.
+        default: Valor a devolver si `--{name}` no está presente.
+
+    Returns:
+        El valor pasado a `--{name}`, o `default` si el flag no aparece
+        en `argv` o no tiene un valor siguiente.
+
+    Ejemplo:
+        _optional_arg(sys.argv, "in_file_key")  # "" si no se pasó
+    """
+    flag = f"--{name}"
+    if flag in argv:
+        idx = argv.index(flag)
+        if idx + 1 < len(argv):
+            return argv[idx + 1]
+    return default
+
+
 args = getResolvedOptions(
     sys.argv,
     [
@@ -185,7 +221,6 @@ args = getResolvedOptions(
         "dynamodb_table_client",
         "dynamodb_table_file_control",
         "force",
-        "in_file_key",
     ],
 )
 
@@ -199,7 +234,9 @@ ANALYTICS_BUCKET = args["analytics_bucket"]
 DDB_CLIENT_TABLE = args["dynamodb_table_client"]
 DDB_FILE_CONTROL_TABLE = args["dynamodb_table_file_control"]
 FORCE = args["force"].strip().lower() == "true"
-IN_FILE_KEY = args["in_file_key"].strip()
+# Solo obligatorio para --mode read (ver run_read()) -- no se declara en
+# getResolvedOptions a propósito, ver docstring de _optional_arg().
+IN_FILE_KEY = _optional_arg(sys.argv, "in_file_key").strip()
 
 ENABLE_SMS = True
 
@@ -1421,6 +1458,141 @@ def _read_json_from_s3(bucket: str, key: str) -> dict:
     return json.loads(resp["Body"].read())
 
 
+def _list_all_keys(bucket: str, prefix: str) -> list:
+    """
+    Lista TODAS las keys bajo un prefijo S3, paginando con
+    list_objects_v2 (que devuelve máximo 1000 por llamada) — usado por
+    write_parquet_multi() tanto para encontrar los part-files recién
+    escritos como para limpiar el prefijo final/temporal antes de
+    escribir, donde asumir "una sola página" sería un bug silencioso en
+    datasets que crezcan más allá de 1000 objetos.
+
+    Args:
+        bucket: Nombre del bucket S3.
+        prefix: Prefijo a listar.
+
+    Returns:
+        Lista de keys (str) bajo ese prefijo, vacía si no hay ninguna.
+
+    Ejemplo:
+        _list_all_keys("bucket", "EBGR/scheme_fee/state/report_month=202601/detail/")
+    """
+    keys = []
+    token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        keys.extend(obj["Key"] for obj in resp.get("Contents", []))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return keys
+
+
+def _delete_all_keys(bucket: str, keys: list) -> None:
+    """
+    Borra una lista de keys S3 en lotes de 1000 — límite duro de la API
+    `delete_objects` (rechaza el request completo si se le pasan más).
+    Usado por write_parquet_multi() para limpiar el prefijo final antes
+    de escribir y el prefijo temporal al terminar; sin este chunking,
+    cualquier dataset que creciera a más de 1000 part-files rompería el
+    borrado en un solo llamado silencioso (no hay ningún dataset de
+    scheme_fee cerca de ese volumen hoy — ~4 part-files por escritura —
+    pero es un límite real de la API, no una suposición de "nunca pasa").
+
+    Args:
+        bucket: Nombre del bucket S3.
+        keys: Lista de keys a borrar (puede estar vacía).
+
+    Returns:
+        None.
+
+    Ejemplo:
+        _delete_all_keys("bucket", ["a.parquet", "b.parquet"])
+    """
+    for i in range(0, len(keys), 1000):
+        chunk = keys[i:i + 1000]
+        s3.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in chunk]},
+        )
+
+
+def write_parquet_multi(df: DataFrame, final_s3_prefix: str) -> None:
+    """
+    Escribe `df` como uno o más archivos Parquet bajo `final_s3_prefix/`,
+    preservando el paralelismo de escritura (sin forzar coalesce/
+    repartition), sin el marcador de directorio `_$folder$` que el
+    committer de Spark/Hadoop genera al escribir directo con
+    `df.write.parquet(path)`.
+
+    A diferencia de `write_single_parquet()` (ver
+    `glue/scripts/reports/get_transaction/get_transaction.py` y
+    `glue/scripts/mastercard/interchange/interchange.py`), esta variante
+    NO fuerza un solo archivo — los datasets de scheme_fee llegan a pesar
+    varios GB (ej. SBSA final/detail ~3.4GB en 4 part-files) y forzar
+    coalesce(1) ahí cambiaría performance real, no solo cosmética.
+
+    Mecánica: escribe a un prefijo temporal descartable (nombre único con
+    uuid4), copia TODOS los part-files resultantes al prefijo final vía
+    `copy_object` (sin pasar por el committer en el destino final, así
+    que ahí nunca se genera el marcador), y borra el prefijo temporal
+    completo. Antes de copiar, limpia el prefijo final existente — mismo
+    efecto que `mode("overwrite")` hubiera tenido escribiendo directo,
+    necesario porque el número de part-files puede variar entre
+    corridas (una corrida con menos filas puede generar menos
+    particiones que la anterior, dejando part-files viejos huérfanos
+    mezclados con los nuevos si no se limpia primero).
+
+    Args:
+        df: DataFrame a escribir, sin coalesce/repartition explícito —
+            Spark decide la cantidad de particiones naturalmente.
+        final_s3_prefix: URI s3:// del prefijo final, sin "/" final, ej.
+            "s3://bucket/EBGR/scheme_fee/state/report_month=202601/detail".
+
+    Returns:
+        None.
+
+    Raises:
+        RuntimeError: si no se encuentra ningún part-file tras escribir
+            el prefijo temporal.
+
+    Ejemplo:
+        write_parquet_multi(detail_df, f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/detail")
+    """
+    bucket, final_prefix = final_s3_prefix[len("s3://"):].split("/", 1)
+    final_prefix = final_prefix.rstrip("/")
+    tmp_prefix = f"{final_prefix}_tmp_{uuid.uuid4().hex}/"
+    tmp_uri = f"s3://{bucket}/{tmp_prefix}"
+
+    try:
+        df.write.mode("overwrite").parquet(tmp_uri)
+
+        part_keys = [
+            key for key in _list_all_keys(bucket, tmp_prefix)
+            if key.endswith(".parquet") and "/part-" in key
+        ]
+        if not part_keys:
+            raise RuntimeError(f"No se encontraron part parquet en {tmp_uri}")
+
+        existing_keys = _list_all_keys(bucket, f"{final_prefix}/")
+        _delete_all_keys(bucket, existing_keys)
+
+        for part_key in part_keys:
+            filename = part_key.rsplit("/", 1)[-1]
+            s3.copy_object(
+                Bucket=bucket,
+                CopySource={"Bucket": bucket, "Key": part_key},
+                Key=f"{final_prefix}/{filename}",
+            )
+
+        log_info(f"[write_parquet_multi] OK -> s3://{bucket}/{final_prefix}/ ({len(part_keys)} archivo(s))")
+    finally:
+        _delete_all_keys(bucket, _list_all_keys(bucket, tmp_prefix))
+
+
 # =============================================================================
 # MODE = GENERATE
 # =============================================================================
@@ -1516,8 +1688,8 @@ def run_generate():
         if pd.api.types.is_float_dtype(report_pdf[col]):
             report_pdf[col] = report_pdf[col].astype(object).where(report_pdf[col].notna(), None)
 
-    detail_df.write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/detail/")
-    spark.createDataFrame(report_pdf).write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/report/")
+    write_parquet_multi(detail_df, f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/detail")
+    write_parquet_multi(spark.createDataFrame(report_pdf), f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/report")
 
     summary = {
         "client_code": CLIENT_CODE,
@@ -1601,7 +1773,7 @@ def update_report_and_propagate():
             f"Grupos actualizados ({updated_report_count}) distinto al summary "
             f"({summary['number_of_groups']}). Abortando (igual que legacy)."
         )
-    updated_report_df.write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{FINAL_PREFIX}/report/")
+    write_parquet_multi(updated_report_df, f"s3://{ANALYTICS_BUCKET}/{FINAL_PREFIX}/report")
 
     detail_df = spark.read.parquet(f"s3://{ANALYTICS_BUCKET}/{STATE_PREFIX}/detail/")
     cost_by_group = updated_report_df.select(
@@ -1635,7 +1807,7 @@ def update_report_and_propagate():
             f"Filas de detalle actualizadas ({final_rows}) distinto al summary "
             f"({summary['number_of_inserted_rows']}). Abortando (igual que legacy)."
         )
-    final_detail_df.write.mode("overwrite").parquet(f"s3://{ANALYTICS_BUCKET}/{FINAL_PREFIX}/detail/")
+    write_parquet_multi(final_detail_df, f"s3://{ANALYTICS_BUCKET}/{FINAL_PREFIX}/detail")
 
     summary["updated_at"] = datetime.now().isoformat()
     summary["number_of_updated_rows"] = final_rows
@@ -1644,6 +1816,11 @@ def update_report_and_propagate():
 
 
 def run_read():
+    if not IN_FILE_KEY:
+        raise RuntimeError(
+            "--in_file_key es obligatorio para --mode read (nombre del CSV "
+            "devuelto por el equipo externo en s3-scheme-fee/IN/{client}/)."
+        )
     update_report_and_propagate()
 
 
