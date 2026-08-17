@@ -30,13 +30,13 @@
 #   .\scripts\push-lambdas.ps1 -Group mc                # solo Mastercard
 #   .\scripts\push-lambdas.ps1 -Group vi                # solo Visa
 #   .\scripts\push-lambdas.ps1 -Group general           # solo generales (router, unzip, archive-file)
-#   .\scripts\push-lambdas.ps1 -Group test               # infra prestada de prueba (hoy: test-1 = rules-refresh)
+#   .\scripts\push-lambdas.ps1 -Group rules-refresh      # solo rules-refresh
 #   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter    # una especifica
 #   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter -WhatIf   # arma el zip y muestra tamano, no sube nada
 #   .\scripts\push-lambdas.ps1 -Force                    # sin prompt de confirmacion (automatizacion)
 
 param(
-    [ValidateSet("all","mc","vi","general","test")]
+    [ValidateSet("all","mc","vi","general","rules-refresh")]
     [string]$Group = "all",
     [string]$Lambda = "",
     [switch]$WhatIf,
@@ -69,14 +69,11 @@ $AllLambdas = [ordered]@{
     "mc-store"          = @{ Group="mc"; Dir="lambdas\mastercard\store" }
     "mc-iar"            = @{ Group="mc"; Dir="lambdas\mastercard\iar" }
     "mc-exchange-rates" = @{ Group="mc"; Dir="lambdas\mastercard\exchange-rates" }
-    # Infra prestada (temporal) -- ver lambdas\rules-refresh\README.md.
-    # "test-1" es el nombre REAL en AWS hoy (Lambda huerfano de pruebas,
-    # creado 2026-06-10, repurposed 2026-08-03 para prototipar
-    # lmbd-rules-refresh) -- no confundir con el FunctionName que dice
-    # lambdas\rules-refresh\config.json (itl-...-lmbd-rules-refresh), que
-    # todavia no existe en AWS. Actualizar esta entrada (suffix real y
-    # Dir) el dia que se cree el Lambda definitivo con su propio rol/layer.
-    "test-1"            = @{ Group="test"; Dir="lambdas\rules-refresh" }
+    # Lambda definitivo (creado por el equipo de infra 2026-08-17,
+    # reemplaza a itl-...-lmbd-test-1 -- ver lambdas\rules-refresh\README.md).
+    # Sigue sobre el rol compartido itl-...-lmbd-vi-role (sin rol dedicado
+    # todavia).
+    "rules-refresh"     = @{ Group="rules-refresh"; Dir="lambdas\rules-refresh" }
 }
 
 # Directorios y patrones que nunca deben llegar al ZIP subido a AWS.

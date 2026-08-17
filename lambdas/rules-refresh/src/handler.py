@@ -82,6 +82,10 @@ Uso real en produccion (no solo pruebas):
     backup automatico a visa_rules/history/, visa_rules/data.parquet
     publicado, smoke test de glue-vi-interchange contra 2 archivos reales
     (EBGR/SBSA) sin regresion. Detalle completo en decisions.md.
+  - 2026-08-17: migrado de lmbd-test-1 (infra prestada) a este Lambda
+    definitivo (creado por el equipo de infra) — mismo rol/layers/config,
+    trigger S3 reapuntado. Validado con el mismo excel V38 ya archivado
+    (diff=0 esperado y confirmado). Detalle completo en decisions.md.
 
 Variables de entorno:
   S3_BUCKET_REFERENCE            : bucket s3-reference (incoming, parquet, history, archive)

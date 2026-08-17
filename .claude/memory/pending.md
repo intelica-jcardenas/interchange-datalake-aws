@@ -6,7 +6,7 @@ memoria de usuario: ver `push_sync_scripts_design.md` e
 `itx_document_script_skill.md`). Lo resuelto se documenta en
 `decisions.md`/`gotchas.md` (o en la memoria de usuario correspondiente)
 y se borra de aquí — no se acumulan items completados con `[x]`.
-Última actualización: 2026-08-11.
+Última actualización: 2026-08-13.
 
 ---
 
@@ -112,15 +112,11 @@ versiones → `decisions.md`.
 
 ---
 
-## `glue-ebgr-report` (Eurobank Merchant Report) — encontrado sin documentar 2026-08-10, ver `decisions.md`
+## `glue-ebgr-report` (Eurobank Merchant Report) — documentado y desplegado 2026-08-13, ver `decisions.md`
 
-**Contexto confirmado por el usuario (2026-08-10):** recrea en el datalake
-un reporte CSV que existe en legacy, específico para EBGR. Lo está
-armando un miembro del equipo, en proceso de validación — **no tocar ni
-investigar la lógica todavía**. Por ahora solo debe existir como entrada
-mapeada en `sync-glue.ps1`/`push-glue.ps1` (ya hecho). Cuando el usuario
-confirme que está terminado/validado, documentar con la skill
-`itx-document-script` (mismo tratamiento que el resto de `glue/scripts/`).
+**Contexto (encontrado sin documentar 2026-08-10, desarrollo confirmado terminado por el usuario 2026-08-13):** recrea el reporte CSV legacy de scheme fee/comercios (RPT_MCT), específico para EBGR, acotado a Mastercard. Documentado completo con la skill `itx-document-script` (50 funciones + módulo, `DOC-ONLY` verificado, sin cambios de lógica) y desplegado al `ScriptLocation` real — ver `decisions.md` para el detalle del flujo/reglas.
+
+- [ ] **Sin validar contra legacy** — el job corre y escribe el CSV (output confirmado en `s3-analytics/EBGR/reports/ebgr_merchant/`), pero nunca se comparó su resultado contra el reporte legacy real (mismo patrón de validación ya usado para `get_transaction.py`/`scheme_fee.py`/etc. — no se hizo acá todavía).
 
 ---
 
@@ -128,18 +124,13 @@ confirme que está terminado/validado, documentar con la skill
 
 **2026-08-11:** primer uso real del trigger para publicar un cambio de negocio genuino (no solo smoke test) — fix de expansión de familias `TRANSACTION_CODE` (excel V38) desplegado a `lmbd-test-1` y disparado subiendo el excel a S3. Backup automático + publicación + smoke test contra EBGR/SBSA, cero regresión. Ver decisión "`visa_rules`: excel V38 simplifica `TRANSACTION_CODE`..." en `decisions.md`.
 
-- [x] ~~Layer con `openpyxl`~~ — **RESUELTO 2026-08-13**: layer dedicado
-  `itl-0004-itx-dev-intchg-02-rules-refresh-openpyxl` creado, adjuntado,
-  código redesplegado sin dependencias bundleadas, probado en vivo
-  (reproceso real de excel, diff=0). Ver `decisions.md`.
-- [ ] **Rol IAM dedicado + rename a Lambda definitivo** — sigue sobre
-  infraestructura prestada (`lmbd-test-1`, rol `lmbd-vi-role`). **En
-  curso 2026-08-13:** ticket armado para pedirle al equipo que
-  renombren/recreen `lmbd-test-1` como
-  `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (incluye reapuntar el
-  trigger S3 y evaluar rol propio) — el docstring de `handler.py` ya
-  documenta explícitamente este gap (nombre real en AWS vs nombre
-  "definitivo").
+- [ ] **Rol IAM dedicado** — **2026-08-17: rename a Lambda definitivo YA
+  RESUELTO** (infra creó `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh`,
+  desactivó el trigger S3 de `lmbd-test-1` y lo dejó apuntando solo al
+  nuevo; código desplegado y validado end-to-end contra AWS real por esta
+  sesión — ver `decisions.md`). Sigue pendiente solo el rol IAM propio —
+  el Lambda nuevo quedó sobre el mismo rol compartido `lmbd-vi-role`, sin
+  permisos dedicados.
 - [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
   (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
   paths — sigue sin ninguna validación de que sus *resultados* (filas de
@@ -203,12 +194,6 @@ detalle completo. Ya desplegado y commiteado; validado para SBSA
 
 ## Housekeeping tst_files/ y S3 (bajo impacto, no urgente)
 
-- [x] ~~Carpetas `_$folder$` en `visa/calculate.py`/`visa/interchange.py`~~
-  — **RESUELTO 2026-08-13**, ver `decisions.md`. Los 360 marcadores
-  existentes en `s3-staging` (`400_baseii_cal_drafts`,
-  `500_baseii_itx_drafts`, `400/500_vss_*`, `400/500_sms_*`, EBGR+SBSA)
-  fueron borrados — no deberían volver a generarse, el código que los
-  creaba ya no usa el writer nativo de Spark.
 - [ ] **`glue-exchange-rates` (`format_exchange_rates.py`) y
   `glue-vi-data-quality` (`vi_data_quality.py`) siguen expuestos** —
   ambos escriben con el writer nativo de Spark

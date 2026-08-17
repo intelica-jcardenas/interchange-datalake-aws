@@ -1,15 +1,15 @@
 ﻿{
-    "FunctionName": "itl-0004-itx-dev-intchg-02-lmbd-test-1",
-    "FunctionArn": "arn:aws:lambda:eu-south-2:861276092327:function:itl-0004-itx-dev-intchg-02-lmbd-test-1",
+    "FunctionName": "itl-0004-itx-dev-intchg-02-lmbd-rules-refresh",
+    "FunctionArn": "arn:aws:lambda:eu-south-2:861276092327:function:itl-0004-itx-dev-intchg-02-lmbd-rules-refresh",
     "Runtime": "python3.11",
     "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-lmbd-vi-role",
     "Handler": "handler.lambda_handler",
-    "CodeSize": 11440,
+    "CodeSize": 11548,
     "Description": "",
     "Timeout": 120,
     "MemorySize": 2048,
-    "LastModified": "2026-08-13T17:08:42.000+0000",
-    "CodeSha256": "UFCUPj8qeZ9bIJvUnkW5JcS++bcQCKQN8F43rPHm+8o=",
+    "LastModified": "2026-08-17T16:33:20.000+0000",
+    "CodeSha256": "DQL69O3L+r9BE6xrJgXv7TtKmN7w+R0NlUlFEFkRwcg=",
     "Version": "$LATEST",
     "VpcConfig": {
         "SubnetIds": [
@@ -31,7 +31,7 @@
     "TracingConfig": {
         "Mode": "PassThrough"
     },
-    "RevisionId": "11c47d6b-e877-4895-9448-9a792cb764d2",
+    "RevisionId": "9bb00416-0607-4030-8c95-ce6b76e87bce",
     "Layers": [
         {
             "Arn": "arn:aws:lambda:eu-south-2:861276092327:layer:itl-0004-itx-dev-intchg-02-pandas-pyarrow:2",
@@ -60,6 +60,6 @@
     },
     "LoggingConfig": {
         "LogFormat": "Text",
-        "LogGroup": "/aws/lambda/itl-0004-itx-dev-intchg-02-lmbd-test-1"
+        "LogGroup": "/aws/lambda/itl-0004-itx-dev-intchg-02-lmbd-rules-refresh"
     }
 }
