@@ -7,20 +7,38 @@ S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/fo
 Enriquece la tabla de tasas de cambio scrapeadas (exchange_rates, con solo
 códigos alfabéticos de moneda) cruzándola contra el maestro de monedas
 (m_currency) para resolver los códigos numéricos. Escribe el resultado
-particionado por brand y exchange_date, con sobreescritura dinámica por
-partición — solo reemplaza fechas presentes en la corrida actual, dejando
-intactas las que no cambiaron.
+particionado por brand y exchange_date — solo toca las particiones
+presentes en la corrida actual (nuevas o recalculadas por un archivo fuente
+corregido), dejando intactas las que no cambiaron.
+
+Escritura y registro en catálogo: antes de escribir se purga en S3
+(glueContext.purge_s3_path, operación S3 pura) el prefijo de cada partición
+que esta corrida va a tocar — así, si una fecha ya procesada se sobrescribe
+en el origen, el bookmark detecta el archivo modificado, esta corrida vuelve
+a leerla y reemplaza esa partición en destino en vez de duplicarla. La
+escritura y el registro en el catálogo Glue usan el sink nativo
+(enableUpdateCatalog=True) en vez de una llamada boto3 directa al API de
+Glue — necesario porque la VPC del job no tiene ruta de salida al endpoint
+público de Glue (sí a S3, vía Gateway Endpoint), así que un
+boto3.client("glue") desde el driver del job da ConnectTimeoutError.
 
 Flujo:
-  1. Lectura bookmarked de exchange_rates (solo cambios desde la última
-     corrida exitosa) y lectura completa de m_currency (maestro pequeño que
-     puede evolucionar).
-  2. Normalización del maestro: un registro por código alfabético, deduplicado.
-  3. Cruce left join por from_currency y to_currency hacia códigos numéricos.
-  4. Reparticionamiento por brand/exchange_date + escritura en modo overwrite
-     dinámico.
-  5. Registración en catálogo Glue solo de particiones nuevas (las existentes
-     conservan su ubicación S3, solo se actualiza el contenido del archivo).
+  1. Lectura bookmarked de exchange_rates (solo archivos nuevos o
+     modificados desde la última corrida exitosa) y lectura completa de
+     m_currency (maestro pequeño que puede evolucionar, sin bookmark).
+  2. Normalización del maestro: un registro por código alfabético,
+     deduplicado.
+  3. Cruce left join por from_currency y to_currency hacia códigos
+     numéricos.
+  4. Reparticionamiento por brand/exchange_date.
+  5. Si hay datos: purga en S3 cada partición (brand, exchange_date) que
+     esta corrida va a tocar, y escribe + registra en el catálogo con el
+     sink nativo de Glue. Si el bookmark no trajo nada nuevo, no escribe
+     nada (evita jobs vacíos con solo overhead de arranque).
+
+Job Bookmarks: habilitados solo para exchange_rates (--job-bookmark-option
+job-bookmark-enable + transformation_ctx). m_currency_csv se relee completo
+en cada corrida, ya que es un maestro pequeño que puede cambiar.
 
 Database / Input / Output:
   Database: itl_0004_itx_dev_02_glue_database_exchange_rates
@@ -33,12 +51,15 @@ Database / Input / Output:
     - exchange-rates-glue (destino S3 + tabla catálogo)
     - Mismo particionado que input + 2 columnas nuevas:
       from_currency_numeric_code, to_currency_numeric_code
+
+Requiere que ambas tablas de entrada ya estén catalogadas en la base de datos
+indicada.
 """
 
 import sys
 
-import boto3
 from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
@@ -53,21 +74,17 @@ CURRENCY_TABLE       = "m_currency_csv"
 TARGET_TABLE         = "exchange-rates-glue"
 TARGET_S3_PATH       = "s3://itl-0004-itx-dev-intchg-02-s3-reference/exchange-rates-glue/"
 PARTITION_COLS       = ["brand", "exchange_date"]
-REGION               = "eu-south-2"
 
 args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
-spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
 # ---------------------------------------------------------------------------
 # 1. Leer tablas fuente desde el Glue Data Catalog
-#    exchange_rates: bookmarked, solo trae archivos nuevos o modificados
-#    desde la última corrida exitosa de este job.
 # ---------------------------------------------------------------------------
 exchange_rates_df = glueContext.create_dynamic_frame.from_catalog(
     database=DATABASE,
@@ -113,56 +130,33 @@ enriched_df = (
 )
 
 # ---------------------------------------------------------------------------
-# 3. Escribir resultado: overwrite dinámico -> solo reemplaza las
-#    particiones presentes en esta corrida (nuevas o recalculadas por un
-#    archivo fuente corregido); el resto de particiones queda intacto.
+# 3. Purgar particiones a tocar + escribir y registrar en catálogo
 # ---------------------------------------------------------------------------
 if enriched_df.take(1):
-    (
-        enriched_df
-        .write
-        .mode("overwrite")
-        .partitionBy(*PARTITION_COLS)
-        .format("parquet")
-        .option("compression", "snappy")
-        .save(TARGET_S3_PATH)
-    )
-
-    # Registrar en el catálogo solo las particiones que aún no existen.
-    # Las que ya estaban registradas conservan su ubicación S3 (no cambia
-    # con el overwrite, solo cambia el contenido del archivo).
     combos = [
         tuple(row) for row in
         enriched_df.select(*PARTITION_COLS).distinct().collect()
     ]
 
-    glue_client = boto3.client("glue", region_name=REGION)
-    storage_descriptor = glue_client.get_table(
-        DatabaseName=DATABASE, Name=TARGET_TABLE,
-    )["Table"]["StorageDescriptor"]
-
-    partitions_input = []
     for brand, exchange_date in combos:
-        sd = dict(storage_descriptor)
-        sd["Location"] = (
+        partition_path = (
             f"{TARGET_S3_PATH.rstrip('/')}/brand={brand}/"
             f"exchange_date={exchange_date}/"
         )
-        partitions_input.append({"Values": [brand, exchange_date], "StorageDescriptor": sd})
+        glueContext.purge_s3_path(partition_path, options={"retentionPeriod": 0})
 
-    for i in range(0, len(partitions_input), 100):
-        batch = partitions_input[i:i + 100]
-        response = glue_client.batch_create_partition(
-            DatabaseName=DATABASE,
-            TableName=TARGET_TABLE,
-            PartitionInputList=batch,
-        )
-        errors = [
-            e for e in response.get("Errors", [])
-            if e["ErrorDetail"]["ErrorCode"] != "AlreadyExistsException"
-        ]
-        if errors:
-            raise RuntimeError(f"Error registrando particiones: {errors}")
+    enriched_dyf = DynamicFrame.fromDF(enriched_df, glueContext, "enriched_dyf")
+
+    sink = glueContext.getSink(
+        path=TARGET_S3_PATH,
+        connection_type="s3",
+        updateBehavior="UPDATE_IN_DATABASE",
+        partitionKeys=PARTITION_COLS,
+        enableUpdateCatalog=True,
+    )
+    sink.setFormat("glueparquet", compression="snappy")
+    sink.setCatalogInfo(catalogDatabase=DATABASE, catalogTableName=TARGET_TABLE)
+    sink.writeFrame(enriched_dyf)
 else:
     print("Sin particiones nuevas o modificadas (bookmark al día); nada que escribir.")
 

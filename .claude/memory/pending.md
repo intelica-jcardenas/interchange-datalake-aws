@@ -6,7 +6,19 @@ memoria de usuario: ver `push_sync_scripts_design.md` e
 `itx_document_script_skill.md`). Lo resuelto se documenta en
 `decisions.md`/`gotchas.md` (o en la memoria de usuario correspondiente)
 y se borra de aquí — no se acumulan items completados con `[x]`.
-Última actualización: 2026-08-13.
+
+**Alcance (definido 2026-08-17):** este checklist trackea solo trabajo que
+bloquea o afecta el desarrollo del pipeline (código, validaciones,
+correctitud de datos). Provisión de infraestructura AWS (roles IAM
+dedicados, creación/rename de Lambdas) es responsabilidad del equipo de
+Infra — se coordina por ticket aparte y no se trackea acá salvo que
+bloquee algo nuestro. Housekeeping/cleanup cosmético (marcadores
+`_$folder$`, crawlers de solo-catálogo sin desarrollo downstream
+esperándolos) tampoco se trackea acá salvo que cause un error real. Ambos
+tipos de items, cuando existen, viven en una nota compacta al final de
+este archivo — no como checklist activo.
+
+Última actualización: 2026-08-17.
 
 ---
 
@@ -19,10 +31,6 @@ downstream (`extract`/`clean`/`calculate`/`interchange`/`visa_fields`) de
 acordó explícitamente que esta etapa solo carga hasta `staging` vía
 `transform`, sin extenderse más allá. Queda abierto solo lo que sigue:
 
-- [ ] **Crawler/database de Glue para `NXGR`** — confirmado que no existe
-  ninguno (ni para VISA ni MASTERCARD) — ya hay Parquets reales en
-  `s3-staging/NXGR/VISA/...` pero nadie puede consultarlos vía Athena/
-  catálogo. Ofrecido al usuario, decidido dejarlo para después.
 - [ ] **3 combinaciones TC/TCSN sin probar con datos reales** (solo tests
   sintéticos): TC `15/16/17/35/36/37` y TCSN `"D"` en BASEII (los 7
   records BASEII reales vistos eran todos del rango viejo 05-27), y TC
@@ -38,6 +46,10 @@ acordó explícitamente que esta etapa solo carga hasta `staging` vía
   schedule, no se autocorrigen). Mismo fix ya validado varias veces en
   `gotchas.md` — decidido no hacer nada proactivo, solo re-crawlear si
   pasa.
+
+(El crawler/database de Glue para `NXGR` — habilita consultas Athena, sin
+downstream de `extract`/`clean`/`calculate` esperándolo todavía — se movió
+a la nota de items fuera de alcance al final de este archivo.)
 
 ---
 
@@ -84,31 +96,14 @@ originales borrados recién después de confirmar):**
   `get_transaction`, no se tocaron.
 
 **Pendiente real:**
-- [ ] Crawlers nuevos para `s3-analytics` (hoy no existe ninguno) — sección
-  5 de la propuesta, sin crear todavía. Es el paso que le da sentido
-  práctico a toda la reestructuración (sin esto nada de esto es
-  consultable desde Athena).
 - [ ] `--mode read` de `scheme_fee.py` (con el `write_parquet_multi()`
   nuevo aplicado a `final/detail`/`final/report`) no se probó con datos
   reales — solo `--mode generate`. Sigue sin CSV real del equipo externo
   (ver pendiente de scheme_fee más abajo), así que la validación seguiría
   siendo con costos dummy si se hace.
 
----
-
-## `glue-exchange-rates` (`format_exchange_rates.py`) — versión en AWS vs versión en repo, sin resolver
-
-El sync completo del 2026-08-10 encontró que la versión desplegada en AWS
-(fecha 2026-08-03) usa el sink nativo de Glue (`enableUpdateCatalog`,
-`glueContext.purge_s3_path()`) en vez del registro manual de particiones
-por `boto3` que tiene el repo hoy. El usuario sospecha que la de AWS podría
-ser una versión **anterior/incorrecta** — descartado el cambio en el repo
-por ahora (`git restore`), **sin tocar AWS**. Detalle completo de ambas
-versiones → `decisions.md`.
-
-- [ ] **Confirmar con el encargado de ese script** cuál versión es la
-  correcta antes de decidir si se sincroniza o se hace push del repo hacia
-  AWS.
+(Los crawlers nuevos para `s3-analytics` — habilitan Athena, no bloquean
+ningún desarrollo de script — se movieron a la nota final.)
 
 ---
 
@@ -120,17 +115,12 @@ versiones → `decisions.md`.
 
 ---
 
-## Automatización `lmbd-rules-refresh` (refresh de visa_rules/mc_rules) — probado 2026-08-10, primer refresh REAL de producción 2026-08-11, ver `decisions.md`
+## Automatización `lmbd-rules-refresh` (refresh de visa_rules/mc_rules) — EN PRODUCCIÓN sobre el Lambda definitivo desde 2026-08-17, ver `decisions.md`
 
-**2026-08-11:** primer uso real del trigger para publicar un cambio de negocio genuino (no solo smoke test) — fix de expansión de familias `TRANSACTION_CODE` (excel V38) desplegado a `lmbd-test-1` y disparado subiendo el excel a S3. Backup automático + publicación + smoke test contra EBGR/SBSA, cero regresión. Ver decisión "`visa_rules`: excel V38 simplifica `TRANSACTION_CODE`..." en `decisions.md`.
+**2026-08-11:** primer uso real del trigger para publicar un cambio de negocio genuino (no solo smoke test) — fix de expansión de familias `TRANSACTION_CODE` (excel V38). Backup automático + publicación + smoke test contra EBGR/SBSA, cero regresión. Ver decisión "`visa_rules`: excel V38 simplifica `TRANSACTION_CODE`..." en `decisions.md`.
 
-- [ ] **Rol IAM dedicado** — **2026-08-17: rename a Lambda definitivo YA
-  RESUELTO** (infra creó `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh`,
-  desactivó el trigger S3 de `lmbd-test-1` y lo dejó apuntando solo al
-  nuevo; código desplegado y validado end-to-end contra AWS real por esta
-  sesión — ver `decisions.md`). Sigue pendiente solo el rol IAM propio —
-  el Lambda nuevo quedó sobre el mismo rol compartido `lmbd-vi-role`, sin
-  permisos dedicados.
+**2026-08-17:** migrado de `lmbd-test-1` (infra prestada) al Lambda definitivo `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (creado por Infra) — código desplegado y validado end-to-end contra AWS real (mismo excel V38 ya archivado, diff=0). Ver decisión "`lmbd-rules-refresh`: migración de `lmbd-test-1`..." en `decisions.md`.
+
 - [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
   (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
   paths — sigue sin ninguna validación de que sus *resultados* (filas de
@@ -142,6 +132,9 @@ auditoría (`rules_control`) para este Lambda — proceso chico y de baja
 frecuencia, no la justifica. El schema propuesto y toda referencia en
 código/README fueron eliminados (no solo deshabilitados) — no queda
 ningún rastro en el repo, ver `decisions.md`.
+
+(El rol IAM dedicado para este Lambda — sigue sobre el rol compartido
+`lmbd-vi-role` — es gestión de Infra, ver nota final.)
 
 ---
 
@@ -181,36 +174,32 @@ detalle completo. Ya desplegado y commiteado; validado para SBSA
 
 ---
 
-## Infraestructura AWS
-
-- [ ] **Rol IAM `itx-lambda-extract-role`** — `lmbd-vi-extract` comparte
-  rol del router. Crear rol propio con permisos mínimos.
-- [ ] **Rol IAM `itx-glue-crawler-ebgr-role`** — crawler Mastercard sin
-  rol propio.
-- [ ] **Agregar `s3-reference/currency/` como target** a un crawler
-  existente o crear uno dedicado — baja prioridad.
-
----
-
-## Housekeeping tst_files/ y S3 (bajo impacto, no urgente)
-
-- [ ] **`glue-exchange-rates` (`format_exchange_rates.py`) y
-  `glue-vi-data-quality` (`vi_data_quality.py`) siguen expuestos** —
-  ambos escriben con el writer nativo de Spark
-  (`.write.mode(...).parquet(path)`, el segundo con `partitionBy` en
-  exchange-rates) sin pasar por `write_single_parquet()`/
-  `write_parquet_multi()`. Confirmado 2026-08-13: 2 marcadores ya
-  existentes en `s3-reference/exchange-rates-glue/brand={Mastercard,Visa}`
-  (sin tocar, se irían regenerando). Deliberadamente fuera de alcance
-  de esta sesión — `vi-data-quality` ni siquiera está integrado a un
-  Step Function todavía (bajo impacto real); `exchange-rates` sigue con
-  su propio pendiente sin resolver (versión AWS vs repo, ver sección
-  propia más arriba) — no tiene sentido tocar su writer hasta resolver
-  eso primero.
-
----
-
 ## Ambiente empresarial
 
-- [ ] **Testing end-to-end en ambiente empresarial** — pendiente cuando
-  el ambiente esté disponible.
+- [ ] **Testing end-to-end en ambiente empresarial** — bloqueado por
+  disponibilidad del ambiente (provisión de Infra, fuera de nuestro
+  control). Retomar cuando el ambiente exista.
+
+---
+
+## Fuera de alcance de este checklist (gestión de Infra / housekeeping cosmético)
+
+Referencia, no checklist activo — nada de esto bloquea el desarrollo del pipeline:
+
+- **Roles IAM dedicados** — `lmbd-vi-extract` (comparte rol con el router),
+  `lmbd-rules-refresh` (comparte `lmbd-vi-role`, ver arriba), crawler MC
+  EBGR (`itx-glue-crawler-ebgr-role`, sin rol propio). Provisión de Infra,
+  se coordina por ticket — mismo patrón que la creación/rename de
+  `lmbd-rules-refresh` (ver `decisions.md`).
+- **Crawlers/databases de Glue para catálogo Athena** — `NXGR` (VISA/MC,
+  sin ninguno hoy), `s3-analytics` (reportes reorganizados, ver arriba),
+  `s3-reference/currency/` como target de un crawler existente. Habilitan
+  consultas ad-hoc, no bloquean ningún desarrollo de script en curso.
+- **Housekeeping de writers Spark sin migrar** — `glue-exchange-rates`
+  (`format_exchange_rates.py`) y `glue-vi-data-quality`
+  (`vi_data_quality.py`) siguen generando el marcador `_$folder$` (0
+  bytes, cosmético) porque no pasaron por el fix de `write_single_parquet()`/
+  `write_parquet_multi()` ya aplicado al resto del pipeline. Sin impacto
+  funcional confirmado — deliberadamente sin tocar hasta que
+  `glue-exchange-rates` resuelva su pendiente de versión (arriba) y
+  `vi-data-quality` se integre a algún Step Function.

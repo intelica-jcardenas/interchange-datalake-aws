@@ -6,6 +6,26 @@ Las decisiones con implementación/validación extensas fueron resumidas aquí �
 
 ---
 
+## `glue-exchange-rates`: versión AWS (sink nativo de Glue) confirmada como la correcta — DOCUMENTADA Y DESPLEGADA — 2026-08-17
+
+**Decisión:** `format_exchange_rates.py` mantiene el sink nativo de Glue (`glueContext.getSink(..., enableUpdateCatalog=True)` + `glueContext.purge_s3_path()` por partición) que ya estaba desplegado en AWS desde 2026-08-03 — la versión que el repo tenía hasta ahora (registro manual de particiones vía `boto3.client("glue").batch_create_partition()`) queda descartada.
+
+**Contexto:** ver la decisión "Sync completo 2026-08-10..." más abajo — el sync trajo esta discrepancia sin resolver, con sospecha de que la versión de AWS pudiera ser una versión vieja/incorrecta. Se pidió confirmación al encargado real del script (2026-08-17), que confirmó que la versión de AWS es la correcta.
+
+**Por qué el cambio (ya documentado en el propio código, ahora confirmado):** una llamada `boto3.client("glue")` directa desde el driver del job da `ConnectTimeoutError` — la VPC del job no tiene ruta de salida al endpoint público de Glue (sí a S3, vía Gateway Endpoint). El sink nativo de Glue evita esa llamada de red, registrando el catálogo internamente sin salir de la VPC.
+
+**Documentación aplicada (2026-08-17, skill `itx-document-script`):** el docstring que trajo la versión de AWS no seguía el estándar del proyecto (header "Glue ETL Job:" en vez de "Job real:", sin sección "Flujo:", sin wrap a 80 columnas — mismo patrón de desvío ya anotado como riesgo conocido en el propio `SKILL.md` para este archivo específico, de un canario con `haiku` del 2026-07-11). Reescrito al estándar (header "Job real:", `Flujo:` con 5 pasos, `Database / Input / Output:`), preservando y expandiendo la explicación del `ConnectTimeoutError`/VPC ya presente. De paso, corregido un dato desactualizado del docstring del encargado: decía `Output: exchange_rates_enriched`, pero la constante/tabla real en el código es `exchange-rates-glue` (`TARGET_TABLE`). Sin funciones en el archivo (script procedural top-level) — no aplica la plantilla de docstring de función.
+
+**Verificación DOC-ONLY con método adaptado:** el verificador estándar (`verify_docs_only.py`) compara contra `git show HEAD:<path>` — como el `HEAD` del repo todavía tenía la versión vieja (`boto3` manual), comparar contra `HEAD` daba `LOGIC CHANGED` esperado (es el cambio real ya confirmado, no un error de esta edición). Se verificó en su lugar contra la versión recién sincronizada de AWS (antes de tocar el docstring): AST idéntico con los docstrings removidos → confirmado que el trabajo de documentación no tocó ninguna línea de lógica.
+
+**Desplegado:** `push-glue.ps1 -Job exchange-rates`, verificado byte a byte contra el `ScriptLocation` real (`s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/format_exchange_rates.py`). Sin re-ejecutar el job (cambio DOC-ONLY sobre una versión ya confirmada funcionando en producción por el encargado — no había nada funcional que revalidar).
+
+**`config.json` local también sincronizado** (2026-08-17, `sync-glue.ps1 -Job exchange-rates`) — refleja la config real de AWS (`LastModifiedOn=2026-08-03`, sin cambios de infraestructura, solo el drift de código que ya se resolvió).
+
+**Sin commitear.**
+
+---
+
 ## `lmbd-rules-refresh`: migración de `lmbd-test-1` (infra prestada) al Lambda definitivo — DESPLEGADO Y VALIDADO CONTRA AWS REAL — 2026-08-17
 
 **Contexto:** el equipo de infra creó `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (nombre definitivo, ver pendiente documentado desde 2026-08-10/13) y reapuntó el trigger S3 de `s3-reference` (prefijo `interchange_rules/`, sufijos `.xlsx`/`.xls`) del Lambda prestado (`lmbd-test-1`) al nuevo — desactivando el trigger de `lmbd-test-1` (que sigue existiendo en AWS, sin uso). Pidieron verificar que el Lambda nuevo quedó configurado igual que `test-1` y probarlo antes de dar la migración por cerrada.

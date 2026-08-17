@@ -6,7 +6,7 @@
         "Description": "",
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-08T08:51:02.273000-05:00",
-        "LastModifiedOn": "2026-07-15T12:15:20.438000-05:00",
+        "LastModifiedOn": "2026-08-03T12:09:38.202000-05:00",
         "ExecutionProperty": {
             "MaxConcurrentRuns": 1
         },
