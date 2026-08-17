@@ -32,12 +32,10 @@ confundir el diagnóstico.
 |---------|-----------|
 | `glue_args/` | `.txt` con argumentos + `.json` generado por `generate_glue_args.py`, por job |
 | `reprocessing/` | Scripts de reproceso masivo (`reprocess_vi_*.py`) + sus logs `.jsonl` |
-| `debug_scripts/` | Scripts de debug/validación reutilizables (escanear schemas, comparar outputs) |
-| `reference_data/` | Parquets/CSVs de tablas de referencia de `s3-reference` para inspección local |
-| `reports/` | Outputs de `glue-get-transaction` y comparativos contra legacy |
+| `reference_data/` | Parquets de tablas de referencia de `s3-reference` para inspección local (18 tablas, resincronizables en cualquier momento desde S3 — excluye `exchange-rates`/`exchange-rates-glue`, datasets particionados grandes) |
 | `payloads/` | Payloads de Lambda para reprocesos manuales (mc-store, vi-store) |
 
-Cuando un gotcha pasa a **RESUELTO Y VALIDADO**, borrar los archivos de `tst_files/` que sirvieron solo para esa investigación. Mantener: scripts genéricos reutilizables (`generate_glue_args.py`, `scan_nulltype_columns.py`, `compare_get_transaction.py`) y datos de referencia activos (`reference_data/`).
+Cuando un gotcha pasa a **RESUELTO Y VALIDADO**, borrar los archivos de `tst_files/` que sirvieron solo para esa investigación — no acumular scripts/datos de investigaciones cerradas "por si acaso". Mantenimiento histórico: limpieza mayor 2026-08-13 (de 7.4GB a 93MB) — se retiraron `debug_scripts/`, `reports/`/`reporting/`, `scheme_fee_reports/`, `scheme_fee_parquet_samples/`, `nxgr_validation/`, `ebgr_validation/`, `interchange_rules/`, `python_scripts/`, `scheme_fee_legacy_scripts/` completos (investigaciones ya cerradas, o — para los scripts de referencia legacy — módulos que ya replican esa lógica en el repo real). Si hace falta un script de diagnóstico puntual (escanear schemas, comparar outputs, parsear bitmaps), recrearlo cuando surja la necesidad en vez de mantenerlo "por si vuelve a pasar" — el diseño de cada uno queda documentado en la conversación donde se creó.
 
 ---
 
@@ -339,6 +337,6 @@ Todos en `tst_files/reprocessing/`. Patrón común: scan DynamoDB `file_control-
 | `reprocess_vi_vss_store.py` | Igual que anterior pero solo VSS_110/120/130/140 |
 | `reprocess_vi_interchange.py` | Relanza `glue-vi-interchange` (listo, no ejecutado aún — ver `pending.md`) |
 
-**Escanear NullType en S3 sin descargar archivos:** `tst_files/debug_scripts/scan_nulltype_columns.py` — lee solo el footer Parquet vía `pq.ParquetFile(...).schema_arrow`. Ajustar `BUCKET`/`PREFIX`.
+**Escanear NullType en S3 sin descargar archivos:** leer solo el footer/schema de cada Parquet vía `pq.ParquetFile(path).schema_arrow` (boto3 + pyarrow, sin descargar el archivo completo) — script borrado en la limpieza de `tst_files/` del 2026-08-13, recrear si hace falta (patrón: listar objetos bajo un prefijo S3, abrir cada uno con `pafs.S3FileSystem`, comparar tipos Arrow entre archivos).
 
-**Comparar reporte vs legacy:** `tst_files/debug_scripts/compare_get_transaction_aggregated.py` — lee Parquet local en chunks + queries `GROUP BY` contra PRD via psycopg2 (credenciales en memoria `prd-db-credentials.md`).
+**Comparar reporte vs legacy:** leer el Parquet local en chunks + queries `GROUP BY` contra PRD vía `psycopg2` (credenciales en memoria `prd-db-credentials.md`) — mismo caso, script borrado en la limpieza del 2026-08-13, recrear si hace falta.

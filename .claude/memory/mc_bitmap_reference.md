@@ -140,5 +140,5 @@ Idéntico al Bitmap A excepto **byte 4: `84` → `85`** (`10000100` → `1000010
 
 - Los mensajes con estos bitmaps son **MTI 1240** (transaccionales principales): presencia de DE 24 (Function Code), DE 48 (PDS), DE 55 (EMV/chip) y DE 105 (Large Data) es característica de este MTI.
 - La diferencia entre Bitmap A y Bitmap B es únicamente DE 40 — indica que algunos mensajes del archivo tienen Service Restriction Code y otros no; es normal que el bitmap varíe por mensaje dentro del mismo archivo.
-- Para parsear bitmaps de otros mensajes del mismo cliente, usar el snippet de Python de la sección anterior o el script `tst_files/debug_scripts/` si ya existe uno de bitmap parsing en el repo.
+- Para parsear bitmaps de otros mensajes del mismo cliente, usar el snippet de Python de la sección anterior (`tst_files/debug_scripts/` está vacío tras la limpieza del 2026-08-13 — recrear un script puntual si hace falta).
 - Código fuente del parser: `lambdas/mastercard/interpreter/src/handler.py` — funciones `bitmap_bits()` (línea 757) y `split_mti_bitmap_body()` (línea 772).

@@ -50,7 +50,7 @@ Estructura S3 esperada:
   [S3_REFERENCE]/region/data.parquet
   [S3_REFERENCE]/currency/data.parquet
   [S3_REFERENCE]/mastercard_brand_product/data.parquet
-  [S3_REFERENCE]/mastercard_iar/historic_data.parquet   ← PROVISIONAL
+  [S3_REFERENCE]/mastercard_iar/data.parquet
   [S3_REFERENCE]/exchange-rates-glue/brand=Mastercard/exchange_date=YYYY-MM-DD/*.parquet
 
   [S3_STAGING]/{s3_key_input}/…_1240.parquet            ← CLN input
@@ -392,18 +392,12 @@ def load_exchange_rate(s3_reference_url: str, rate_date: str) -> DataFrame:
  
 def _load_iar_raw(s3_reference_url: str) -> DataFrame:
     """
-    Carga el parquet IAR crudo.
-    PROVISIONAL: usa historic_data.parquet.
-    En el futuro, usar data.parquet cuando esté completo.
+    Carga el parquet IAR crudo (fuente única, `data.parquet` — mismo criterio
+    que ARDEF). Nota: función sin uso actual en este archivo — `prepare_iar()`
+    hace su propia carga con pandas en vez de llamar a esta, ver ahí.
     """
-    try:
-        path = _s3_url(s3_reference_url, "mastercard_iar", "historic_data.parquet")
-        df   = _load_parquet(path)
-        log_info("  IAR: loaded from historic_data.parquet (provisional)")
-        return df
-    except Exception:
-        log_warn("  IAR: historic_data.parquet not found — fallback to data.parquet")
-        return _load_parquet(_s3_url(s3_reference_url, "mastercard_iar", "data.parquet"))
+    path = _s3_url(s3_reference_url, "mastercard_iar", "data.parquet")
+    return _load_parquet(path)
  
  
 def _load_brand_product_raw(s3_reference_url: str) -> DataFrame:
@@ -469,14 +463,9 @@ def prepare_iar(s3_reference_url: str, file_date_str: str) -> DataFrame:
     # _load_iar_raw devuelve un Spark DataFrame diseñado para Glue/S3.
     # En prepare_iar todo el procesamiento es pandas, así que leemos el parquet
     # directamente con pd.read_parquet (funciona tanto en local como en Glue)
-    try:
-        iar_path = _s3_url(s3_reference_url, "mastercard_iar", "historic_data.parquet")
-        df_iar = pd.read_parquet(iar_path)
-        log_info("  IAR: loaded via pd.read_parquet from historic_data.parquet (provisional)")
-    except Exception:
-        log_warn("  IAR: historic_data.parquet not found — fallback to data.parquet")
-        iar_path = _s3_url(s3_reference_url, "mastercard_iar", "data.parquet")
-        df_iar = pd.read_parquet(iar_path)
+    iar_path = _s3_url(s3_reference_url, "mastercard_iar", "data.parquet")
+    df_iar = pd.read_parquet(iar_path)
+    log_info("  IAR: loaded via pd.read_parquet from data.parquet")
  
     df_iar = df_iar.rename(columns={
         "low_range":          "low_key_for_range",
@@ -572,7 +561,7 @@ def prepare_iar(s3_reference_url: str, file_date_str: str) -> DataFrame:
     # Requisitos para Arrow:
     #   - Columnas numéricas deben ser int64 / Int64 (nullable) — no float64 con NaN
     #   - Columnas string deben ser object con None (no np.nan) para mapear a null en Arrow
-    # NOTA: la nueva maestra historic_data.parquet almacena low_range / high_range como
+    # NOTA: la maestra IAR (mastercard_iar/data.parquet) almacena low_range / high_range como
     # VARCHAR, por lo que tras pd.to_numeric los valores quedan en float64 con posibles
     # NaN. El cast directo float64 → Int64 falla con la regla 'safe' de numpy
     # (TypeError: cannot safely cast non-equivalent float64 to int64).
