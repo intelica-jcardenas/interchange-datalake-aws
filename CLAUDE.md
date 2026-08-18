@@ -313,11 +313,12 @@ Patron de nomenclatura: `itl-0004-itx-{env}-dynamo-{tabla}-02`
 | vi-exchange-rates | `itl-0004-itx-dev-intchg-02-lmbd-vi-exchange-rates` | ✓ |
 | mc-transform | `itl-0004-itx-dev-intchg-02-lmbd-mc-transform` | ✓ |
 | mc-interpreter | `itl-0004-itx-dev-intchg-02-lmbd-mc-interpreter` | ✓ |
-| mc-iar | `itl-0004-itx-dev-intchg-02-lmbd-mc-iar` | — |
+| mc-iar | `itl-0004-itx-dev-intchg-02-lmbd-mc-iar` | ✓ |
 | mc-extract | `itl-0004-itx-dev-intchg-02-lmbd-mc-extract` | ✓ |
 | mc-clean | `itl-0004-itx-dev-intchg-02-lmbd-mc-clean` | ✓ |
 | mc-store | `itl-0004-itx-dev-intchg-02-lmbd-mc-store` | ✓ |
-| mc-exchange-rates | `itl-0004-itx-dev-intchg-02-lmbd-mc-exchange-rates` | — |
+| mc-exchange-rates | `itl-0004-itx-dev-intchg-02-lmbd-mc-exchange-rates` | ✓ |
+| rules-refresh | `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` | ✓ |
 
 **Chunked processing:** los Lambdas de procesamiento dividen los archivos en chunks para no exceder el timeout:
 - `transform`: chunks de 128 MB, flush cada 1,000,000 records
@@ -340,7 +341,7 @@ Patron de nomenclatura: `itl-0004-itx-{env}-intchg-02-glue-{marca}-{job}`
 | `itl-0004-itx-dev-intchg-02-glue-get-transaction` | Visa/MC | G.1X × 2 | Reporte de transacciones (`get_transaction.py`) — un cliente por ejecucion. Renombrado desde `glue-test-1` (verificado en AWS 2026-07-08). |
 | `itl-0004-itx-dev-intchg-02-glue-exchange-rates` | — | G.1X × 2 | Enriquece `exchange-rates/` (scraping crudo, alfa) con codigos numericos → `exchange-rates-glue/` (`format_exchange_rates.py`, `glue/scripts/reports/exchange_rates/`). Renombrado desde `glue-test-2` (verificado en AWS 2026-07-08). **Fuente oficial de tipo de cambio del pipeline** — ver seccion "Fuente de tipo de cambio" mas abajo. |
 | `itl-0004-itx-dev-intchg-02-glue-vi-data-quality` | Visa | G.1X × 2 | Data Quality Visa (`vi_data_quality.py`). Renombrado desde `glue-test-3` (verificado en AWS 2026-07-08). Aun no integrado a ningun Step Function. |
-| `itl-0004-itx-dev-intchg-02-glue-mc-data-quality` | MC | G.1X × 2 | Data Quality Mastercard (`mc_data_quality.py`). Ya desplegado en AWS (verificado 2026-07-08 — antes documentado como "en desarrollo local, pendiente de subir"; esa nota estaba desactualizada). Primera corrida con datos reales recién el 2026-08-10 (smoke test EBGR/2026-01-05, ver `decisions.md`) — sigue sin validación de resultados contra legacy, aun no integrado a ningun Step Function. |
+| `itl-0004-itx-dev-intchg-02-glue-mc-data-quality` | MC | G.1X × 2 | Data Quality Mastercard (`mc_data_quality.py`). Ya desplegado en AWS. Primera corrida con datos reales el 2026-08-10 (smoke test EBGR/2026-01-05). Rewrite sustancial del encargado real del job (2026-07-30..2026-08-12): fix de precisión decimal que truncaba montos en silencio, `hash_file_filter` de SBSA reescrito a DynamoDB `file_control` (antes muerto, apuntaba a un Parquet inexistente), inclusión de MTI 1442, overrides de `validation_conditions`, output movido a `s3-analytics/{cliente}/reports/quality/MC/{YYYYMM}/` con nombre de archivo legible — sincronizado y aceptado 2026-08-17, `DefaultArguments` limpiados de parámetros de negocio contaminados (recurrencia del mismo problema del `glue-mc-interchange`, ver `decisions.md`). Sigue sin validación de resultados contra legacy, aun no integrado a ningun Step Function. |
 | `itl-0004-itx-dev-intchg-02-glue-scheme-fee` | Visa/MC | G.1X × 2 | Scheme Fee (`scheme_fee.py`, `glue/scripts/reports/scheme_fee/`), replica del modulo legacy de cuotas (EC2 `exec_scheme_fee.py`). Modos `--mode generate`/`--mode read`. Desplegado 2026-07-03, ambos modos validados end-to-end 2026-07-08 (falta validar con costos reales, ver `.claude/memory/pending.md`). |
 | `itl-0004-itx-dev-intchg-02-glue-ebgr-report` | MC (EBGR) | G.1X × 2 | "Eurobank Merchant Report" (RPT_MCT, `ebgr_merchant.py`, `glue/scripts/reports/ebgr_report/`) — recrea el reporte CSV legacy de scheme fee/comercios, específico para EBGR. Deliberadamente acotado a Mastercard (aborta si se pide otro scheme). Lee crudo `MC/IPM_1240`/`IPM_1442`, clasifica contra catálogos legacy (`lu_tmplt_scheme_fee`, `lu_sub_scheme`, `lu_scheme_fee_category`, `lu_rg_mct_amt`), agrega mensual y escribe `RPT_MCT_{YYYYMM}.csv` en el formato legacy exacto (filas '01'/'02'/'03', encoding cp1252). `--begin_date`/`--end_date`/`--raw_root`/`--output_root` (sin default fijo, por `--Arguments` en cada ejecución — output real confirmado en `s3-analytics/EBGR/reports/ebgr_merchant/`). Desarrollo confirmado terminado por el equipo, documentado con la skill `itx-document-script` y desplegado 2026-08-13 (`DOC-ONLY`, sin cambios de lógica) — sigue sin validar sus resultados contra legacy. Ver `.claude/memory/pending.md`. |
 

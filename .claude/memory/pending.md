@@ -121,12 +121,6 @@ ningún desarrollo de script — se movieron a la nota final.)
 
 **2026-08-17:** migrado de `lmbd-test-1` (infra prestada) al Lambda definitivo `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (creado por Infra) — código desplegado y validado end-to-end contra AWS real (mismo excel V38 ya archivado, diff=0). Ver decisión "`lmbd-rules-refresh`: migración de `lmbd-test-1`..." en `decisions.md`.
 
-- [ ] **`mc_data_quality.py` corrió por primera vez con datos reales**
-  (2026-08-10, EBGR/2026-01-05) pero solo como smoke test del fix de
-  paths — sigue sin ninguna validación de que sus *resultados* (filas de
-  validación, discrepancias detectadas) sean correctos contra legacy.
-  Pendiente si se decide integrar este job al pipeline real.
-
 **Nota:** se evaluó y descartó explícitamente una tabla DynamoDB de
 auditoría (`rules_control`) para este Lambda — proceso chico y de baja
 frecuencia, no la justifica. El schema propuesto y toda referencia en
@@ -135,6 +129,23 @@ ningún rastro en el repo, ver `decisions.md`.
 
 (El rol IAM dedicado para este Lambda — sigue sobre el rol compartido
 `lmbd-vi-role` — es gestión de Infra, ver nota final.)
+
+---
+
+## `glue-mc-data-quality` — sin validar resultados contra legacy, ver `decisions.md`
+
+Corrió por primera vez con datos reales el 2026-08-10 (EBGR/2026-01-05, smoke
+test del fix de paths). El 2026-08-17 se sincronizó un rewrite sustancial
+del script (fixes reales de precisión decimal, `hash_file_filter` de SBSA,
+MTI 1442, overrides de `validation_conditions`) hecho por el encargado real
+del job entre el 2026-07-30 y el 2026-08-12 — aceptado tal cual, más la
+limpieza de `DefaultArguments` (recurrencia del mismo problema ya resuelto
+una vez, ver decisión "Estandarización de configuración de Glue Jobs").
+
+- [ ] **Sin ninguna validación de que los *resultados* (filas de validación,
+  discrepancias detectadas) sean correctos contra legacy** — ni antes ni
+  después del rewrite del 2026-08-17. Pendiente si se decide integrar este
+  job al pipeline real.
 
 ---
 
@@ -203,3 +214,10 @@ Referencia, no checklist activo — nada de esto bloquea el desarrollo del pipel
   funcional confirmado — deliberadamente sin tocar hasta que
   `glue-exchange-rates` resuelva su pendiente de versión (arriba) y
   `vi-data-quality` se integre a algún Step Function.
+- **Inventario de migración DEV→PRD (Terraform, Infra)** — revisado
+  2026-08-18 contra AWS real, 2 gaps críticos encontrados (catálogo de
+  Glue subestimado 4 vs 18 recursos reales; buckets S3 con mapeo dudoso,
+  recurso llamado `aws_s3_bucket.poc`) más 2 importantes (falta
+  `lmbd-archive-file`; `for_each` de Lambdas no distingue Visa/Mastercard).
+  Coordinación con Infra, no bloquea desarrollo del pipeline — detalle
+  completo en `decisions.md`.

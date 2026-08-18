@@ -110,6 +110,13 @@ repo):**
 2. Si sí — ¿a dónde escribe? ¿Ya está probado con algún archivo real?
 3. ¿Quién lo administra / tiene acceso a ver el Lambda target y logs?
 
+**Hallazgo adicional (2026-08-18, revisión del inventario de migración a PRD de Infra):** aparecieron más piezas del mismo rompecabezas, con un prefijo de nomenclatura distinto al del proyecto (`itl-0004-itx-dev-` sin `-intchg-02-`):
+- Roles IAM: `itl-0004-itx-dev-tf-sftp-02-landing-role`, `...-landing-pre-role`, `...-logging-role`.
+- Buckets S3: `itl-0004-itx-dev-s3-landing-02`, `itl-0004-itx-dev-s3-landing-pre-02` (y otros: `raw`, `structured`, `enriched`, `configuration`, `devops`, `log`, `operational`, `scheme-fee`, todos con sufijo `-02` y sin `intchg`).
+- Coincide con el `lmbd-file-load-02` ya visto arriba (mismo prefijo `itl-0004-itx-dev-lmbd-file-load-02-role`, confirmado que existe como rol IAM real).
+
+**No confirmado si esto escribe a nuestro `s3-landing` real** (`itl-0004-itx-dev-intchg-02-s3-landing`) — el nombre "landing-pre" sugiere una etapa previa/de staging del lado SFTP antes de que el archivo llegue a landing real, pero no se verificó el flujo completo (permisos insuficientes para ver el Lambda target, mismo bloqueo que el hallazgo original de arriba). Mismas 3 preguntas para el equipo, ahora con más pistas concretas para acotar la búsqueda.
+
 ---
 
 ## 4. Hallazgo aparte: EBGR ya tiene archivos de febrero 2026 sin el reproceso de hoy

@@ -45,10 +45,11 @@ itl-0004-itx-{env}-intchg-02-lmbd-router
 itl-0004-itx-{env}-intchg-02-lmbd-archive-file   Archiva original -> S3 Archive
     |
     v
-Athena (*)                                        Consultas SQL sobre datos finales
+Athena                                            Consultas SQL sobre datos finales
 ```
 
-`(*)` Athena: configuracion de crawlers, workgroups y tablas pendiente de validacion
+`itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` (Lambda aparte, fuera de este flujo) refresca
+`visa_rules`/`mc_rules` en S3 Reference via trigger S3 propio — ver `CLAUDE.md`.
 
 ---
 
@@ -74,6 +75,7 @@ Athena (*)                                        Consultas SQL sobre datos fina
 | `itl-0004-itx-dev-intchg-02-lmbd-mc-iar` | MC: motor de reglas IAR (rangos de BINes y fees) |
 | `itl-0004-itx-dev-intchg-02-lmbd-mc-store` | MC: consolida CLN+CAL+ITX por MTI -> S3 Operational |
 | `itl-0004-itx-dev-intchg-02-lmbd-mc-exchange-rates` | MC: conversion de moneda |
+| `itl-0004-itx-dev-intchg-02-lmbd-rules-refresh` | Refresca visa_rules/mc_rules desde excels legacy (trigger S3 propio, fuera del flujo de transacciones) |
 
 ### Glue Jobs
 
@@ -88,6 +90,7 @@ Athena (*)                                        Consultas SQL sobre datos fina
 | `itl-0004-itx-dev-intchg-02-glue-vi-data-quality` | Visa | G.1X × 2 |
 | `itl-0004-itx-dev-intchg-02-glue-mc-data-quality` | MC | G.1X × 2 |
 | `itl-0004-itx-dev-intchg-02-glue-scheme-fee` (cuotas) | Visa/MC | G.1X × 2 |
+| `itl-0004-itx-dev-intchg-02-glue-ebgr-report` (Eurobank Merchant Report) | MC (EBGR) | G.1X × 2 |
 
 ### Step Functions
 
@@ -104,7 +107,10 @@ Athena (*)                                        Consultas SQL sobre datos fina
 | `itl-0004-itx-dev-intchg-02-s3-staging` | Intermedio — Parquets de proceso |
 | `itl-0004-itx-dev-intchg-02-s3-operational` | Salida — Parquets finales |
 | `itl-0004-itx-dev-intchg-02-s3-archive` | Archivo — originales post-proceso |
-| `itl-0004-itx-dev-intchg-02-s3-reference` | Referencia — ARDEF, IAR, tipos de cambio |
+| `itl-0004-itx-dev-intchg-02-s3-reference` | Referencia — ARDEF, IAR, tipos de cambio, reglas de interchange, scripts de Glue |
+| `itl-0004-itx-dev-intchg-02-s3-analytics` | Reportes internos — get_transaction, scheme_fee, data quality, EBGR merchant |
+| `itl-0004-itx-dev-intchg-02-s3-scheme-fee` | Intercambio de CSV de cuotas con el equipo externo (`IN`/`OUT`) |
+| `itl-0004-itx-dev-intchg-02-s3-athena` | Resultados de consultas Athena |
 
 ### DynamoDB
 
@@ -126,6 +132,7 @@ interchange-datalake-aws/
 │   ├── router/
 │   ├── unzip/
 │   ├── archive-file/
+│   ├── rules-refresh/
 │   ├── visa/
 │   │   ├── transform/
 │   │   ├── extract/
@@ -182,6 +189,7 @@ para subir).
 | Pipeline Mastercard completo | Implementado y validado end-to-end (comparativos EBGR + SBSA enero 2026) |
 | Reporting (`get_transaction.py`) | Validado para ambas marcas |
 | Scheme Fee (cuotas) | `--mode generate` y `--mode read` validados end-to-end; falta validar con costos reales del equipo externo |
-| Athena (crawlers, workgroups, tablas) | Pendiente de configuracion y validacion |
+| Athena (crawlers, workgroups, tablas) | Configurado y validado — 9 databases + 9 crawlers (por cliente), 1 workgroup |
+| `lmbd-rules-refresh` | En producción — trigger S3 real, auto-publica refreshes de visa_rules/mc_rules |
 
 Ver `CLAUDE.md` para documentacion tecnica detallada.
