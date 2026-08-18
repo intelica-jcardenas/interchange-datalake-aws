@@ -24,9 +24,10 @@ no aborta el rango completo, se loguea y se omite (ver
 get_mastercard_validation_results_range).
 
 Particularidad SBSA: aplica un filtro adicional de hash de archivo
-(hash_file_filter) contra un Parquet de control equivalente a la tabla
-legacy control.t_control_file — ver get_control_hash_codes(). Para el
-resto de los clientes este filtro no aplica.
+(hash_file_filter) contra DynamoDB (tabla file_control, equivalente Standard
+2.0 de la tabla legacy control.t_control_file) — ver get_control_hash_codes().
+Mismo patrón/tabla que usa vi_data_quality.py::get_valid_content_hashes().
+Para el resto de los clientes este filtro no aplica.
 
 Flujo:
 1. get_mastercard_validation_results_range(): itera día por día el rango
@@ -50,13 +51,24 @@ Variables de entorno (no son Job Parameters, se leen con os.getenv):
   S3_OUTPUT                : bucket de salida del reporte (default: s3a://itl-0004-itx-dev-intchg-02-s3-analytics)
   DYNAMO_TABLE_CLIENT      : tabla DynamoDB de clientes (default: itl-0004-itx-dev-dynamo-client-02)
   AWS_REGION               : región AWS (default: eu-south-2)
-  CONTROL_FILE_PATH        : path del Parquet de control para hash_file_filter (solo SBSA, default: "")
+  DYNAMO_TABLE_FILE_CONTROL: tabla DynamoDB de control de archivos, usada por
+                             hash_file_filter (solo SBSA, default: itl-0004-itx-dev-dynamo-file_control-02)
   SPARK_SHUFFLE_PARTITIONS : particiones de shuffle Spark (default: 32)
 
 Salida:
-  S3 analytics: {S3_OUTPUT}/{customer_code}/reports/quality/range_{start_date}_{end_date}/
+  S3 analytics: {S3_OUTPUT}/{customer_code}/reports/quality/MC/{YYYYMM}/{archivo}.parquet
+  (carpeta MC agregada 2026-08-12 para diferenciar por marca, igual convención
+  que ya usa el bucket operational — {cliente}/MC/... y {cliente}/VISA/...)
+  Nombre de archivo (ver build_output_names()): si el rango cubre el mes
+  calendario completo, "{customer_code}_data_quality_{YYYYMM}.parquet";
+  si es un rango parcial, "{customer_code}_data_quality_{YYYYMMDD}_{YYYYMMDD}.parquet"
+  (agregado 2026-08-12 junto con write_single_named_parquet(), que reemplaza
+  el nombre autogenerado por Spark, part-00000-<uuid>-c000.snappy.parquet,
+  por este nombre legible).
 """
 import os
+import time
+from calendar import monthrange
 from decimal import Decimal
 from typing import Any, List
 from functools import reduce
@@ -64,6 +76,7 @@ from functools import reduce
 from datetime import datetime, timedelta
 
 import boto3
+from boto3.dynamodb.conditions import Attr
 from awsglue.context import GlueContext
 from pyspark.context import SparkContext
 from pyspark.sql import DataFrame
@@ -117,9 +130,12 @@ DYNAMO_TABLE_CLIENT = os.getenv(
 
 AWS_REGION = os.getenv("AWS_REGION", "eu-south-2")
 
-# Solo necesario para SBSA si quieres aplicar hash_file_filter.
-# Debe apuntar al parquet equivalente de control.t_control_file.
-CONTROL_FILE_PATH = os.getenv("CONTROL_FILE_PATH", "")
+# Solo necesario para SBSA, usado por hash_file_filter (ver get_control_hash_codes).
+# Equivalente Standard 2.0 de la tabla legacy control.t_control_file.
+DYNAMO_TABLE_FILE_CONTROL = os.getenv(
+    "DYNAMO_TABLE_FILE_CONTROL",
+    "itl-0004-itx-dev-dynamo-file_control-02",
+)
 
 
 # =============================================================================
@@ -179,6 +195,20 @@ def read_ipm_1644_operational(spark, path: str) -> DataFrame:
     Arrow del CLN..." — mismo problema que motivó el schema explícito en la
     capa operational).
 
+    IMPORTANTE (bug encontrado 2026-08-11): los campos amount_net_fee_* y
+    amount_net_transaction_* son decimal(18,2) en el parquet real, pero
+    estaban declarados acá como DecimalType(6,2)/(9,2) — mucho más angostos.
+    Con spark.sql.parquet.enableVectorizedReader=false (como corre el job
+    real, ver __main__), Spark trunca/corrompe en silencio, sin error ni
+    warning, cualquier valor que no entre en la precisión declarada — no
+    lanza excepción (eso solo pasa con el lector vectorizado activado).
+    Confirmado empíricamente: para EBGR 2026-01-05, esto perdía 40,913.04 de
+    la suma de fees de un solo archivo (2 filas de 3 dígitos enteros nomás,
+    ej. 11,231.49) porque no entraban en el límite de 4 dígitos enteros de
+    DecimalType(6,2). Esto explicaba gran parte de lo que se había atribuido
+    a "discrepancia real de negocio" en el reporte de calidad — no lo era.
+    Ahora ambos campos usan DecimalType(18,2), igual al tipo nativo real.
+
     Args:
         spark: Sesión de Spark activa.
         path: Path S3 al directorio operational de IPM_1644 a leer
@@ -203,12 +233,12 @@ def read_ipm_1644_operational(spark, path: str) -> DataFrame:
 
         StructField(
             "amount_net_fee_in_reconciliation_currency_2_pds_395_2",
-            DecimalType(6, 2),
+            DecimalType(18, 2),
             True,
         ),
         StructField(
             "amount_net_transaction_in_reconciliation_currency_2_pds_394_2",
-            DecimalType(9, 2),
+            DecimalType(18, 2),
             True,
         ),
 
@@ -242,6 +272,15 @@ def read_ipm_1240_operational(spark, path: str) -> DataFrame:
     pipeline (jurisdiction, settlement_report_currency_code, intelica_id,
     calculated_value) — mismo motivo que read_ipm_1644_operational().
 
+    IMPORTANTE (mismo bug que read_ipm_1644_operational, ver su docstring):
+    amount_reconciliation_de_5, amount_transaction_de_4 y
+    amounts_transaction_fee_7_pds_146_7 son decimal(18,4) en el parquet real,
+    pero estaban declarados como DecimalType(8,4)/(10,4)/(6,4) — el de fee
+    (6,4) apenas soportaba hasta 99.9999, cualquier comisión de más de 2
+    dígitos enteros se corrompía en silencio. Confirmado empíricamente para
+    EBGR 2026-01-05: perdía 10,215.16 en amount_reconciliation (1 fila) y
+    225.88 en fee (2 filas) de un solo día. Ahora los 3 usan DecimalType(18,4).
+
     Args:
         spark: Sesión de Spark activa.
         path: Path S3 al directorio operational de IPM_1240 a leer
@@ -267,9 +306,9 @@ def read_ipm_1240_operational(spark, path: str) -> DataFrame:
         StructField("message_reason_code_de_25", LongType(), True),
         StructField("electronic_commerce_indicator_3_pds_52_3", StringType(), True),
 
-        StructField("amount_reconciliation_de_5", DecimalType(8, 4), True),
-        StructField("amount_transaction_de_4", DecimalType(10, 4), True),
-        StructField("amounts_transaction_fee_7_pds_146_7", DecimalType(6, 4), True),
+        StructField("amount_reconciliation_de_5", DecimalType(18, 4), True),
+        StructField("amount_transaction_de_4", DecimalType(18, 4), True),
+        StructField("amounts_transaction_fee_7_pds_146_7", DecimalType(18, 4), True),
 
         StructField("currency_code_reconciliation_de_50", LongType(), True),
         StructField("currency_code_transaction_de_49", LongType(), True),
@@ -486,19 +525,72 @@ def get_validation_condition(
 # HASH FILTER SOLO SBSA
 # =============================================================================
 
+def _scan_with_backoff(table, scan_kwargs: dict, max_retries: int = 6):
+    """
+    Wrapper de table.scan() con backoff exponencial ante
+    ProvisionedThroughputExceededException.
+
+    file_control-02 tiene solo 1 RCU provisionada — un scan completo de la
+    tabla (cientos de items) la agota fácil, y este job la escanea DOS veces
+    seguidas por día (una vez para settlement, otra para transactional) vía
+    get_control_hash_codes(). Confirmado empíricamente: el segundo scan
+    revienta con ProvisionedThroughputExceededException incluso después de
+    que boto3 ya reintentó internamente 9 veces con su backoff default. Esto
+    no es solo un problema de pruebas locales — el job real correría en el
+    mismo riesgo si se ejecuta para SBSA (más aún si vi_data_quality.py, que
+    también escanea esta tabla, corre en paralelo).
+
+    Args:
+        table: recurso Table de boto3 (dynamodb.Table(...)).
+        scan_kwargs: kwargs a pasar a table.scan() (FilterExpression,
+            ExclusiveStartKey, etc.).
+        max_retries: intentos máximos antes de propagar la excepción.
+
+    Returns:
+        La respuesta de table.scan(...).
+
+    Ejemplo:
+        _scan_with_backoff(table, {"FilterExpression": filter_expr})
+    """
+    from botocore.exceptions import ClientError
+
+    for attempt in range(max_retries):
+        try:
+            return table.scan(**scan_kwargs)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ProvisionedThroughputExceededException":
+                raise
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(
+                f"[WARN] file_control scan throttled (intento {attempt + 1}/{max_retries}), "
+                f"reintentando en {wait}s",
+                flush=True,
+            )
+            time.sleep(wait)
+
+
 def get_control_hash_codes(
-    spark,
     customer_code: str,
     query_date: str,
     brand_local_indicator: str,
     include_cps_collections: bool = False,
 ) -> List[str]:
     """
-    Replica la lógica PostgreSQL de filtrado por hash de archivo, exclusiva
-    de SBSA — obtiene los códigos de archivo válidos desde un Parquet de
-    control equivalente a la tabla legacy control.t_control_file, filtrando
-    por cliente, marca ("MC" fijo), fecha, y el patrón de nombre de archivo
-    correspondiente al indicador brand/local:
+    Replica la lógica de filtrado por hash de archivo, exclusiva de SBSA,
+    leyendo de DynamoDB (tabla file_control) — mismo patrón y misma tabla
+    real que usa vi_data_quality.py::get_valid_content_hashes(). Reemplaza
+    el enfoque original vía Parquet (CONTROL_FILE_PATH / control.t_control_file),
+    que no tiene ninguna fuente de datos disponible en Standard 2.0 — el
+    control de archivos se migró a DynamoDB, no a un Parquet, y esta función
+    quedó desactualizada apuntando a un path que nunca existió, dejando el
+    hash_file_filter de SBSA inerte (siempre caía al sentinel ['xyz']).
+
+    Filtra por client_id=customer_code, brand_id='MC' y file_processing_date
+    == query_date; luego matchea landing_file_name en Python (DynamoDB no
+    soporta LIKE) según el patrón de nombre de archivo correspondiente al
+    indicador brand/local:
 
       Settlement:
         brand: MasterCard_Inward / MasterCard_Outward
@@ -508,58 +600,62 @@ def get_control_hash_codes(
         brand: MasterCard_Inward / MasterCard_Outward / MasterCard_CPS_Collections_File
         default: Local_MasterCard
 
-    Si no hay CONTROL_FILE_PATH configurado, retorna ['xyz'] como fallback
-    (sentinel que no matchea ningún hash real), igual que el SQL original.
-
     Args:
-        spark: Sesión de Spark activa.
         customer_code: Código de cliente (se espera "SBSA", único caso donde
             se llama a esta función).
         query_date: Fecha a filtrar, formato "YYYY-MM-DD".
         brand_local_indicator: "brand" o "default" — determina qué patrones
-            de process_file_name se incluyen.
+            de landing_file_name se incluyen.
         include_cps_collections: Si es True, agrega el patrón
             MasterCard_CPS_Collections_File al filtro "brand" (usado solo
             para el data_source "trx").
 
     Returns:
-        Lista de códigos de archivo (code) que matchean los filtros, o
-        ["xyz"] si no hay ninguno o falta CONTROL_FILE_PATH.
+        Lista de content_hash que matchean los filtros, o ["xyz"] si no hay
+        ninguno (sentinel que no matchea ningún hash real).
 
     Ejemplo:
-        get_control_hash_codes(spark, "SBSA", "2026-01-03", "brand", include_cps_collections=True)
+        get_control_hash_codes("SBSA", "2026-01-24", "brand", include_cps_collections=True)
     """
+    dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+    table = dynamodb.Table(DYNAMO_TABLE_FILE_CONTROL)
 
-    if not CONTROL_FILE_PATH:
-        print("[WARN] CONTROL_FILE_PATH no configurado. hash_file_filter usará ['xyz'].")
-        return ["xyz"]
-
-    df_control = read_parquet(spark, CONTROL_FILE_PATH, "control_file")
-
-    base = df_control.filter(
-        (F.col("customer") == customer_code)
-        & (F.col("brand") == "MC")
-        & (F.col("file_date").cast("date") == F.lit(query_date).cast("date"))
+    filter_expr = (
+        Attr("client_id").eq(customer_code)
+        & Attr("brand_id").eq("MC")
+        & Attr("file_processing_date").eq(query_date)
     )
 
-    if brand_local_indicator.lower() == "brand":
-        cond = (
-            F.col("process_file_name").like("%MasterCard_Inward%")
-            | F.col("process_file_name").like("%MasterCard_Outward%")
-        )
+    codes: List[str] = []
+    scan_kwargs = {"FilterExpression": filter_expr}
 
-        if include_cps_collections:
-            cond = cond | F.col("process_file_name").like("%MasterCard_CPS_Collections_File%")
+    while True:
+        response = _scan_with_backoff(table, scan_kwargs)
 
-        base = base.filter(cond)
-    else:
-        base = base.filter(F.col("process_file_name").like("%Local_MasterCard%"))
+        for item in response.get("Items", []):
+            landing_file_name = item.get("landing_file_name", "")
+            content_hash = item.get("content_hash", "")
 
-    codes = [
-        r["code"]
-        for r in base.select("code").distinct().collect()
-        if r["code"]
-    ]
+            if not content_hash:
+                continue
+
+            if brand_local_indicator.lower() == "brand":
+                matches = (
+                    "MasterCard_Inward" in landing_file_name
+                    or "MasterCard_Outward" in landing_file_name
+                )
+                if include_cps_collections:
+                    matches = matches or "MasterCard_CPS_Collections_File" in landing_file_name
+            else:
+                matches = "Local_MasterCard" in landing_file_name
+
+            if matches:
+                codes.append(content_hash)
+
+        if "LastEvaluatedKey" in response:
+            scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        else:
+            break
 
     return codes if codes else ["xyz"]
 
@@ -569,7 +665,6 @@ def get_control_hash_codes(
 # =============================================================================
 
 def apply_validation_conditions(
-    spark,
     df: DataFrame,
     df_validation: DataFrame,
     query_date: str,
@@ -592,8 +687,6 @@ def apply_validation_conditions(
         presente en df.
 
     Args:
-        spark: Sesión de Spark activa (necesaria para get_control_hash_codes
-            en el caso SBSA).
         df: DataFrame ya normalizado (settlement o transactional) a filtrar.
         df_validation: DataFrame de la tabla validation_conditions.
         query_date: Fecha en formato "YYYY-MM-DD".
@@ -615,7 +708,7 @@ def apply_validation_conditions(
         condición aplicó).
 
     Ejemplo:
-        apply_validation_conditions(spark, df, df_validation, "2026-01-03",
+        apply_validation_conditions(df, df_validation, "2026-01-03",
                                      "SBSA", "I", "brand", "trx",
                                      member_activity_col=None, hash_col="content_hash")
     """
@@ -652,7 +745,6 @@ def apply_validation_conditions(
 
         if hash_sql and "app_hash_file" in hash_sql and actual_hash_col in df.columns:
             hash_codes = get_control_hash_codes(
-                spark=spark,
                 customer_code=customer_code,
                 query_date=query_date,
                 brand_local_indicator=brand_local_indicator,
@@ -663,6 +755,136 @@ def apply_validation_conditions(
             df = df.filter(F.col(actual_hash_col).isin(hash_codes))
 
     return df
+
+
+def compute_extra_fields_stl(t1: DataFrame, df_validation: DataFrame, customer_code: str):
+    """
+    Replica el override iqa_extra_fields de validation_conditions (settlement).
+
+    Legacy: sin fila configurada para (MC, stl, customer), message_reason_code,
+    electronic_commerce_indicator y reconciled_file_flg van en blanco (''). Con
+    fila configurada (hoy solo SBSA), message_reason_code y
+    electronic_commerce_indicator vienen del dato real, y reconciled_file_flg
+    se deriva 'Y'/'N' según si reconciled_file contiene '00004' — texto exacto
+    de la única fila iqa_extra_fields/stl vista hasta hoy (customer=SBSA).
+
+    Si en el futuro otro cliente configura iqa_extra_fields/stl con un texto
+    distinto al de SBSA, esta función seguirá tratándolo como "override
+    presente" para message_reason_code/electronic_commerce_indicator (que sí
+    coincide con el único patrón visto), pero NO recalculará el flag Y/N de
+    reconciled_file_flg salvo que sea SBSA — revisar manualmente ese caso.
+
+    Returns:
+        Tupla de 3 columnas ya aliasadas: (message_reason_code,
+        electronic_commerce_indicator_3, reconciled_file).
+    """
+    has_override = get_validation_condition(
+        df_validation=df_validation,
+        customer_code=customer_code,
+        condition_type="iqa_extra_fields",
+        data_source="stl",
+    ) != ""
+
+    if not has_override:
+        blank = F.lit("").cast("string")
+        return (
+            blank.alias("message_reason_code"),
+            blank.alias("electronic_commerce_indicator_3"),
+            blank.alias("reconciled_file"),
+        )
+
+    if customer_code.upper() == "SBSA":
+        reconciled_file_col = F.when(
+            safe_col(t1, COL_STL_RECONCILED_FILE, "").cast("string").like("%00004"),
+            F.lit("Y"),
+        ).otherwise(F.lit("N"))
+    else:
+        reconciled_file_col = safe_col(t1, COL_STL_RECONCILED_FILE, "").cast("string")
+
+    return (
+        safe_col(t1, COL_STL_MSG_REASON, "").cast("string").alias("message_reason_code"),
+        safe_col(t1, COL_STL_ECI, "").cast("string").alias("electronic_commerce_indicator_3"),
+        reconciled_file_col.alias("reconciled_file"),
+    )
+
+
+def compute_extra_fields_trx(t1: DataFrame, df_validation: DataFrame, customer_code: str):
+    """
+    Replica el override iqa_extra_fields de validation_conditions (transactional).
+
+    Legacy: sin fila configurada para (MC, trx, customer), message_reason_code
+    y electronic_commerce_indicator van en blanco (''). Con fila configurada
+    (hoy solo SBSA), ambos vienen del dato real — reconciled_file_flg no
+    aplica en transactional, siempre es '' en ambos sistemas.
+
+    Returns:
+        Tupla de 2 columnas ya aliasadas: (message_reason_code,
+        electronic_commerce_indicator_3).
+    """
+    has_override = get_validation_condition(
+        df_validation=df_validation,
+        customer_code=customer_code,
+        condition_type="iqa_extra_fields",
+        data_source="trx",
+    ) != ""
+
+    if not has_override:
+        blank = F.lit("").cast("string")
+        return blank.alias("message_reason_code"), blank.alias("electronic_commerce_indicator_3")
+
+    return (
+        safe_col(t1, COL_TRX_MSG_REASON, "").cast("string").alias("message_reason_code"),
+        safe_col(t1, COL_TRX_ECI, "").cast("string").alias("electronic_commerce_indicator_3"),
+    )
+
+
+def compute_processing_code(df_validation: DataFrame, customer_code: str, raw_col):
+    """
+    Replica el override iqa_processing_code de validation_conditions
+    (transactional, hoy solo SBSA). Sin fila configurada: default legacy
+    LEFT(processing_code, 2).
+
+    Con fila configurada (SBSA), el legacy remapea con este CASE (texto
+    exacto de validation_conditions):
+        LEFT(processing_code,2) = '**' → '18'
+        LEFT(processing_code,2) = '*0' → '20'
+        LEFT(processing_code,2) = '0*' AND business_activity_4 IN ('CC','CD') → '01'
+        LEFT(processing_code,2) = '0*' → '09'
+        ELSE LEFT(processing_code,2)
+
+    ADVERTENCIA (sin resolver): en datos reales de SBSA (IPM_1240 Standard
+    2.0) el carácter de máscara observado es '?' (ej. '??','?0','0?'), no '*'
+    como está escrito en validation_conditions — con el patrón tal cual
+    escrito, este remapeo NO va a matchear ningún registro real hoy. Se
+    replica literalmente el texto configurado (no se adivina '?' en su
+    lugar) hasta confirmar con el owner de validation_conditions si la fila
+    debe actualizarse al nuevo carácter de máscara.
+
+    Returns:
+        Columna sin alias (processing_code remapeado o LEFT(2) por defecto).
+    """
+    prefix = F.substring(raw_col.cast("string"), 1, 2)
+
+    has_override = get_validation_condition(
+        df_validation=df_validation,
+        customer_code=customer_code,
+        condition_type="iqa_processing_code",
+        data_source="trx",
+    ) != ""
+
+    if not (customer_code.upper() == "SBSA" and has_override):
+        return prefix
+
+    return (
+        F.when(prefix == "**", F.lit("18"))
+         .when(prefix == "*0", F.lit("20"))
+         .when(
+             (prefix == "0*") & (F.col(COL_TRX_BUSINESS_ACTIVITY_4).isin("CC", "CD")),
+             F.lit("01"),
+         )
+         .when(prefix == "0*", F.lit("09"))
+         .otherwise(prefix)
+    )
 
 
 # =============================================================================
@@ -746,12 +968,11 @@ def get_mastercard_validation_results_settlement(
         df_raw
         .filter(F.col("type_mti").cast("string") == "1644")
         .filter(F.col("function_code").cast("string") == "685")
-        .filter(F.col(COL_STL_TXN_FUNC).cast("string") == "1240")
+        .filter(F.col(COL_STL_TXN_FUNC).cast("string").isin("1240", "1442"))
     )
 
 
     t1 = apply_validation_conditions(
-        spark=spark,
         df=t1,
         df_validation=df_validation,
         query_date=query_date,
@@ -765,6 +986,10 @@ def get_mastercard_validation_results_settlement(
     if DEBUG:
         print(f"[COUNT][STL] filtered_transactions={t1.count()}")
 
+
+    extra_msg_reason, extra_eci, extra_reconciled_file = compute_extra_fields_stl(
+        t1, df_validation, customer_code
+    )
 
     t1_norm = t1.select(
         yymmdd_to_date(F.col("file_dt")).alias("app_processing_date"),
@@ -781,15 +1006,15 @@ def get_mastercard_validation_results_settlement(
         F.col(COL_STL_TOTAL_TRX_NUMBER).cast("double").alias("total_transaction_number"),
         F.col(COL_STL_AMT_NET_TRX_RECON).cast("double").alias("amount_net_transaction_in_reconciliation_currency_2"),
         F.col(COL_STL_AMT_NET_FEE_RECON).cast("double").alias("amount_net_fee_in_reconciliation_currency_2"),
-        safe_col(t1, COL_STL_MSG_REASON, "").cast("string").alias("message_reason_code"),
-        safe_col(t1, COL_STL_ECI, "").cast("string").alias("electronic_commerce_indicator_3"),
+        extra_msg_reason,
+        extra_eci,
         F.col(COL_STL_PROCESSING_CODE).cast("string").alias("reconciled_processing_code"),
         F.col(COL_STL_CURRENCY_RECON).cast("string").alias("currency_code_reconciliation"),
         F.col("function_code").cast("string").alias("function_code"),
         F.col(COL_STL_TXN_FUNC).cast("string").alias("reconciled_transaction_function_1"),
         F.col(COL_STL_SETTLEMENT_INDICATOR).cast("string").alias("settlement_indicator_1"),
         F.col("type_mti").cast("string").alias("app_message_type"),
-        safe_col(t1, COL_STL_RECONCILED_FILE, "").cast("string").alias("reconciled_file"),
+        extra_reconciled_file,
     )
     if DEBUG:
         print(f"[COUNT SLT] {t1_norm.count()}")
@@ -1006,10 +1231,9 @@ def get_mastercard_validation_results_transactional(
     df_currency = read_parquet(spark, currency_path, "currency")
     df_validation = read_parquet(spark, validation_path, "validation_conditions")
 
-    t1 = df_raw.filter(F.col(COL_TRX_MTI).cast("string") == "1240")
+    t1 = df_raw.filter(F.col(COL_TRX_MTI).cast("string").isin("1240", "1442"))
 
     t1 = apply_validation_conditions(
-        spark=spark,
         df=t1,
         df_validation=df_validation,
         query_date=query_date,
@@ -1023,9 +1247,9 @@ def get_mastercard_validation_results_transactional(
     if DEBUG:
         print(f"[COUNT][TRX] filtered_transactions={t1.count()}")
 
-    # iqa_processing_code:
-    # En SQL legacy puede venir una expresión custom por banco.
-    # Por defecto PostgreSQL usa LEFT(processing_code, 2).
+    processing_code_col = compute_processing_code(df_validation, customer_code, F.col(COL_TRX_PROCESSING_CODE))
+    extra_msg_reason, extra_eci = compute_extra_fields_trx(t1, df_validation, customer_code)
+
     t1_norm = t1.select(
         yymmdd_to_date(F.col(COL_TRX_FILE_DATE)).alias("app_processing_date"),
         F.col(COL_TRX_HASH).cast("string").alias("app_hash_file"),
@@ -1035,11 +1259,11 @@ def get_mastercard_validation_results_transactional(
         F.lit(file_type).cast("string").alias("app_type_file"),
 
         F.col(COL_TRX_SETTLEMENT_INDICATOR).cast("string").alias("settlement_indicator_1"),
-        F.substring(F.col(COL_TRX_PROCESSING_CODE).cast("string"), 1, 2).alias("processing_code"),
+        processing_code_col.alias("processing_code"),
         F.col(COL_TRX_BUSINESS_ACTIVITY_4).cast("string").alias("business_activity_4"),
 
-        safe_col(t1, COL_TRX_MSG_REASON, "").cast("string").alias("message_reason_code"),
-        safe_col(t1, COL_TRX_ECI, "").cast("string").alias("electronic_commerce_indicator_3"),
+        extra_msg_reason,
+        extra_eci,
 
         F.col(COL_TRX_AMOUNT_RECON).cast("double").alias("amount_reconciliation"),
         F.col(COL_TRX_AMOUNT_TRANSACTION).cast("double").alias("amount_transaction"),
@@ -1147,7 +1371,7 @@ def get_mastercard_validation_results_transactional(
         LEFT JOIN trx_mc MC
             ON MC.currency_alphabetic_code = T1.settlement_report_currency_code
 
-        WHERE T1.app_message_type = '1240'
+        WHERE T1.app_message_type IN ('1240', '1442')
 
         GROUP BY
             T1.app_processing_date,
@@ -1292,6 +1516,131 @@ def get_mastercard_validation_results_range(
 
     return reduce(lambda a, b: a.unionByName(b), dfs)
 
+
+def build_output_names(customer_code: str, start_date: str, end_date: str) -> tuple[str, str]:
+    """
+    Arma el nombre de carpeta (mes, formato YYYYMM) y de archivo final para el
+    output combinado, agregado 2026-08-12 para reemplazar el nombre
+    autogenerado por Spark (part-00000-<uuid>-c000.snappy.parquet) por uno
+    legible.
+
+    Si el rango [start_date, end_date] cubre el mes calendario completo del
+    mes de start_date (día 1 al último día del mes, mismo año/mes en ambos
+    extremos), el archivo se nombra solo con el mes (YYYYMM). Si es un rango
+    parcial, se nombra con ambas fechas (YYYYMMDD_YYYYMMDD).
+
+    No contempla rangos que crucen más de un mes calendario (ej.
+    2026-01-15 a 2026-02-15) — en ese caso usa el mes de start_date para la
+    carpeta y el rango completo para el nombre del archivo, igual que
+    cualquier rango parcial.
+
+    Args:
+        customer_code: Código de cliente, ej. "EBGR".
+        start_date: Inicio del rango, formato "YYYY-MM-DD".
+        end_date: Fin del rango, formato "YYYY-MM-DD".
+
+    Returns:
+        Tupla (year_month, file_name) — ej. ("202601", "EBGR_data_quality_202601.parquet")
+        o ("202601", "EBGR_data_quality_20260105_20260107.parquet").
+
+    Ejemplo:
+        build_output_names("EBGR", "2026-01-01", "2026-01-31")
+        # ("202601", "EBGR_data_quality_202601.parquet")
+        build_output_names("EBGR", "2026-01-05", "2026-01-07")
+        # ("202601", "EBGR_data_quality_20260105_20260107.parquet")
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    year_month = start_dt.strftime("%Y%m")
+
+    last_day_of_month = monthrange(start_dt.year, start_dt.month)[1]
+    is_full_month = (
+        start_dt.day == 1
+        and end_dt.year == start_dt.year
+        and end_dt.month == start_dt.month
+        and end_dt.day == last_day_of_month
+    )
+
+    if is_full_month:
+        file_name = f"{customer_code}_data_quality_{year_month}.parquet"
+    else:
+        file_name = (
+            f"{customer_code}_data_quality_"
+            f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.parquet"
+        )
+
+    return year_month, file_name
+
+
+def write_single_named_parquet(spark, df: DataFrame, staging_path: str, final_file_path: str) -> None:
+    """
+    Escribe df como un único archivo parquet con nombre exacto (final_file_path),
+    en vez del nombre autogenerado por Spark (part-00000-<uuid>-c000.snappy.parquet).
+    Agregado 2026-08-12 junto con build_output_names().
+
+    Escribe primero a staging_path (coalesce(1) + mode overwrite), después usa
+    la API de Hadoop FileSystem (vía el JVM que ya usa Spark internamente) para
+    mover el único part-*.parquet resultante al nombre final exacto, y borra
+    la carpeta de staging. Funciona igual en local (file://) y en S3 (s3a://)
+    porque ambos casos pasan por la misma API de Hadoop — no depende de boto3
+    ni de si S3_OUTPUT es un bucket real o una ruta local de disco.
+
+    Args:
+        spark: Sesión de Spark activa.
+        df: DataFrame a escribir (se le aplica coalesce(1) acá adentro).
+        staging_path: Carpeta temporal donde Spark escribe su output normal
+            antes del renombre (se borra al final).
+        final_file_path: Ruta completa del archivo final, incluyendo nombre
+            (ej. ".../MC/202601/EBGR_data_quality_202601.parquet").
+
+    Ejemplo:
+        write_single_named_parquet(
+            spark, df_result,
+            staging_path=f"{output_folder}_staging_tmp/",
+            final_file_path=f"{output_folder}{file_name}",
+        )
+    """
+    (
+        df
+        .coalesce(1)
+        .write
+        .mode("overwrite")
+        .parquet(staging_path)
+    )
+
+    jvm = spark._jvm
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+
+    staging_hadoop_path = jvm.org.apache.hadoop.fs.Path(staging_path)
+    final_hadoop_path = jvm.org.apache.hadoop.fs.Path(final_file_path)
+
+    # FileSystem.get(conf) sin URI devuelve el filesystem default (file:/// en
+    # Glue), no el del path real (s3a://) — falla en Glue real con
+    # "Wrong FS: s3a://... expected: file:///" aunque funcione en local (ahí
+    # default y real son el mismo file://). path.getFileSystem(conf) resuelve
+    # el filesystem correcto según el scheme del propio path.
+    fs = staging_hadoop_path.getFileSystem(hadoop_conf)
+
+    part_file = None
+    for status in fs.listStatus(staging_hadoop_path):
+        name = status.getPath().getName()
+        if name.startswith("part-") and name.endswith(".parquet"):
+            part_file = status.getPath()
+            break
+
+    if part_file is None:
+        raise RuntimeError(
+            f"No se encontró ningún part-*.parquet en {staging_path} "
+            f"para renombrar a {final_file_path}"
+        )
+
+    if fs.exists(final_hadoop_path):
+        fs.delete(final_hadoop_path, False)
+
+    fs.rename(part_file, final_hadoop_path)
+    fs.delete(staging_hadoop_path, True)
+
+
 # =============================================================================
 # MAIN LOCAL TEST
 # =============================================================================
@@ -1347,19 +1696,26 @@ if __name__ == "__main__":
             f"output_local/validation_combined/{customer_code}/"
             f"start_date={start_date}_end_date={end_date}/"
         )
-    else:
-        output_path = (
-            f"{S3_OUTPUT}/{customer_code}/reports/quality/"
-            f"range_{start_date}_{end_date}/"
+        (
+            df_result
+            .coalesce(1)
+            .write
+            .mode("overwrite")
+            .parquet(output_path)
         )
+        print(f"[OK] Output combinado generado en: {output_path}", flush=True)
+    else:
+        year_month, file_name = build_output_names(customer_code, start_date, end_date)
+        output_folder = f"{S3_OUTPUT}/{customer_code}/reports/quality/MC/{year_month}/"
+        final_output_path = f"{output_folder}{file_name}"
+        staging_path = f"{output_folder}_staging_tmp/"
 
-    (
-        df_result
-        .write
-        .mode("overwrite")
-        .parquet(output_path)
-    )
-
-    print(f"[OK] Output combinado generado en: {output_path}", flush=True)
+        write_single_named_parquet(
+            spark=spark,
+            df=df_result,
+            staging_path=staging_path,
+            final_file_path=final_output_path,
+        )
+        print(f"[OK] Output combinado generado en: {final_output_path}", flush=True)
 
     spark.stop()

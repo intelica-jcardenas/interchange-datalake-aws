@@ -5,7 +5,7 @@
         "JobRunQueuingEnabled": false,
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-08T08:51:02.453000-05:00",
-        "LastModifiedOn": "2026-07-30T15:34:36.609000-05:00",
+        "LastModifiedOn": "2026-08-17T16:40:20.820000-05:00",
         "ExecutionProperty": {
             "MaxConcurrentRuns": 1
         },
@@ -23,7 +23,7 @@
             "--AWS_REGION": "eu-south-2",
             "--SPARK_SHUFFLE_PARTITIONS": "64",
             "--job-language": "python",
-            "--S3_OUTPUT": "s3://itl-0004-itx-dev-intchg-02-s3-operational",
+            "--S3_OUTPUT": "s3://itl-0004-itx-dev-intchg-02-s3-analytics",
             "--S3_REFERENCE": "s3://itl-0004-itx-dev-intchg-02-s3-reference",
             "--DYNAMO_TABLE_CLIENT": "itl-0004-itx-dev-dynamo-client-02"
         },
