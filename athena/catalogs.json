@@ -1,9 +1,0 @@
-{
-    "DataCatalogsSummary": [
-        {
-            "CatalogName": "AwsDataCatalog",
-            "Type": "GLUE",
-            "Status": "CREATE_COMPLETE"
-        }
-    ]
-}

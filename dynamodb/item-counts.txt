@@ -1,4 +1,0 @@
-itx-file-control: 55 items
-itx-file-pattern: 5 items
-itx-visa-fields: 430 items
-itx-client: 4 items

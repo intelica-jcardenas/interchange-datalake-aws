@@ -155,12 +155,9 @@ interchange-datalake-aws/
 │   ├── visa/
 │   └── mastercard/
 ├── dynamodb/schemas/
-├── iam/roles/
-├── s3/configs/
 ├── layers/pandas-pyarrow/
 ├── layers/pyarrow-curl_cffi/
 ├── layers/rules-refresh-openpyxl/
-├── athena/
 ├── scripts/
 │   ├── sync-lambdas.ps1
 │   └── sync-glue.ps1

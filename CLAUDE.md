@@ -214,9 +214,6 @@ interchange-datalake-aws/
 │   ├── scripts/mastercard/
 │   └── *.json                      # Configs de crawlers, databases, tables
 ├── dynamodb/                        # Schemas y documentacion de tablas
-├── s3/                             # Configuraciones de buckets
-├── iam/                            # Roles IAM documentados
-├── athena/                         # Workgroups y catálogos
 ├── layers/pandas-pyarrow/          # Layer compartido: pandas + pyarrow
 ├── layers/pyarrow-curl_cffi/       # Layer de mc-exchange-rates (scraping via proxies)
 ├── layers/rules-refresh-openpyxl/  # Layer de rules-refresh: openpyxl + et_xmlfile

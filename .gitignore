@@ -26,3 +26,6 @@ sql*
 
 # Credenciales de proxies para scraping de tasas (mc-exchange-rates)
 **/resources/proxy_settings.json
+
+# Memoria/skills de Claude Code — conversaciones de trabajo, solo local
+.claude/
