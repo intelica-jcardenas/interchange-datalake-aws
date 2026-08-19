@@ -61,7 +61,19 @@ Job Parameters:
 
 Salida:
   Un Parquet por client_id:
-  s3://{analytics_bucket}/{client_id}/reports/tst_{client_id}_data_quality.parquet
+  s3://{analytics_bucket}/{client_id}/reports/quality/VISA/{YYYYMM}/{archivo}.parquet
+  (carpeta VISA para igualar la convención ya usada en operational —
+  {client_id}/VISA/baseii_drafts/, {client_id}/VISA/vss_130/ — y en
+  mc_data_quality.py, que usa MC en vez de VISA. Agregado 2026-08-17,
+  reemplaza el nombre fijo tst_{client_id}_data_quality.parquet, que cada
+  corrida pisaba sin importar el rango de fechas procesado — ver
+  my_modules.md, Análisis 2026-08-17.)
+  Nombre de archivo (ver build_output_names()): si el rango cubre el mes
+  calendario completo, "{client_id}_data_quality_{YYYYMM}.parquet"; si es
+  un rango parcial, "{client_id}_data_quality_{YYYYMMDD}_{YYYYMMDD}.parquet"
+  (igual convención que mc_data_quality.py, portado tal cual junto con
+  write_single_named_parquet(), que reemplaza el nombre autogenerado por
+  Spark, part-00000-<uuid>-c000.snappy.parquet, por este nombre legible).
   Columnas: app_processing_date, data_source, file_source, app_customer_code,
             business_mode, jurisdiction, settlement_currency, reversal_indicator,
             trx_type, trx_cycle, fee_descriptor, report_currency_code,
@@ -78,15 +90,19 @@ Notas importantes:
 """
 
 import sys
+import time
+import re
+from calendar import monthrange
+from datetime import datetime, timedelta
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-import re
 from pyspark.sql.types import IntegerType, DoubleType, StringType, LongType, DecimalType
 import boto3
 from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
 
 
 # =============================================================================
@@ -111,26 +127,6 @@ def log_info(message: str):
 
 def log_error(message: str):
     logger.error(f"GlueLogger: {message}")
-
-
-# =============================================================================
-# HELPERS: S3 / PARQUET
-# =============================================================================
-
-def save_parquet(df: DataFrame, path: str):
-    """
-    Guarda el DataFrame como Parquet en S3.
-
-    Al ser un reporte de Data Quality (volumen reducido de filas agrupadas),
-    se usa coalesce(1) para producir un único archivo Parquet fácil de abrir
-    y explorar manualmente (p. ej. desde Athena o un cliente local).
-
-    Si el volumen crece significativamente en el futuro, cambiar a repartition(N).
-    """
-    count = df.count()
-    log_info(f"  Saving {count:,} rows → {path}")
-    df.coalesce(1).write.mode("overwrite").parquet(path)
-    log_info(f"  ✓ Saved: {path}")
 
 
 # =============================================================================
@@ -173,6 +169,50 @@ def get_client_data(client_id: str, dynamodb_table_client: str) -> dict:
 # =============================================================================
 # HELPERS: DYNAMODB – FILE CONTROL (FILTRO DE HASH)
 # =============================================================================
+
+def _scan_with_backoff(table, scan_kwargs: dict, max_retries: int = 6):
+    """
+    Wrapper de table.scan() con backoff exponencial ante
+    ProvisionedThroughputExceededException.
+
+    file_control-02 tiene solo 1 RCU provisionada (ambiente dev). Portado
+    de mc_data_quality.py::_scan_with_backoff() (Alex ya lo necesitó y
+    confirmó empíricamente que un scan real de esta misma tabla puede
+    fallar con ProvisionedThroughputExceededException incluso después de
+    que boto3 ya reintentó internamente con su backoff default — ver
+    my_findings.md, hallazgo 2026-08-17). get_valid_content_hashes() usa
+    la misma tabla con el mismo patrón de scan paginado, así que está
+    expuesta al mismo riesgo, especialmente si corre cerca en el tiempo de
+    otro proceso que también la escanea (mc_data_quality.py, o el script
+    de carga de ARDEF — ver gotchas.md del proyecto).
+
+    Args:
+        table: recurso Table de boto3 (dynamodb.Table(...)).
+        scan_kwargs: kwargs a pasar a table.scan() (FilterExpression,
+            ExclusiveStartKey, etc.).
+        max_retries: intentos máximos antes de propagar la excepción.
+
+    Returns:
+        La respuesta de table.scan(...).
+
+    Ejemplo:
+        _scan_with_backoff(table, {"FilterExpression": filter_expr})
+    """
+    for attempt in range(max_retries):
+        try:
+            return table.scan(**scan_kwargs)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ProvisionedThroughputExceededException":
+                raise
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            log_info(
+                f"  [WARN] file_control scan throttled (intento {attempt + 1}/{max_retries}), "
+                f"reintentando en {wait}s"
+            )
+            time.sleep(wait)
+
 
 def check_hash_filter_needed(
     conditions_df: DataFrame,
@@ -368,7 +408,7 @@ def get_valid_content_hashes(
     scan_kwargs   = {"FilterExpression": filter_expr}
 
     while True:
-        response = table.scan(**scan_kwargs)
+        response = _scan_with_backoff(table, scan_kwargs)
         items    = response.get("Items", [])
 
         for item in items:
@@ -577,6 +617,58 @@ def load_exchange_rate(reference_bucket: str, start_date: str, end_date: str) ->
 
 
 # =============================================================================
+# HELPERS: FECHAS FALTANTES EN EL RANGO
+# =============================================================================
+
+def log_missing_dates(df: DataFrame, start_date: str, end_date: str, label: str) -> None:
+    """
+    Compara las fechas del rango [start_date, end_date] contra las fechas
+    realmente presentes en df (columna 'app_processing_date') y loguea un
+    WARN con las que no aportaron ningún dato.
+
+    VI lee el rango completo de una sola vez (partition discovery de Spark
+    sobre la carpeta padre, ver load_baseii_transactions/load_vss_transactions)
+    en vez de iterar día por día como mc_data_quality.py — eso hace que una
+    fecha sin datos pase completamente silenciosa (ni error ni log), a
+    diferencia del '[WARN] Fecha omitida ...' que MC sí emite por cada día
+    fallido dentro de get_mastercard_validation_results_range(). Esta función
+    agrega ese mismo nivel de log a VI sin cambiar el mecanismo de lectura
+    (sigue siendo una sola lectura Spark, solo se agrega un chequeo de
+    fechas distintas ya presentes en el DataFrame) — ver my_modules.md,
+    Análisis 2026-08-17.
+
+    No es un error: una fecha sin datos es una situación normal (fin de
+    semana, archivo que no llegó ese día) — solo deja registro explícito
+    para quien revise el log, igual que en MC.
+
+    Args:
+        df: DataFrame ya filtrado por rango, con columna 'app_processing_date'
+            (string 'YYYY-MM-DD').
+        start_date: Inicio del rango, formato 'YYYY-MM-DD'.
+        end_date: Fin del rango, formato 'YYYY-MM-DD'.
+        label: Etiqueta descriptiva para el log (ej. 'BaseII/EBGR/IN/default').
+
+    Ejemplo:
+        log_missing_dates(baseii_df, "2026-01-01", "2026-01-15", "BaseII/EBGR/IN/default")
+    """
+    expected = set()
+    current = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    while current <= end_dt:
+        expected.add(current.strftime("%Y-%m-%d"))
+        current += timedelta(days=1)
+
+    present = {
+        row["app_processing_date"]
+        for row in df.select("app_processing_date").distinct().collect()
+    }
+
+    missing = sorted(expected - present)
+    if missing:
+        log_info(f"  [WARN] {label}: fechas omitidas (sin datos en el rango) → {missing}")
+
+
+# =============================================================================
 # HELPERS: CARGA DE TRANSACCIONES BASEII
 # =============================================================================
 
@@ -630,6 +722,7 @@ def load_baseii_transactions(
 
     count = df.count()
     log_info(f"  Loaded {count:,} BaseII records")
+    log_missing_dates(df, start_date, end_date, f"BaseII/{client_id}/{file_type}")
     return df
 
 
@@ -949,6 +1042,7 @@ def load_vss_transactions(
 
     count = df.count()
     log_info(f"  Cargados {count:,} registros VSS 130 (todos los modos)")
+    log_missing_dates(df, start_date, end_date, f"VSS/{client_id}")
     return df
 
 
@@ -1229,6 +1323,138 @@ def aggregate_vss_results(df: DataFrame) -> DataFrame:
     count = result.count()
     log_info(f"  VSS: Agregación completa → {count:,} filas de resultado")
     return result
+
+
+# =============================================================================
+# HELPERS: NOMBRE Y ESCRITURA DEL OUTPUT
+# =============================================================================
+
+def build_output_names(customer_code: str, start_date: str, end_date: str) -> tuple[str, str]:
+    """
+    Arma el nombre de carpeta (mes, formato YYYYMM) y de archivo final para el
+    output, reemplazando el nombre fijo 'tst_{client_id}_data_quality.parquet'
+    (sin fecha — cada corrida pisaba la anterior, ver my_findings.md/
+    my_modules.md, Análisis 2026-08-17) por uno versionado por rango, igual
+    patrón que ya usa mc_data_quality.py::build_output_names() (portado tal
+    cual, sin cambios de lógica — solo cambia dónde se usa, ver
+    write_single_named_parquet()).
+
+    Si el rango [start_date, end_date] cubre el mes calendario completo del
+    mes de start_date (día 1 al último día del mes, mismo año/mes en ambos
+    extremos), el archivo se nombra solo con el mes (YYYYMM). Si es un rango
+    parcial, se nombra con ambas fechas (YYYYMMDD_YYYYMMDD).
+
+    No contempla rangos que crucen más de un mes calendario (ej.
+    2026-01-15 a 2026-02-15) — en ese caso usa el mes de start_date para la
+    carpeta y el rango completo para el nombre del archivo, igual que
+    cualquier rango parcial.
+
+    Args:
+        customer_code: Código de cliente, ej. "EBGR".
+        start_date: Inicio del rango, formato "YYYY-MM-DD".
+        end_date: Fin del rango, formato "YYYY-MM-DD".
+
+    Returns:
+        Tupla (year_month, file_name) — ej. ("202601", "EBGR_data_quality_202601.parquet")
+        o ("202601", "EBGR_data_quality_20260105_20260107.parquet").
+
+    Ejemplo:
+        build_output_names("EBGR", "2026-01-01", "2026-01-31")
+        # ("202601", "EBGR_data_quality_202601.parquet")
+        build_output_names("EBGR", "2026-01-05", "2026-01-07")
+        # ("202601", "EBGR_data_quality_20260105_20260107.parquet")
+    """
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    year_month = start_dt.strftime("%Y%m")
+
+    last_day_of_month = monthrange(start_dt.year, start_dt.month)[1]
+    is_full_month = (
+        start_dt.day == 1
+        and end_dt.year == start_dt.year
+        and end_dt.month == start_dt.month
+        and end_dt.day == last_day_of_month
+    )
+
+    if is_full_month:
+        file_name = f"{customer_code}_data_quality_{year_month}.parquet"
+    else:
+        file_name = (
+            f"{customer_code}_data_quality_"
+            f"{start_dt.strftime('%Y%m%d')}_{end_dt.strftime('%Y%m%d')}.parquet"
+        )
+
+    return year_month, file_name
+
+
+def write_single_named_parquet(spark, df: DataFrame, staging_path: str, final_file_path: str) -> None:
+    """
+    Escribe df como un único archivo parquet con nombre exacto (final_file_path),
+    en vez del nombre autogenerado por Spark (part-00000-<uuid>-c000.snappy.parquet).
+    Portado tal cual de mc_data_quality.py::write_single_named_parquet() (ver
+    my_modules.md, Análisis 2026-08-17) — sin cambios de lógica.
+
+    Escribe primero a staging_path (coalesce(1) + mode overwrite), después usa
+    la API de Hadoop FileSystem (vía el JVM que ya usa Spark internamente) para
+    mover el único part-*.parquet resultante al nombre final exacto, y borra
+    la carpeta de staging. Funciona igual en local (file://) y en S3 (s3a:///
+    s3://) porque ambos casos pasan por la misma API de Hadoop — no depende de
+    boto3 ni de si analytics_bucket es un bucket real o una ruta local de disco.
+
+    Args:
+        spark: Sesión de Spark activa.
+        df: DataFrame a escribir (se le aplica coalesce(1) acá adentro).
+        staging_path: Carpeta temporal donde Spark escribe su output normal
+            antes del renombre (se borra al final).
+        final_file_path: Ruta completa del archivo final, incluyendo nombre
+            (ej. ".../VISA/202601/EBGR_data_quality_202601.parquet").
+
+    Ejemplo:
+        write_single_named_parquet(
+            spark, df_result,
+            staging_path=f"{output_folder}_staging_tmp/",
+            final_file_path=f"{output_folder}{file_name}",
+        )
+    """
+    (
+        df
+        .coalesce(1)
+        .write
+        .mode("overwrite")
+        .parquet(staging_path)
+    )
+
+    jvm = spark._jvm
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+
+    staging_hadoop_path = jvm.org.apache.hadoop.fs.Path(staging_path)
+    final_hadoop_path = jvm.org.apache.hadoop.fs.Path(final_file_path)
+
+    # FileSystem.get(conf) sin URI devuelve el filesystem default (file:/// en
+    # Glue), no el del path real (s3a://) — falla en Glue real con
+    # "Wrong FS: s3a://... expected: file:///" aunque funcione en local (ahí
+    # default y real son el mismo file://). path.getFileSystem(conf) resuelve
+    # el filesystem correcto según el scheme del propio path.
+    fs = staging_hadoop_path.getFileSystem(hadoop_conf)
+
+    part_file = None
+    for status in fs.listStatus(staging_hadoop_path):
+        name = status.getPath().getName()
+        if name.startswith("part-") and name.endswith(".parquet"):
+            part_file = status.getPath()
+            break
+
+    if part_file is None:
+        raise RuntimeError(
+            f"No se encontró ningún part-*.parquet en {staging_path} "
+            f"para renombrar a {final_file_path}"
+        )
+
+    if fs.exists(final_hadoop_path):
+        fs.delete(final_hadoop_path, False)
+
+    fs.rename(part_file, final_hadoop_path)
+    fs.delete(staging_hadoop_path, True)
 
 
 # =============================================================================
@@ -1533,12 +1759,20 @@ def main():
 
         result_df = result_df.cache()
 
-        # Guardar resultado por client_id
-        output_path = f"s3://{analytics_bucket}/{client_id}/reports/tst_{client_id}_data_quality.parquet"
-        log_info(f"  Saving output → {output_path}")
-        save_parquet(result_df, output_path)
+        # Guardar resultado por client_id — ruta/naming versionados por rango
+        # (ver build_output_names()/write_single_named_parquet(), portadas de
+        # mc_data_quality.py, my_modules.md Análisis 2026-08-17). Reemplaza el
+        # nombre fijo 'tst_{client_id}_data_quality.parquet' que cada corrida
+        # pisaba sin importar el rango procesado.
+        year_month, file_name = build_output_names(client_id, start_date, end_date)
+        output_folder = f"s3://{analytics_bucket}/{client_id}/reports/quality/VISA/{year_month}/"
+        output_path = f"{output_folder}{file_name}"
+        staging_path = f"{output_folder}_staging_tmp/"
 
         total_records = result_df.count()
+        log_info(f"  Saving {total_records:,} rows → {output_path}")
+        write_single_named_parquet(spark, result_df, staging_path, output_path)
+
         result_df.unpersist()
 
         log_info(f"  [CLIENT DONE] {client_id} ({client_data['client_name']}) "

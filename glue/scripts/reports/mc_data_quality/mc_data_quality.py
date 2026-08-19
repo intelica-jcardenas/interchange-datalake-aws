@@ -571,6 +571,106 @@ def _scan_with_backoff(table, scan_kwargs: dict, max_retries: int = 6):
             time.sleep(wait)
 
 
+def get_control_hash_codes_by_date(
+    customer_code: str,
+    start_date: str,
+    end_date: str,
+    brand_local_indicator: str,
+    include_cps_collections: bool = False,
+) -> dict:
+    """
+    Trae los content_hash válidos de DynamoDB (file_control) para TODO el
+    rango [start_date, end_date] en un solo scan, agrupados por fecha —
+    mismo patrón que vi_data_quality.py::get_valid_content_hashes(), que
+    recibe start_date/end_date y usa Attr("file_processing_date").between()
+    en vez de pedir un día a la vez.
+
+    Por qué (encontrado 2026-08-17): get_mastercard_validation_results_range()
+    procesa el rango día por día, y antes de este cambio cada día llamaba a
+    get_control_hash_codes() (scan de un solo día) por separado — 62 scans
+    idénticos para un mes de SBSA (31 días × 2 fuentes). Un Scan+FilterExpression
+    de DynamoDB consume RCU por el TOTAL de items leídos de la tabla, no por
+    los que matchean el filtro (file_control-02 solo tiene 'file_id' como
+    partition key, sin sort key ni GSI — no admite Query por fecha), así que
+    pedir "un día" cuesta lo mismo que pedir "todo el rango": el costo real
+    depende de CUÁNTAS VECES se llama, no de qué tan angosto sea el filtro.
+    Confirmado en un job real: SBSA/enero completo tardó >27 min (cancelado
+    manualmente) vs. ~1 min de un día suelto.
+
+    Llamando esta función UNA vez por rango (como hace VI) en vez de una vez
+    por día, un mes de SBSA pasa de 62 scans a 2 (uno para settlement, uno
+    para transactional — difieren en include_cps_collections). No resuelve
+    el problema de fondo (la tabla debería tener un GSI para permitir Query
+    real — ver pendiente #2 en la memoria del proyecto), pero evita la
+    lentitud práctica sin cambiar la tabla.
+
+    Args:
+        customer_code: Código de cliente (se espera "SBSA").
+        start_date, end_date: Rango a traer, formato "YYYY-MM-DD" (inclusive,
+            vía Attr.between — igual semántica que VI).
+        brand_local_indicator: "brand" o "default" — igual que en
+            get_control_hash_codes().
+        include_cps_collections: igual que en get_control_hash_codes().
+
+    Returns:
+        Dict {query_date: [content_hash, ...]} — un día sin ningún hash
+        válido simplemente no aparece como key (el caller debe tratar esa
+        ausencia igual que el sentinel ["xyz"] de get_control_hash_codes()).
+
+    Ejemplo:
+        get_control_hash_codes_by_date("SBSA", "2026-01-01", "2026-01-31", "brand", True)
+        # {"2026-01-01": ["hash1", "hash2"], "2026-01-03": ["hash3"], ...}
+    """
+    dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+    table = dynamodb.Table(DYNAMO_TABLE_FILE_CONTROL)
+
+    filter_expr = (
+        Attr("client_id").eq(customer_code)
+        & Attr("brand_id").eq("MC")
+        & Attr("file_processing_date").between(start_date, end_date)
+    )
+
+    by_date: dict = {}
+    scan_kwargs = {"FilterExpression": filter_expr}
+
+    while True:
+        response = _scan_with_backoff(table, scan_kwargs)
+
+        for item in response.get("Items", []):
+            file_date = item.get("file_processing_date", "")
+            landing_file_name = item.get("landing_file_name", "")
+            content_hash = item.get("content_hash", "")
+
+            if not content_hash:
+                continue
+
+            if brand_local_indicator.lower() == "brand":
+                matches = (
+                    "MasterCard_Inward" in landing_file_name
+                    or "MasterCard_Outward" in landing_file_name
+                )
+                if include_cps_collections:
+                    matches = matches or "MasterCard_CPS_Collections_File" in landing_file_name
+            else:
+                matches = "Local_MasterCard" in landing_file_name
+
+            if matches:
+                by_date.setdefault(file_date, []).append(content_hash)
+
+        if "LastEvaluatedKey" in response:
+            scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        else:
+            break
+
+    total_hashes = sum(len(v) for v in by_date.values())
+    print(
+        f"[VALIDATION] file_control scan por rango ({start_date}..{end_date}) "
+        f"para {customer_code}: {total_hashes} hashes en {len(by_date)} fechas",
+        flush=True,
+    )
+    return by_date
+
+
 def get_control_hash_codes(
     customer_code: str,
     query_date: str,
@@ -599,6 +699,13 @@ def get_control_hash_codes(
       Transactional:
         brand: MasterCard_Inward / MasterCard_Outward / MasterCard_CPS_Collections_File
         default: Local_MasterCard
+
+    NOTA: esta versión escanea un solo día por llamada — usada como fallback
+    cuando no hay un mapa {fecha: hashes} precalculado (ver
+    get_control_hash_codes_by_date(), que trae el rango completo en un solo
+    scan y es lo que usa get_mastercard_validation_results_range() en el
+    camino normal). Queda disponible para no romper llamadas puntuales
+    fuera del loop de rango.
 
     Args:
         customer_code: Código de cliente (se espera "SBSA", único caso donde
@@ -674,6 +781,7 @@ def apply_validation_conditions(
     data_source: str,
     member_activity_col: str | None = None,
     hash_col: str = "content_hash",
+    hash_codes_by_date: dict | None = None,
 ) -> DataFrame:
     """
     Aplica condiciones dinámicas de la tabla validation_conditions sobre un
@@ -702,6 +810,13 @@ def apply_validation_conditions(
         hash_col: Nombre de columna de hash preferido (default:
             "content_hash"); si no está en df, se usa "app_hash_file" como
             fallback.
+        hash_codes_by_date: mapa {fecha: [hashes]} precalculado para todo el
+            rango por get_control_hash_codes_by_date() (un solo scan de
+            DynamoDB por rango, en vez de uno por día — ver esa función).
+            Si se pasa, se usa `hash_codes_by_date.get(query_date, ["xyz"])`
+            en vez de llamar a get_control_hash_codes() (que sigue siendo el
+            fallback si no se pasa nada, ej. para llamadas puntuales fuera
+            del loop de rango).
 
     Returns:
         El DataFrame filtrado (puede ser el mismo df sin cambios si ninguna
@@ -744,12 +859,15 @@ def apply_validation_conditions(
         actual_hash_col = hash_col if hash_col in df.columns else "app_hash_file"
 
         if hash_sql and "app_hash_file" in hash_sql and actual_hash_col in df.columns:
-            hash_codes = get_control_hash_codes(
-                customer_code=customer_code,
-                query_date=query_date,
-                brand_local_indicator=brand_local_indicator,
-                include_cps_collections=(data_source == "trx"),
-            )
+            if hash_codes_by_date is not None:
+                hash_codes = hash_codes_by_date.get(query_date, ["xyz"])
+            else:
+                hash_codes = get_control_hash_codes(
+                    customer_code=customer_code,
+                    query_date=query_date,
+                    brand_local_indicator=brand_local_indicator,
+                    include_cps_collections=(data_source == "trx"),
+                )
 
             print(f"[VALIDATION][{data_source}] SBSA hash_file_filter codes={len(hash_codes)}")
             df = df.filter(F.col(actual_hash_col).isin(hash_codes))
@@ -897,6 +1015,7 @@ def get_mastercard_validation_results_settlement(
     customer_code: str,
     issuer_acquirer_indicator: str,
     brand_local_indicator: str = "default",
+    hash_codes_by_date: dict | None = None,
 ) -> DataFrame:
     """
     Arma el resultado de validación de un día desde la fuente de liquidación
@@ -918,6 +1037,11 @@ def get_mastercard_validation_results_settlement(
             aunque el settlement 1644 siempre se lee de IN, ver comentario
             inline) y se usa para el filtro de member_activity.
         brand_local_indicator: "brand" o "default" (default: "default").
+        hash_codes_by_date: mapa {fecha: [hashes]} precalculado por
+            get_control_hash_codes_by_date() para todo el rango — se pasa
+            tal cual a apply_validation_conditions(). None (default) hace
+            que apply_validation_conditions() escanee DynamoDB por su cuenta
+            para este único día (fallback, ver esa función).
 
     Returns:
         DataFrame agregado con columnas app_processing_date, data_source,
@@ -982,6 +1106,7 @@ def get_mastercard_validation_results_settlement(
         data_source="stl",
         member_activity_col=COL_STL_MEMBER_ACTIVITY,
         hash_col="content_hash",
+        hash_codes_by_date=hash_codes_by_date,
     )
     if DEBUG:
         print(f"[COUNT][STL] filtered_transactions={t1.count()}")
@@ -1151,6 +1276,7 @@ def get_mastercard_validation_results_transactional(
     customer_code: str,
     issuer_acquirer_indicator: str,
     brand_local_indicator: str = "default",
+    hash_codes_by_date: dict | None = None,
 ) -> DataFrame:
     """
     Arma el resultado de validación de un día desde la fuente transaccional
@@ -1178,6 +1304,9 @@ def get_mastercard_validation_results_transactional(
         issuer_acquirer_indicator: "I" o "A" — determina file_type (IN/OUT)
             y por lo tanto qué columnas/joins de moneda se usan.
         brand_local_indicator: "brand" o "default" (default: "default").
+        hash_codes_by_date: mapa {fecha: [hashes]} precalculado por
+            get_control_hash_codes_by_date() para todo el rango — ver mismo
+            parámetro en get_mastercard_validation_results_settlement().
 
     Returns:
         DataFrame agregado con las mismas columnas que
@@ -1243,6 +1372,7 @@ def get_mastercard_validation_results_transactional(
         data_source="trx",
         member_activity_col=None,
         hash_col=COL_TRX_HASH,
+        hash_codes_by_date=hash_codes_by_date,
     )
     if DEBUG:
         print(f"[COUNT][TRX] filtered_transactions={t1.count()}")
@@ -1401,6 +1531,8 @@ def get_mastercard_validation_results_combined(
     customer_code: str,
     issuer_acquirer_indicator: str,
     brand_local_indicator: str = "default",
+    hash_codes_by_date_stl: dict | None = None,
+    hash_codes_by_date_trx: dict | None = None,
 ) -> DataFrame:
 
     """
@@ -1413,6 +1545,12 @@ def get_mastercard_validation_results_combined(
         customer_code: Código de cliente.
         issuer_acquirer_indicator: "I" o "A".
         brand_local_indicator: "brand" o "default" (default: "default").
+        hash_codes_by_date_stl: mapa {fecha: [hashes]} de
+            get_control_hash_codes_by_date() para la rama settlement (ver
+            get_mastercard_validation_results_range(), que lo calcula una
+            vez para todo el rango, no por día).
+        hash_codes_by_date_trx: igual que el anterior, para la rama
+            transactional (difiere de stl en include_cps_collections).
 
     Returns:
         DataFrame con la unión de settlement + transactional para ese día.
@@ -1426,6 +1564,7 @@ def get_mastercard_validation_results_combined(
         customer_code=customer_code,
         issuer_acquirer_indicator=issuer_acquirer_indicator,
         brand_local_indicator=brand_local_indicator,
+        hash_codes_by_date=hash_codes_by_date_stl,
     )
 
     df_transactional = get_mastercard_validation_results_transactional(
@@ -1434,6 +1573,7 @@ def get_mastercard_validation_results_combined(
         customer_code=customer_code,
         issuer_acquirer_indicator=issuer_acquirer_indicator,
         brand_local_indicator=brand_local_indicator,
+        hash_codes_by_date=hash_codes_by_date_trx,
     )
 
     return df_settlement.unionByName(df_transactional)
@@ -1461,6 +1601,18 @@ def get_mastercard_validation_results_range(
     fecha) no aborta el rango completo — se loguea como warning y se omite,
     acumulando failed_dates.
 
+    Para SBSA (único cliente con hash_file_filter), trae los content_hash
+    válidos de DynamoDB UNA SOLA VEZ para todo el rango, antes de empezar el
+    loop de días — usando get_control_hash_codes_by_date(), mismo patrón que
+    vi_data_quality.py::get_valid_content_hashes() (recibe start_date/end_date
+    y hace un solo scan, en vez de que cada día del rango dispare su propio
+    scan). Antes de este cambio, un mes de SBSA hacía 62 scans idénticos
+    (31 días × 2 fuentes) contra una tabla de 1 RCU — confirmado en un job
+    real que eso tardaba >27 min. Con el fetch único quedan solo 2 scans por
+    corrida (uno para settlement, otro para transactional, ya que difieren
+    en include_cps_collections). Para el resto de los clientes esto no
+    aplica — ni se llama a DynamoDB.
+
     Args:
         spark: Sesión de Spark activa.
         start_date: Inicio del rango, formato "YYYY-MM-DD" (inclusive).
@@ -1482,6 +1634,26 @@ def get_mastercard_validation_results_range(
     current_date = datetime.strptime(start_date, "%Y-%m-%d")
     end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
 
+    hash_codes_by_date_stl: dict | None = None
+    hash_codes_by_date_trx: dict | None = None
+
+    if customer_code.upper() == "SBSA":
+        print(f"[RANGE] SBSA — trayendo hash_file_filter para todo el rango de una vez", flush=True)
+        hash_codes_by_date_stl = get_control_hash_codes_by_date(
+            customer_code=customer_code,
+            start_date=start_date,
+            end_date=end_date,
+            brand_local_indicator=brand_local_indicator,
+            include_cps_collections=False,
+        )
+        hash_codes_by_date_trx = get_control_hash_codes_by_date(
+            customer_code=customer_code,
+            start_date=start_date,
+            end_date=end_date,
+            brand_local_indicator=brand_local_indicator,
+            include_cps_collections=True,
+        )
+
     dfs: List[DataFrame] = []
     failed_dates: List[str] = []
 
@@ -1496,6 +1668,8 @@ def get_mastercard_validation_results_range(
                 customer_code=customer_code,
                 issuer_acquirer_indicator=issuer_acquirer_indicator,
                 brand_local_indicator=brand_local_indicator,
+                hash_codes_by_date_stl=hash_codes_by_date_stl,
+                hash_codes_by_date_trx=hash_codes_by_date_trx,
             )
             dfs.append(df_day)
 

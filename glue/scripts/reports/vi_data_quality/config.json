@@ -3,11 +3,12 @@
         "Name": "itl-0004-itx-dev-intchg-02-glue-vi-data-quality",
         "JobMode": "SCRIPT",
         "JobRunQueuingEnabled": false,
+        "Description": "",
         "Role": "arn:aws:iam::861276092327:role/itl-0004-itx-dev-intchg-02-glue-role",
         "CreatedOn": "2026-07-08T08:51:02.242000-05:00",
-        "LastModifiedOn": "2026-07-31T18:37:35.481000-05:00",
+        "LastModifiedOn": "2026-08-17T20:53:32.899000-05:00",
         "ExecutionProperty": {
-            "MaxConcurrentRuns": 50
+            "MaxConcurrentRuns": 1
         },
         "Command": {
             "Name": "glueetl",
@@ -15,8 +16,8 @@
             "PythonVersion": "3"
         },
         "DefaultArguments": {
-            "--enable-metrics": "true",
             "--dynamodb_table_file_control": "itl-0004-itx-dev-dynamo-file_control-02",
+            "--enable-metrics": "true",
             "--enable-job-insights": "true",
             "--conf": "spark.sql.catalog.glue_catalog.glue.skip-name-validation=true",
             "--enable-continuous-cloudwatch-log": "true",
@@ -28,11 +29,11 @@
             "--analytics_bucket": "itl-0004-itx-dev-intchg-02-s3-analytics"
         },
         "MaxRetries": 0,
-        "AllocatedCapacity": 10,
+        "AllocatedCapacity": 2,
         "Timeout": 2880,
-        "MaxCapacity": 10.0,
+        "MaxCapacity": 2.0,
         "WorkerType": "G.1X",
-        "NumberOfWorkers": 10,
+        "NumberOfWorkers": 2,
         "GlueVersion": "4.0"
     }
 }
