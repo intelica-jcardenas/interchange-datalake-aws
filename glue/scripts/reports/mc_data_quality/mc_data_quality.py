@@ -1,6 +1,6 @@
 
 """
-mc_data_quality.py — Job real: itl-0004-itx-dev-intchg-02-glue-mc-data-quality
+mc_data_quality.py — Job real: itl-0004-itx-{env}-intchg-02-glue-mc-data-quality
 ================================================================================
 Archivo:     glue/scripts/reports/mc_data_quality/mc_data_quality.py
 S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/mc_data_quality.py

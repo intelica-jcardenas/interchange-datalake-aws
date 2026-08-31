@@ -1,5 +1,5 @@
 """
-handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-mc-clean
+handler.py — Lambda real: itl-0004-itx-{env}-intchg-02-lmbd-mc-clean
 ================================================================================
 Archivo:     lambdas/mastercard/clean/src/handler.py
 

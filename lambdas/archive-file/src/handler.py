@@ -1,5 +1,5 @@
 """
-handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-archive-file
+handler.py — Lambda real: itl-0004-itx-{env}-intchg-02-lmbd-archive-file
 ================================================================================
 Archivo:     lambdas/archive-file/src/handler.py
 

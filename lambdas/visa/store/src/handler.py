@@ -1,5 +1,5 @@
 """
-handler.py — Lambda real: itl-0004-itx-dev-intchg-02-lmbd-vi-store
+handler.py — Lambda real: itl-0004-itx-{env}-intchg-02-lmbd-vi-store
 ================================================================================
 Archivo:     lambdas/visa/store/src/handler.py
 

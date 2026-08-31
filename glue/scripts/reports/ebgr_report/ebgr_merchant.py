@@ -1,5 +1,5 @@
 """
-ebgr_merchant.py — Job real: itl-0004-itx-dev-intchg-02-glue-ebgr-report
+ebgr_merchant.py — Job real: itl-0004-itx-{env}-intchg-02-glue-ebgr-report
 ================================================================================
 Archivo:     glue/scripts/reports/ebgr_report/ebgr_merchant.py
 S3 Script:   s3://itl-0004-itx-dev-intchg-02-s3-reference/glue/scripts/report/ebgr_merchant.py
