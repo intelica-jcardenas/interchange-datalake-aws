@@ -452,7 +452,21 @@ configuración, ver `.claude/memory/pending.md` → memoria de usuario
 
 Scripts PowerShell en `scripts/` para mantener el repo sincronizado con el estado real de AWS. **Solo para uso local del desarrollador — no forman parte del pipeline ni del deploy.**
 
-Prerequisito: `aws sso login --profile itx-dev` y `$env:AWS_PROFILE = "itx-dev"`.
+Prerequisito: `aws sso login --profile itx-dev` y `$env:AWS_PROFILE = "itx-dev"` (o `itx-prd`/`$env:AWS_PROFILE = "itx-prd"` si se usa `-Environment prd`, ver abajo).
+
+**Parametro `-Environment` (agregado 2026-08-31, despliegue a PRD):** los 6
+scripts (`sync-lambdas.ps1`, `sync-glue.ps1`, `sync-dynamodb.ps1`,
+`sync-step-functions.ps1`, `push-lambdas.ps1`, `push-glue.ps1`) aceptan
+`-Environment dev` (default) o `-Environment prd`. En los `push-*` cambia
+a qué cuenta se despliega (con verificación de cuenta AWS real impresa
+antes de subir). En los `sync-*`, **OJO**: los archivos locales
+(`config.json`, `env-vars.json`, `src/`, `dynamodb/schemas`, etc.) no
+distinguen de qué ambiente vinieron — normalmente reflejan DEV, y
+sincronizar con `-Environment prd` los sobreescribe con datos de PRD sin
+dejar rastro del origen. Por eso `-Environment prd` en los `sync-*` pide
+una confirmación reforzada (escribir `CONFIRMAR`, no basta con `-Force`)
+— usar solo para inspección puntual, y volver a sincronizar desde DEV
+después si hace falta restaurar el reflejo habitual del repo.
 
 **`sync-lambdas.ps1`** — descarga desde AWS al repo:
 - `get-function-configuration` → `config.json`
@@ -460,7 +474,8 @@ Prerequisito: `aws sso login --profile itx-dev` y `$env:AWS_PROFILE = "itx-dev"`
 - ZIP del deployment descomprimido → `src/`
 
 ```powershell
-.\scripts\sync-lambdas.ps1                        # todos
+.\scripts\sync-lambdas.ps1                        # todos, desde DEV (default)
+.\scripts\sync-lambdas.ps1 -Environment prd       # todos, desde PRD (pide confirmacion extra)
 .\scripts\sync-lambdas.ps1 -Group mc              # solo Mastercard
 .\scripts\sync-lambdas.ps1 -Group vi              # solo Visa
 .\scripts\sync-lambdas.ps1 -Group general         # router, unzip, archive-file
@@ -469,11 +484,12 @@ Prerequisito: `aws sso login --profile itx-dev` y `$env:AWS_PROFILE = "itx-dev"`
 
 **`sync-glue.ps1`** — descarga desde AWS al repo:
 - Jobs: `get-job` → `config.json` + `args.json` + script PySpark desde S3 → `glue/scripts/*/`
-- Databases: `get-database` → `glue/databases/<sufijo>.json` (prefijo `itl_0004_itx_dev_02_`)
-- Crawlers: `get-crawler` → `glue/crawlers/<sufijo>.json` (prefijo `itl_0004_itx_dev_02_`)
+- Databases: `get-database` → `glue/databases/<sufijo>.json` (prefijo `itl_0004_itx_dev_02_`, o `itl_0004_itx_prd_02_` con `-Environment prd`)
+- Crawlers: `get-crawler` → `glue/crawlers/<sufijo>.json` (idem)
 
 ```powershell
-.\scripts\sync-glue.ps1                              # todo (jobs + databases + crawlers)
+.\scripts\sync-glue.ps1                              # todo, desde DEV (default)
+.\scripts\sync-glue.ps1 -Environment prd             # todo, desde PRD (pide confirmacion extra)
 .\scripts\sync-glue.ps1 -Resource jobs               # solo jobs
 .\scripts\sync-glue.ps1 -Resource databases          # solo databases
 .\scripts\sync-glue.ps1 -Resource crawlers           # solo crawlers
@@ -484,16 +500,21 @@ Prerequisito: `aws sso login --profile itx-dev` y `$env:AWS_PROFILE = "itx-dev"`
 ```
 
 **`sync-dynamodb.ps1`** — descarga desde AWS al repo:
-- Schemas: `describe-table` → `dynamodb/schemas/<sufijo>.json` (prefijo `itl-0004-itx-dev-dynamo-`, sufijo `-02`)
+- Schemas: `describe-table` → `dynamodb/schemas/<sufijo>.json` (prefijo `itl-0004-itx-dev-dynamo-`, o `itl-0004-itx-prd-dynamo-` con `-Environment prd`; sufijo `-02`)
 - Items: `scan` → `dynamodb/items/<sufijo>.json` — solo tablas de configuracion (`client`, `file_pattern`, `visa_fields`, `mastercard_fields`); `file_control` excluida (datos operacionales)
 
 ```powershell
-.\scripts\sync-dynamodb.ps1                          # todo (schemas + items)
+.\scripts\sync-dynamodb.ps1                          # todo, desde DEV (default)
+.\scripts\sync-dynamodb.ps1 -Environment prd         # todo, desde PRD (pide confirmacion extra)
 .\scripts\sync-dynamodb.ps1 -Resource schemas        # solo schemas
 .\scripts\sync-dynamodb.ps1 -Resource items          # solo items
 .\scripts\sync-dynamodb.ps1 -Table visa_fields       # tabla especifica (schemas + items)
 .\scripts\sync-dynamodb.ps1 -Resource schemas -Table client
 ```
+
+**`sync-step-functions.ps1`** — descarga las definiciones ASL de `sfn-vi`/`sfn-mc` desde AWS a `step-functions/{visa,mastercard}/asl.json` + `config.json`. Mismo `-Environment`/confirmacion reforzada que los demas `sync-*`.
+
+**`push-lambdas.ps1`/`push-glue.ps1`** (repo → AWS, solo código, ver sección Deploy) — mismo `-Environment dev`/`prd`, sin la confirmación reforzada de los `sync-*` (no sobreescriben archivos del repo, solo AWS) pero sí imprimen la cuenta AWS real antes de desplegar.
 
 ---
 

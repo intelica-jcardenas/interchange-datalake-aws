@@ -1,12 +1,21 @@
 # sync-lambdas.ps1
 # Sincroniza codigo fuente y configuracion de Lambdas desde AWS al repo local.
 #
-# Prerequisitos:
-#   aws sso login --profile itx-dev
-#   $env:AWS_PROFILE = "itx-dev"
+# OJO -Environment: los archivos locales (config.json, env-vars.json, src/) NO
+# distinguen de que ambiente vinieron -- son "la ultima foto sincronizada", y
+# el repo los usa en todos lados asumiendo que reflejan DEV. Sincronizar desde
+# "prd" sobreescribe esos mismos archivos con datos de PRD sin dejar rastro de
+# cual era el origen. Usar -Environment prd solo para inspeccion puntual, y
+# volver a correr sin el parametro (o con -Environment dev) para restaurar el
+# reflejo de DEV despues.
+#
+# Prerequisitos (segun -Environment):
+#   dev: aws sso login --profile itx-dev  ; $env:AWS_PROFILE = "itx-dev"
+#   prd: aws sso login --profile itx-prd  ; $env:AWS_PROFILE = "itx-prd"
 #
 # Uso:
-#   .\scripts\sync-lambdas.ps1                          # sincroniza todos
+#   .\scripts\sync-lambdas.ps1                          # sincroniza todos desde DEV (default)
+#   .\scripts\sync-lambdas.ps1 -Environment prd         # sincroniza todos desde PRD (pide confirmacion extra)
 #   .\scripts\sync-lambdas.ps1 -Group mc                # solo Mastercard
 #   .\scripts\sync-lambdas.ps1 -Group vi                # solo Visa
 #   .\scripts\sync-lambdas.ps1 -Group general           # solo generales (router, unzip, archive-file)
@@ -16,12 +25,25 @@
 param(
     [ValidateSet("all","mc","vi","general","rules-refresh")]
     [string]$Group = "all",
-    [string]$Lambda = ""
+    [string]$Lambda = "",
+    [ValidateSet("dev","prd")]
+    [string]$Environment = "dev"
 )
+
+if ($Environment -ne "dev") {
+    Write-Host "ADVERTENCIA: sincronizando desde '$Environment', no 'dev'." -ForegroundColor Red
+    Write-Host "Esto sobreescribe config.json/env-vars.json/src/ locales (que normalmente reflejan DEV) con datos de '$Environment'." -ForegroundColor Red
+    $EnvConfirm = Read-Host "Escribi CONFIRMAR para continuar"
+    if ($EnvConfirm -ne "CONFIRMAR") {
+        Write-Host "Cancelado." -ForegroundColor Yellow
+        exit 0
+    }
+    Write-Host ""
+}
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $TempDir  = Join-Path $env:TEMP "lambda-sync"
-$Prefix   = "itl-0004-itx-dev-intchg-02-lmbd"
+$Prefix   = "itl-0004-itx-$Environment-intchg-02-lmbd"
 
 # sufijo AWS => grupo, directorio local
 # Formato: "sufijo" = @{ Group="grupo"; Dir="ruta\relativa" }

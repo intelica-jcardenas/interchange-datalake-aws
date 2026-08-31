@@ -11,26 +11,36 @@
 #
 # De donde saca el ScriptLocation:
 #   Lee el config.json local de cada job (el mismo que deja sync-glue.ps1) y usa
-#   Job.Command.ScriptLocation como destino S3. Si no existe ese config.json, corre
+#   Job.Command.ScriptLocation como base. Si no existe ese config.json, corre
 #   sync-glue.ps1 primero para ese job.
+#   -Environment: el config.json local normalmente refleja DEV (bucket
+#   itl-0004-itx-dev-...) sin importar cual sea el destino real del push. Si
+#   -Environment no es "dev", el script reemplaza ese fragmento del path por
+#   el bucket del ambiente pedido antes de subir -- asume que el resto de la
+#   ruta (glue/scripts/...) es identica entre ambientes, que es la convencion
+#   real del proyecto (confirmado 2026-08-31 para 7 de 10 jobs; los otros 3
+#   necesitan que Infra corrija su ScriptLocation en PRD para que coincida).
 #
-# Prerequisitos:
-#   aws sso login --profile itx-dev
-#   $env:AWS_PROFILE = "itx-dev"
+# Prerequisitos (segun -Environment):
+#   dev: aws sso login --profile itx-dev  ; $env:AWS_PROFILE = "itx-dev"
+#   prd: aws sso login --profile itx-prd  ; $env:AWS_PROFILE = "itx-prd"
 #
 # Uso:
-#   .\scripts\push-glue.ps1                          # sube todos los jobs
+#   .\scripts\push-glue.ps1                          # sube todos los jobs a DEV (default)
+#   .\scripts\push-glue.ps1 -Environment prd         # sube todos los jobs a PRD
 #   .\scripts\push-glue.ps1 -Group mc                # jobs Mastercard
-#   .\scripts\push-glue.ps1 -Group vi                # jobs Visa
+#   .\scripts\push-glue.ps1 -Group vi -Environment prd  # jobs Visa, a PRD
 #   .\scripts\push-glue.ps1 -Group reports           # jobs de reportes y DQ
 #   .\scripts\push-glue.ps1 -Job vi-calculate        # uno especifico
 #   .\scripts\push-glue.ps1 -Job vi-calculate -WhatIf   # muestra que se subiria, no sube nada
-#   .\scripts\push-glue.ps1 -Force                   # sin prompt de confirmacion (automatizacion)
+#   .\scripts\push-glue.ps1 -Environment prd -Force  # sin prompt de confirmacion (automatizacion)
 
 param(
     [ValidateSet("all","vi","mc","reports")]
     [string]$Group = "all",
     [string]$Job = "",
+    [ValidateSet("dev","prd")]
+    [string]$Environment = "dev",
     [switch]$WhatIf,
     [switch]$Force
 )
@@ -76,12 +86,21 @@ if ($ToSync.Count -eq 0) {
     exit 0
 }
 
+Write-Host "Ambiente destino: $Environment" -ForegroundColor White
+if (-not $WhatIf) {
+    $CallerIdentity = aws sts get-caller-identity --output json 2>$null | ConvertFrom-Json
+    if ($CallerIdentity) {
+        Write-Host "Cuenta AWS real (segun credenciales activas): $($CallerIdentity.Account)" -ForegroundColor White
+    } else {
+        Write-Host "ADVERTENCIA: no se pudo verificar la cuenta AWS activa (revisar `$env:AWS_PROFILE / sesion SSO)." -ForegroundColor Red
+    }
+}
 Write-Host "Glue Jobs a subir a AWS: $($ToSync.Count)" -ForegroundColor White
 $ToSync.Keys | ForEach-Object { Write-Host "  $_" }
 Write-Host ""
 
 if (-not $WhatIf -and -not $Force) {
-    Write-Host "Esto sobreescribe el script .py en S3 (ScriptLocation) de cada job listado." -ForegroundColor Yellow
+    Write-Host "Esto sobreescribe el script .py en S3 (ScriptLocation) de cada job listado, en la cuenta AWS de arriba." -ForegroundColor Yellow
     Write-Host "Afecta la PROXIMA ejecucion de cada job (no hay ejecuciones en curso afectadas)." -ForegroundColor Yellow
     $Confirm = Read-Host "Continuar? (s/N)"
     if ($Confirm -notin @("s", "S", "si", "SI", "y", "Y", "yes", "YES")) {
@@ -116,6 +135,18 @@ foreach ($Suffix in $ToSync.Keys) {
         $null = $Results.Add([pscustomobject]@{ Job = $Suffix; Group = $Meta.Group; Status = "NO SCRIPT LOCATION" })
         Write-Host ""
         continue
+    }
+
+    # El config.json local puede reflejar un ambiente distinto al pedido (normalmente
+    # DEV, ver nota de -Environment al inicio del script). Si el bucket del path no
+    # coincide con -Environment, se recalcula sustituyendo el segmento de ambiente --
+    # asume que el resto de la ruta (glue/scripts/...) es igual en todos los ambientes.
+    if ($ScriptS3Path -match "itl-0004-itx-(dev|prd)-") {
+        $SourceEnv = $Matches[1]
+        if ($SourceEnv -ne $Environment) {
+            $ScriptS3Path = $ScriptS3Path -replace "itl-0004-itx-$SourceEnv-", "itl-0004-itx-$Environment-"
+            Write-Host "  (ScriptLocation local es de '$SourceEnv', recalculado para '$Environment')" -ForegroundColor DarkGray
+        }
     }
 
     $ScriptName  = Split-Path $ScriptS3Path -Leaf

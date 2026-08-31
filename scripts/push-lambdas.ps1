@@ -21,31 +21,37 @@
 #   update-function-code con --zip-file no aplica a imagenes; gestionar esa Lambda
 #   por su pipeline de imagen Docker aparte.
 #
-# Prerequisitos:
-#   aws sso login --profile itx-dev
-#   $env:AWS_PROFILE = "itx-dev"
+# Prerequisitos (segun -Environment):
+#   dev: aws sso login --profile itx-dev  ; $env:AWS_PROFILE = "itx-dev"
+#   prd: aws sso login --profile itx-prd  ; $env:AWS_PROFILE = "itx-prd"
+#   El script NO valida que $env:AWS_PROFILE coincida con -Environment --
+#   es responsabilidad de quien lo corre tenerlos alineados (mismo criterio
+#   que el resto de scripts sync-*/push-* de este repo).
 #
 # Uso:
-#   .\scripts\push-lambdas.ps1                          # sube todas (Zip-based)
-#   .\scripts\push-lambdas.ps1 -Group mc                # solo Mastercard
-#   .\scripts\push-lambdas.ps1 -Group vi                # solo Visa
-#   .\scripts\push-lambdas.ps1 -Group general           # solo generales (router, unzip, archive-file)
-#   .\scripts\push-lambdas.ps1 -Group rules-refresh      # solo rules-refresh
-#   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter    # una especifica
-#   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter -WhatIf   # arma el zip y muestra tamano, no sube nada
-#   .\scripts\push-lambdas.ps1 -Force                    # sin prompt de confirmacion (automatizacion)
+#   .\scripts\push-lambdas.ps1                                    # sube todas a DEV (default)
+#   .\scripts\push-lambdas.ps1 -Environment prd                   # sube todas a PRD
+#   .\scripts\push-lambdas.ps1 -Group mc                          # solo Mastercard (DEV)
+#   .\scripts\push-lambdas.ps1 -Group vi -Environment prd         # solo Visa, a PRD
+#   .\scripts\push-lambdas.ps1 -Group general                     # solo generales (router, unzip, archive-file)
+#   .\scripts\push-lambdas.ps1 -Group rules-refresh                # solo rules-refresh
+#   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter              # una especifica
+#   .\scripts\push-lambdas.ps1 -Lambda mc-interpreter -WhatIf      # arma el zip y muestra tamano, no sube nada
+#   .\scripts\push-lambdas.ps1 -Environment prd -Force             # sin prompt de confirmacion (automatizacion)
 
 param(
     [ValidateSet("all","mc","vi","general","rules-refresh")]
     [string]$Group = "all",
     [string]$Lambda = "",
+    [ValidateSet("dev","prd")]
+    [string]$Environment = "dev",
     [switch]$WhatIf,
     [switch]$Force
 )
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $TempDir  = Join-Path $env:TEMP "lambda-push"
-$Prefix   = "itl-0004-itx-dev-intchg-02-lmbd"
+$Prefix   = "itl-0004-itx-$Environment-intchg-02-lmbd"
 
 # Debe reflejar exactamente el mismo mapeo que sync-lambdas.ps1. Si agregas una
 # Lambda nueva, actualiza los dos scripts.
@@ -103,12 +109,22 @@ if ($ToSync.Count -eq 0) {
     exit 0
 }
 
+Write-Host "Ambiente destino: $Environment (prefijo $Prefix-*)" -ForegroundColor White
+if (-not $WhatIf) {
+    $CallerIdentity = aws sts get-caller-identity --output json 2>$null | ConvertFrom-Json
+    if ($CallerIdentity) {
+        Write-Host "Cuenta AWS real (segun credenciales activas): $($CallerIdentity.Account)" -ForegroundColor White
+    } else {
+        Write-Host "ADVERTENCIA: no se pudo verificar la cuenta AWS activa (revisar `$env:AWS_PROFILE / sesion SSO)." -ForegroundColor Red
+    }
+}
 Write-Host "Lambdas a subir a AWS: $($ToSync.Count)" -ForegroundColor White
 $ToSync.Keys | ForEach-Object { Write-Host "  $_" }
 Write-Host ""
 
 if (-not $WhatIf -and -not $Force) {
-    Write-Host "Esto sobreescribe el codigo `$LATEST de cada Lambda listada en AWS (cuenta dev)." -ForegroundColor Yellow
+    Write-Host "Esto sobreescribe el codigo `$LATEST de cada Lambda listada arriba, en la cuenta AWS de arriba." -ForegroundColor Yellow
+    Write-Host "Verifica que la cuenta y el ambiente ($Environment) sean los correctos antes de continuar." -ForegroundColor Yellow
     $Confirm = Read-Host "Continuar? (s/N)"
     if ($Confirm -notin @("s", "S", "si", "SI", "y", "Y", "yes", "YES")) {
         Write-Host "Cancelado." -ForegroundColor Yellow

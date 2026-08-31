@@ -1,12 +1,20 @@
 # sync-glue.ps1
 # Sincroniza Jobs, Databases y Crawlers de AWS Glue desde AWS al repo local.
 #
-# Prerequisitos:
-#   aws sso login --profile itx-dev
-#   $env:AWS_PROFILE = "itx-dev"
+# OJO -Environment: los archivos locales (config.json, args.json, el script .py,
+# glue\databases\*.json, glue\crawlers\*.json) NO distinguen de que ambiente
+# vinieron -- sincronizar desde "prd" sobreescribe esos mismos archivos con
+# datos de PRD sin dejar rastro del origen. Usar -Environment prd solo para
+# inspeccion puntual, y volver a sincronizar desde DEV despues si hace falta
+# restaurar el reflejo habitual del repo.
+#
+# Prerequisitos (segun -Environment):
+#   dev: aws sso login --profile itx-dev  ; $env:AWS_PROFILE = "itx-dev"
+#   prd: aws sso login --profile itx-prd  ; $env:AWS_PROFILE = "itx-prd"
 #
 # Uso:
-#   .\scripts\sync-glue.ps1                               # todo (jobs + databases + crawlers)
+#   .\scripts\sync-glue.ps1                               # todo, desde DEV (default)
+#   .\scripts\sync-glue.ps1 -Environment prd              # todo, desde PRD (pide confirmacion extra)
 #   .\scripts\sync-glue.ps1 -Resource jobs                # solo jobs
 #   .\scripts\sync-glue.ps1 -Resource databases           # solo databases
 #   .\scripts\sync-glue.ps1 -Resource crawlers            # solo crawlers
@@ -21,12 +29,25 @@ param(
     [ValidateSet("all","vi","mc","reports")]
     [string]$Group = "all",
     [string]$Job  = "",
-    [string]$Name = ""
+    [string]$Name = "",
+    [ValidateSet("dev","prd")]
+    [string]$Environment = "dev"
 )
 
+if ($Environment -ne "dev") {
+    Write-Host "ADVERTENCIA: sincronizando desde '$Environment', no 'dev'." -ForegroundColor Red
+    Write-Host "Esto sobreescribe config.json/args.json/script/.json de databases-crawlers locales (que normalmente reflejan DEV) con datos de '$Environment'." -ForegroundColor Red
+    $EnvConfirm = Read-Host "Escribi CONFIRMAR para continuar"
+    if ($EnvConfirm -ne "CONFIRMAR") {
+        Write-Host "Cancelado." -ForegroundColor Yellow
+        exit 0
+    }
+    Write-Host ""
+}
+
 $RepoRoot      = Split-Path -Parent $PSScriptRoot
-$JobPrefix     = "itl-0004-itx-dev-intchg-02-glue"
-$CatalogPrefix = "itl_0004_itx_dev_02_"
+$JobPrefix     = "itl-0004-itx-$Environment-intchg-02-glue"
+$CatalogPrefix = "itl_0004_itx_${Environment}_02_"
 $DbPrefix      = "${CatalogPrefix}glue_database_"
 $CrawlerPrefix = "${CatalogPrefix}glue_crawler_"
 
